@@ -1,0 +1,18 @@
+/target/
+/dist/
+/.worktrees/
+**/*.rs.bk
+*.profraw
+
+# Never commit credentials or live inventory.
+*.pem
+*.p12
+*.key
+.env
+.env.*
+clusters.json
+devices.json
+tokens.json
+*.tokens.json
+
+.DS_Store
