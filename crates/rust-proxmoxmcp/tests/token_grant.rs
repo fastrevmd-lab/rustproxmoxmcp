@@ -18,13 +18,9 @@ fn token_add_with_guests_and_actions_stores_grant() {
         .expect("chmod");
 
     // Mint a token with guest scope and actions.
-    // Note: --guests and --actions must come BEFORE the token subcommand.
+    // Grant flags now appear AFTER the subcommand.
     let output = Command::new(env!("CARGO_BIN_EXE_rust-proxmoxmcp"))
         .args([
-            "--guests",
-            "vmid:600-699,tag:ci",
-            "--actions",
-            "read,low",
             "token",
             "add",
             "--tokens-file",
@@ -35,6 +31,10 @@ fn token_add_with_guests_and_actions_stores_grant() {
             "*",
             "--tools",
             "*",
+            "--guests",
+            "vmid:600-699,tag:ci",
+            "--actions",
+            "read,low",
         ])
         .output()
         .expect("spawn");
@@ -71,8 +71,6 @@ fn token_add_with_invalid_selector_fails_at_mint_time() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_rust-proxmoxmcp"))
         .args([
-            "--guests",
-            "site:emea",  // Invalid selector
             "token",
             "add",
             "--tokens-file",
@@ -83,6 +81,8 @@ fn token_add_with_invalid_selector_fails_at_mint_time() {
             "*",
             "--tools",
             "*",
+            "--guests",
+            "site:emea",  // Invalid selector
         ])
         .output()
         .expect("spawn");
@@ -165,8 +165,6 @@ fn token_add_accepts_wildcard_guests() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_rust-proxmoxmcp"))
         .args([
-            "--guests",
-            "*",
             "token",
             "add",
             "--tokens-file",
@@ -176,6 +174,8 @@ fn token_add_accepts_wildcard_guests() {
             "--devices",
             "*",
             "--tools",
+            "*",
+            "--guests",
             "*",
         ])
         .output()

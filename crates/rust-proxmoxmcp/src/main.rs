@@ -5,7 +5,7 @@ mod http_transport;
 mod server;
 
 use anyhow::{Context as _, Result};
-use cli::ProxmoxCli;
+use cli::{ProxmoxCli, TokenCli, TokenCommand};
 use http_transport::build_http_router;
 use mecmcp_auth::TokenStoreFile;
 use mecmcp_runtime::cli::{Command, TokenAction, Transport};
@@ -21,18 +21,16 @@ use rust_proxmoxmcp_core::{
 use server::ProxmoxServer;
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::Duration};
 
-/// Build a vendor grant for token minting when --guests or --actions are given.
+/// Build a vendor grant from TokenCommand::Add fields.
 ///
-/// Returns `None` for non-Add operations or when no Proxmox-specific grant fields
-/// are present, allowing the caller to pass `None` to preserve grantless tokens.
-fn build_token_grant(args: &ProxmoxCli, action: &TokenAction) -> Result<Option<ProxmoxGrant>> {
-    // Only Add uses grants; other operations round-trip existing ones untouched.
-    if !matches!(action, TokenAction::Add { .. }) {
-        return Ok(None);
-    }
-
+/// Returns `None` when no guest selectors are given, allowing cluster-scoped
+/// tokens. Validates selectors at mint time and prints a note when omitted.
+fn build_token_grant_from_add(
+    guests: &[String],
+    actions: &[String],
+) -> Result<Option<ProxmoxGrant>> {
     // No grant fields given: token will work for cluster-scoped tools only.
-    if args.guests.is_empty() {
+    if guests.is_empty() {
         eprintln!(
             "Note: This token cannot use guest-addressed tools. \
              Use --guests '*' or a selector (vmid:X, tag:Y, pool:Z) to grant guest access."
@@ -42,15 +40,14 @@ fn build_token_grant(args: &ProxmoxCli, action: &TokenAction) -> Result<Option<P
 
     // Validate each selector at mint time. A selector that cannot parse produces
     // a token that silently admits nothing, which an operator cannot diagnose.
-    for term in &args.guests {
+    for term in guests {
         Selector::parse(term).map_err(|error| {
             anyhow::anyhow!("invalid --guests selector '{term}': {error}")
         })?;
     }
 
-    // Parse action names. Default is already set by clap to "read".
-    let actions: Result<Vec<ProxmoxAction>> = args
-        .actions
+    // Parse action names.
+    let parsed_actions: Result<Vec<ProxmoxAction>> = actions
         .iter()
         .map(|name| match name.as_str() {
             "read" => Ok(ProxmoxAction::Read),
@@ -63,9 +60,69 @@ fn build_token_grant(args: &ProxmoxCli, action: &TokenAction) -> Result<Option<P
         .collect();
 
     Ok(Some(ProxmoxGrant {
-        guests: args.guests.clone(),
-        actions: actions?,
+        guests: guests.to_vec(),
+        actions: parsed_actions?,
     }))
+}
+
+/// Convert `TokenCommand` to `TokenAction` and extract grant for Add.
+fn token_command_to_action(
+    command: TokenCommand,
+) -> Result<(TokenAction, Option<ProxmoxGrant>)> {
+    match command {
+        TokenCommand::Add {
+            tokens_file,
+            name,
+            devices,
+            tools,
+            guests,
+            actions,
+            provider,
+            provider_tier,
+            on_behalf_of,
+            actor_type,
+            server_pid,
+        } => {
+            let grant = build_token_grant_from_add(&guests, &actions)?;
+            let action = TokenAction::Add {
+                tokens_file,
+                name,
+                devices,
+                tools,
+                provider,
+                provider_tier,
+                on_behalf_of,
+                actor_type,
+                server_pid,
+            };
+            Ok((action, grant))
+        }
+        TokenCommand::Revoke {
+            tokens_file,
+            name,
+            server_pid,
+        } => Ok((
+            TokenAction::Revoke {
+                tokens_file,
+                name,
+                server_pid,
+            },
+            None,
+        )),
+        TokenCommand::List { tokens_file } => Ok((TokenAction::List { tokens_file }, None)),
+        TokenCommand::Rotate {
+            tokens_file,
+            name,
+            server_pid,
+        } => Ok((
+            TokenAction::Rotate {
+                tokens_file,
+                name,
+                server_pid,
+            },
+            None,
+        )),
+    }
 }
 
 #[tokio::main]
@@ -76,6 +133,31 @@ async fn main() -> Result<()> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("a rustls crypto provider was already installed"))?;
+
+    // Dispatch token commands before parsing ProxmoxCli.
+    //
+    // This keeps grant-specific flags (--guests, --actions) off the server's help
+    // and allows them to appear after the subcommand where they belong. The
+    // flattened Cli still declares its own `token` subcommand, but TokenCli owns
+    // the complete token surface including --help when argv names `token`.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("token") {
+        use clap::Parser;
+        // Build args for TokenCli: [program_name, add/revoke/list/rotate, ...]
+        // Skip "token" at index 1 since TokenCli expects the subcommand directly.
+        let token_args = std::iter::once(args[0].clone())
+            .chain(args.iter().skip(2).cloned())
+            .collect::<Vec<_>>();
+        let token_cli = TokenCli::parse_from(token_args);
+        let (action, grant) = token_command_to_action(token_cli.command)?;
+        return mecmcp_runtime::token_cmd::run_with_grant::<ProxmoxGrant>(
+            action,
+            &[],
+            server::KNOWN_TOOLS,
+            grant,
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"));
+    }
 
     let parsed = mecmcp_runtime::cli::parse_with_provenance::<ProxmoxCli>(
         "rust-proxmoxmcp",
@@ -89,14 +171,14 @@ async fn main() -> Result<()> {
     init_audit(&args.common)?;
 
     if let Some(Command::Token { action }) = args.common.command.take() {
-        // Token management is deliberately local: it validates against the fixed
-        // tool registry and does not load cluster inventory or build clients.
-        let grant = build_token_grant(&args, &action)?;
+        // This path is unreachable when argv[1] is "token" due to early dispatch,
+        // but it remains for the flattened Cli's own Token variant. In practice
+        // that variant is shadowed by TokenCli's interception.
         return mecmcp_runtime::token_cmd::run_with_grant::<ProxmoxGrant>(
             action,
             &[],
             server::KNOWN_TOOLS,
-            grant,
+            None,
         )
         .map_err(|error| anyhow::anyhow!("{error}"));
     }
