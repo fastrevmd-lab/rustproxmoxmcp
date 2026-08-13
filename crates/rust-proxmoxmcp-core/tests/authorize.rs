@@ -10,8 +10,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
-mod common;
-use common::{cluster_for, Route, TlsMockServer};
+use rust_proxmoxmcp_core::testing::{cluster_for, Route, TlsMockServer};
 
 const RESOURCES: &[u8] = br#"{"data":[
   {"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2",

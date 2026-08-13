@@ -35,7 +35,11 @@ tokio-util       = { workspace = true }
 tracing          = { workspace = true }
 
 [dev-dependencies]
+mecmcp-auth      = { workspace = true }
 mecmcp-transport = { workspace = true }
+rust-proxmoxmcp-core = { path = "../rust-proxmoxmcp-core", features = ["testing"] }
+serde_json       = { workspace = true }
+tempfile         = "3"
 tokio            = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [lints]

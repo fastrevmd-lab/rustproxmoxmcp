@@ -23,6 +23,9 @@ pub mod resolve;
 pub mod selector;
 pub mod tier;
 
+#[cfg(feature = "testing")]
+pub mod testing;
+
 pub use authorized::AuthorizedGuest;
 pub use client::ProxmoxClient;
 pub use error::ProxmoxError;

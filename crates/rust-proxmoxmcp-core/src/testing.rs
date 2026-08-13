@@ -5,7 +5,7 @@
 //! server. This harness generates a self-signed certificate for `localhost` and
 //! serves minimal HTTP/1.1 responses while recording requests.
 
-use rust_proxmoxmcp_core::inventory::Cluster;
+use crate::inventory::Cluster;
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
