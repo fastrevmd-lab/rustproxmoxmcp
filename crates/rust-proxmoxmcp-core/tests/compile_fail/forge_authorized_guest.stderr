@@ -1,0 +1,20 @@
+error[E0624]: associated function `new` is private
+ --> tests/compile_fail/forge_authorized_guest.rs:3:52
+  |
+3 |     let _ = rust_proxmoxmcp_core::AuthorizedGuest::new(panic!(), panic!(), panic!());
+  |                                                    ^^^ private associated function
+  |
+ ::: src/authorized.rs
+  |
+  |     pub(crate) fn new(guest: ResolvedGuest, protection: Protection, tier: Tier) -> Self {
+  |     ----------------------------------------------------------------------------------- private associated function defined here
+
+warning: unreachable expression
+ --> tests/compile_fail/forge_authorized_guest.rs:3:66
+  |
+3 |     let _ = rust_proxmoxmcp_core::AuthorizedGuest::new(panic!(), panic!(), panic!());
+  |                                                        --------  ^^^^^^^^ unreachable expression
+  |                                                        |
+  |                                                        any code following this expression is unreachable
+  |
+  = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default

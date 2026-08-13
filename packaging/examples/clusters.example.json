@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "devices": {
+    "pve3": {
+      "endpoint": "https://pve3.example.org:8006",
+      "token_id": "root@pam!mcp",
+      "token_secret_file": "/etc/proxmoxmcp/secrets/pve3.token",
+      "ca_pem_path": "/etc/proxmoxmcp/ca/pve3.pem",
+      "protected_vmids": [905, 906, 907, 908, 910, 920, 950, 951, 952, 960, 970, 980, 990, 991],
+      "protected_tags": ["protected"]
+    }
+  },
+  "policy": {
+    "resource_cache_ttl_secs": 10
+  }
+}

@@ -1,6 +1,7 @@
 /target/
 /dist/
 /.worktrees/
+/.superpowers/
 **/*.rs.bk
 *.profraw
 
@@ -16,3 +17,4 @@ tokens.json
 *.tokens.json
 
 .DS_Store
+Cargo.lock
