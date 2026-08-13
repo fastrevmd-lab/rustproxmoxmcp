@@ -8,9 +8,13 @@
 //! per call, because the same snapshot answers node, name, status, tags and
 //! pool for every guest at once.
 
+use crate::authorized::AuthorizedGuest;
 use crate::client::ProxmoxClient;
 use crate::error::ProxmoxError;
+use crate::grant::ProxmoxGrant;
+use crate::protect::protection_of;
 use crate::selector::{GuestFacts, GuestType};
+use crate::tier::Tier;
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
@@ -114,6 +118,56 @@ impl GuestIndex {
         if let Ok(mut snapshots) = self.snapshots.write() {
             snapshots.clear();
         }
+    }
+
+    /// Resolve a guest and run stage-2 authorization for `tier`.
+    ///
+    /// Order matters. The guest is resolved first, because the grant selector
+    /// and the protection check both need live facts. The scope check runs
+    /// before the protection check so an out-of-scope caller learns nothing
+    /// about whether the guest is protected.
+    ///
+    /// Protection does not gate [`Tier::Read`]: observing a protected guest is
+    /// how an operator confirms it is protected. It is carried on the returned
+    /// value so the audit event and, from 0.3, the change-set preview can
+    /// report it.
+    ///
+    /// # Errors
+    /// Returns [`ProxmoxError::NotFound`] for an absent guest,
+    /// [`ProxmoxError::Denied`] when the grant does not admit the guest, does
+    /// not carry the tier, or when the tier is gated by protection.
+    pub async fn authorize(
+        &self,
+        client: &ProxmoxClient,
+        cluster: &str,
+        vmid: u32,
+        grant: &ProxmoxGrant,
+        tier: Tier,
+    ) -> Result<AuthorizedGuest, ProxmoxError> {
+        let guest = self.resolve(client, cluster, vmid).await?;
+
+        if !grant.allows_guest(guest.facts()) {
+            return Err(ProxmoxError::Denied(format!(
+                "token scope does not admit guest {vmid} in cluster {cluster}"
+            )));
+        }
+
+        if !mecmcp_auth::Grant::allows_action(grant, tier.action()) {
+            return Err(ProxmoxError::Denied(format!(
+                "token grant does not carry the {tier:?} action tier"
+            )));
+        }
+
+        let protection = protection_of(client.cluster(), Some(&guest), false);
+
+        if tier == Tier::Destructive && protection.is_protected() {
+            return Err(ProxmoxError::Denied(format!(
+                "guest {vmid} is protected ({}); a destructive call needs a waiver",
+                protection.summary()
+            )));
+        }
+
+        Ok(AuthorizedGuest::new(guest, protection, tier))
     }
 
     /// Read one guest out of a snapshot that has not expired.

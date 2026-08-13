@@ -87,6 +87,7 @@ impl TlsMockServer {
     }
 
     /// Number of requests recorded so far.
+    #[allow(dead_code)]
     pub fn request_count(&self) -> usize {
         self.requests.lock().expect("lock requests").len()
     }

@@ -23,6 +23,7 @@ pub mod resolve;
 pub mod selector;
 pub mod tier;
 
+pub use authorized::AuthorizedGuest;
 pub use client::ProxmoxClient;
 pub use error::ProxmoxError;
 pub use grant::{ProxmoxAction, ProxmoxGrant};
