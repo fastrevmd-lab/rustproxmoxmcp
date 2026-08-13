@@ -277,16 +277,28 @@ runs inside the bearer boundary, before dispatch and before any I/O; it has
 request arguments and nothing else. Tags and pools are properties of the live
 cluster, not of the request.
 
-- **Stage 1 — preflight, zero I/O.** Tool scope, cluster scope, `vmid:`
-  and `type:` terms. All derivable from raw arguments. Rejects the bulk of abuse
-  before a packet leaves for Proxmox, and preserves the boundary's ordering:
-  `IP rate limit → authenticate → token rate limit → token concurrency → body
-  limit → preflight → target concurrency → handler`.
-- **Stage 2 — after resolution, in `core`.** `tag:`, `pool:` and `node:` terms
-  evaluated against the resolved guest, followed by the protection check.
+- **Stage 1 — preflight, zero I/O.** Tool scope and cluster scope, both
+  derivable from raw arguments. Rejects the bulk of abuse before a packet leaves
+  for Proxmox, and preserves the boundary's ordering: `IP rate limit →
+  authenticate → token rate limit → token concurrency → body limit → preflight →
+  target concurrency → handler`.
+- **Stage 2 — after resolution, in `core`.** The whole guest selector —
+  every term, `vmid:` included — evaluated against the resolved guest, followed
+  by the protection check.
 
-A token whose selector uses only stage-2 terms is still fully enforced; stage 1
-simply admits it and stage 2 decides.
+**Where each half is stored.** The device `ScopeSet` carries **cluster names
+only**, which `ToolScopePreflight` matches unchanged with
+`TargetField::scalar("cluster")`. The guest selector lives in the token's
+**grant**, `mecmcp-auth`'s documented vendor seam.
+
+That split is forced rather than chosen. `CallerScopes` exposes only
+`token_name`, `devices` and `tools` — all opaque name sets — and
+`TargetValueShape` is `Scalar | NonEmptyArray` with no numeric-range form. A
+`vmid:600-699` term is therefore unevaluable before dispatch, and putting it in
+the device scope would leave a restriction the operator believes is enforced
+sitting unread. Moving it into the grant makes it enforced, at the cost of one
+cached `/cluster/resources` read before an out-of-scope vmid is refused — behind
+authentication, the tool scope, the cluster scope, and the rate limiter.
 
 ### `AuthorizedGuest`
 
@@ -490,7 +502,7 @@ across releases, so a snapshot restore is a complete revert.
 
 ## 12. `mecmcp` issue candidates
 
-Neither blocks implementation.
+One candidate, and it does not block implementation.
 
 1. **`WaiverRecord` cannot express an operator waiver.** It carries only
    `reason`, and the waived-approval digest binds the literal
@@ -499,11 +511,13 @@ Neither blocks implementation.
    a controlled exception as a disabled control. Proposed: `WaiverRecord` gains
    a digest-bound `kind` (`LabMode` | `Operator`) plus optional `expires_at` and
    `ticket`. Until then, `core` keeps its own waiver record and sets the
-   change-set waiver only when `--lab-mode` is genuinely on.
-2. **`ToolScopePreflight` target shapes may not express a numeric range.**
-   `vmid:600-699` needs a range-valued `TargetValueShape`. To be verified
-   against the real API before filing; if `TargetValueShape` is open enough,
-   there is no issue.
+   change-set waiver only when `--lab-mode` is genuinely on. Belongs to 0.3.
+
+A second candidate — a numeric-range `TargetValueShape` for `vmid:600-699` — was
+withdrawn after reading the real API. `CallerScopes` exposes only opaque name
+sets, so even a range shape would not have carried the guest selector into the
+preflight. Moving the selector into the grant solves it entirely within the
+consumer, as §5 now records.
 
 ---
 
