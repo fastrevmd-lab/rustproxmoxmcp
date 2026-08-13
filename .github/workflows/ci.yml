@@ -42,9 +42,16 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
-      - name: Verify testing feature not in release build
+      - name: Release build excludes the dev-only testing feature
         run: |
-          cargo tree --package rust-proxmoxmcp --no-default-features --edges normal --locked | \
-            grep -q rcgen && \
-            (echo "ERROR: rcgen found in release build - testing feature leaked" && exit 1) || \
-            echo "OK: testing feature correctly excluded from release build"
+          set -euo pipefail
+          tree="$(cargo tree --package rust-proxmoxmcp --no-default-features --edges normal --locked)"
+          if [ -z "$tree" ]; then
+            echo "ERROR: cargo tree produced no output; the guard cannot verify anything" >&2
+            exit 1
+          fi
+          if printf '%s' "$tree" | grep -q rcgen; then
+            echo "ERROR: rcgen present in the release tree — the testing feature leaked in" >&2
+            exit 1
+          fi
+          echo "OK: testing feature excluded from the release build"
