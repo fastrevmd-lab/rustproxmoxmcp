@@ -3635,7 +3635,7 @@ ExecStart=/usr/local/bin/rust-proxmoxmcp \
     --tokens-file /etc/proxmoxmcp/tokens.json \
     --transport streamable-http \
     --host 0.0.0.0 --port 30031 \
-    --allowed-host proxmoxmcp.mechub.org \
+    --allowed-host proxmoxmcp.example.org \
     --tls-cert /etc/proxmoxmcp/tls/fullchain.pem \
     --tls-key /etc/proxmoxmcp/tls/privkey.pem \
     --audit-format json \

@@ -1,0 +1,22 @@
+# Historical findings in commit 9e5233ca, which added the release-0.1
+# implementation plan. All seven are the same illustrative test fixture,
+# `0123456789abcdef`, appearing in example code inside a planning document. It
+# was never a credential; the fixture was later renamed to carry the explicit
+# `not-a-real-secret-` marker that `.gitleaks.toml` allowlists.
+#
+# Fingerprint-based exemptions are normally the wrong tool, because they key on
+# `commit:file:rule:line` and stop matching when lines move — an exemption that
+# drifts off its target, or worse onto a real secret that later lands at that
+# line. That objection does not apply here: these fingerprints are pinned to a
+# commit that is already merged and immutable, so they cannot drift. Current and
+# future code is covered by the marker convention in `.gitleaks.toml` instead.
+#
+# Do not add entries here for anything in the working tree. If a new finding
+# appears, either it is a real secret or the fixture needs the marker.
+9e5233cad24ddcf2f2b8242c30d026601ad67fc8:docs/superpowers/plans/2026-08-12-rustproxmoxmcp-0.1-read-spine.md:generic-api-key:1685
+9e5233cad24ddcf2f2b8242c30d026601ad67fc8:docs/superpowers/plans/2026-08-12-rustproxmoxmcp-0.1-read-spine.md:generic-api-key:1706
+9e5233cad24ddcf2f2b8242c30d026601ad67fc8:docs/superpowers/plans/2026-08-12-rustproxmoxmcp-0.1-read-spine.md:generic-api-key:1732
+9e5233cad24ddcf2f2b8242c30d026601ad67fc8:docs/superpowers/plans/2026-08-12-rustproxmoxmcp-0.1-read-spine.md:generic-api-key:1749
+9e5233cad24ddcf2f2b8242c30d026601ad67fc8:docs/superpowers/plans/2026-08-12-rustproxmoxmcp-0.1-read-spine.md:generic-api-key:1770
+9e5233cad24ddcf2f2b8242c30d026601ad67fc8:docs/superpowers/plans/2026-08-12-rustproxmoxmcp-0.1-read-spine.md:generic-api-key:1993
+9e5233cad24ddcf2f2b8242c30d026601ad67fc8:docs/superpowers/plans/2026-08-12-rustproxmoxmcp-0.1-read-spine.md:generic-api-key:2548
