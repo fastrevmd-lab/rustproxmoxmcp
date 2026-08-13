@@ -28,8 +28,10 @@ pub struct RecordedRequest {
     #[allow(dead_code)]
     pub method: String,
     /// Full request target including query string.
+    #[allow(dead_code)]
     pub target: String,
     /// Value of the Authorization header, if present.
+    #[allow(dead_code)]
     pub authorization: Option<String>,
 }
 
@@ -79,6 +81,7 @@ impl TlsMockServer {
     }
 
     /// All requests recorded so far.
+    #[allow(dead_code)]
     pub fn requests(&self) -> Vec<RecordedRequest> {
         self.requests.lock().expect("lock requests").clone()
     }
