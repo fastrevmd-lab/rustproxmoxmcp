@@ -53,7 +53,7 @@ async fn index_and_client() -> (GuestIndex, ProxmoxClient, TlsMockServer) {
     }])
     .await;
 
-    let secret_path = create_secret_file("0123456789abcdef");
+    let secret_path = create_secret_file("not-a-real-secret-0123456789abcdef");
     let mut cluster = cluster_for(server.uri(), server.ca_pem_path());
     cluster.token_secret_file = Some(secret_path);
 

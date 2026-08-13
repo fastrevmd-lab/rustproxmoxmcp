@@ -49,7 +49,7 @@ async fn unwraps_the_data_envelope() {
     }])
     .await;
 
-    let secret_path = create_secret_file("0123456789abcdef");
+    let secret_path = create_secret_file("not-a-real-secret-0123456789abcdef");
     let mut cluster = cluster_for(server.uri(), server.ca_pem_path());
     cluster.token_secret_file = Some(secret_path);
 
@@ -66,7 +66,7 @@ async fn unwraps_the_data_envelope() {
     assert_eq!(requests.len(), 1);
     assert_eq!(
         requests[0].authorization.as_deref(),
-        Some("PVEAPIToken=root@pam!mcp=0123456789abcdef")
+        Some("PVEAPIToken=root@pam!mcp=not-a-real-secret-0123456789abcdef")
     );
 }
 
@@ -81,7 +81,7 @@ async fn expands_a_path_template_and_percent_encodes_the_value() {
     }])
     .await;
 
-    let secret_path = create_secret_file("0123456789abcdef");
+    let secret_path = create_secret_file("not-a-real-secret-0123456789abcdef");
     let mut cluster = cluster_for(server.uri(), server.ca_pem_path());
     cluster.token_secret_file = Some(secret_path);
 
@@ -104,7 +104,7 @@ async fn a_path_parameter_cannot_escape_its_segment() {
 
     let server = TlsMockServer::start(vec![]).await;
 
-    let secret_path = create_secret_file("0123456789abcdef");
+    let secret_path = create_secret_file("not-a-real-secret-0123456789abcdef");
     let mut cluster = cluster_for(server.uri(), server.ca_pem_path());
     cluster.token_secret_file = Some(secret_path);
 
@@ -134,11 +134,11 @@ async fn a_401_becomes_unauthorized_without_echoing_the_body() {
     let server = TlsMockServer::start(vec![Route {
         path: "/api2/json/nodes",
         status: 401,
-        body: b"authentication failure: token 0123456789abcdef",
+        body: b"authentication failure: token not-a-real-secret-0123456789abcdef",
     }])
     .await;
 
-    let secret_path = create_secret_file("0123456789abcdef");
+    let secret_path = create_secret_file("not-a-real-secret-0123456789abcdef");
     let mut cluster = cluster_for(server.uri(), server.ca_pem_path());
     cluster.token_secret_file = Some(secret_path);
 
@@ -153,7 +153,9 @@ async fn a_401_becomes_unauthorized_without_echoing_the_body() {
         "expected Unauthorized, got {error:?}"
     );
     assert!(
-        !error.to_string().contains("0123456789abcdef"),
+        !error
+            .to_string()
+            .contains("not-a-real-secret-0123456789abcdef"),
         "secret must not leak into error message"
     );
 }
@@ -163,7 +165,7 @@ async fn a_plaintext_endpoint_is_refused_at_construction() {
     ensure_crypto_provider();
 
     let server = TlsMockServer::start(vec![]).await;
-    let secret_path = create_secret_file("0123456789abcdef");
+    let secret_path = create_secret_file("not-a-real-secret-0123456789abcdef");
 
     let mut cluster = cluster_for("http://pve3.example.org:8006", server.ca_pem_path());
     cluster.ca_pem_path = None;
@@ -187,7 +189,7 @@ async fn appends_query_parameters() {
     }])
     .await;
 
-    let secret_path = create_secret_file("0123456789abcdef");
+    let secret_path = create_secret_file("not-a-real-secret-0123456789abcdef");
     let mut cluster = cluster_for(server.uri(), server.ca_pem_path());
     cluster.token_secret_file = Some(secret_path);
 
