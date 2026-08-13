@@ -41,7 +41,9 @@ tracing     = "0.1"
 url         = "2"
 
 # Test-only
-wiremock    = "0.6"
+rcgen        = "0.13"
+tokio-rustls = "0.26"
+wiremock     = "0.6"
 
 # mecmcp is consumed read-only at an exact pinned version. Do not relax the tag.
 mecmcp-audit     = { version = "0.8.8", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.8.8" }

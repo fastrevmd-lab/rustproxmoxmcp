@@ -23,6 +23,7 @@ pub mod resolve;
 pub mod selector;
 pub mod tier;
 
+pub use client::ProxmoxClient;
 pub use error::ProxmoxError;
 pub use grant::{ProxmoxAction, ProxmoxGrant};
 pub use inventory::{Cluster, ClusterInventory, ClusterPolicy};
