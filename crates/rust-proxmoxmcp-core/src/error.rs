@@ -24,7 +24,10 @@ pub enum ProxmoxError {
         /// Bounded, control-stripped detail.
         message: String,
     },
-    /// The cluster rejected our credentials.
+    /// The cluster rejected our credentials (401 or 403 from a response).
+    ///
+    /// Distinct from [`ProxmoxError::Denied`], which is us rejecting the
+    /// *caller's* token. This is the cluster rejecting *ours*.
     ///
     /// Carries no body: a 401 body has been observed to echo the presented
     /// credential back, and this error is rendered into logs and MCP results.
@@ -53,8 +56,12 @@ pub enum ProxmoxError {
 impl ProxmoxError {
     /// Classify a non-success response.
     ///
-    /// A 401 is deliberately reduced to [`ProxmoxError::Unauthorized`] with the
-    /// body discarded.
+    /// Both 401 and 403 mean the cluster rejected the credentials this server
+    /// presented, so they are reduced to [`ProxmoxError::Unauthorized`] with
+    /// the body discarded (a 401 body has been observed to echo the presented
+    /// credential back). This is distinct from [`ProxmoxError::Denied`], which
+    /// is this server refusing the caller's token — that variant never comes
+    /// from a response.
     #[must_use]
     pub fn from_response(status: u16, body: &[u8]) -> Self {
         if status == 401 || status == 403 {
