@@ -1,6 +1,7 @@
 /target/
 /dist/
 /.worktrees/
+/.superpowers/
 **/*.rs.bk
 *.profraw
 
