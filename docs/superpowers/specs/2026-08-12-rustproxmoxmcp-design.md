@@ -180,7 +180,7 @@ never a value a caller passes.
 
 | Tier | Tools | Gate |
 |---|---|---|
-| `read` | `get_nodes`, `get_node_status`, `get_vms`, `get_containers`, `get_vm_config`, `get_container_config`, `get_container_ip`, `get_storage`, `get_cluster_status`, `list_snapshots`, `list_backups`, `list_isos`, `list_templates`, `list_jobs`, `get_job` | scope + audit |
+| `read` | `get_cluster_status`, `get_nodes`, `get_node_status`, `get_vms`, `get_containers`, `get_vm_config`, `get_container_config`, `get_container_ip`, `get_guest_status`, `get_storage`, `list_snapshots`, `list_backups`, `list_isos`, `list_templates`, `list_tasks`, `get_task_status` | scope + audit |
 | `low` | `start_vm`, `stop_vm`, `shutdown_vm`, `reset_vm`, `start_container`, `stop_container`, `restart_container`, `create_snapshot`, `create_backup`, `create_vm`, `create_container`, `clone_vm`, `download_iso`, `update_container_resources`, `resize_disk` (grow) | scope + protection reported + audit |
 | `destructive` | `delete_vm`, `delete_container`, `restore_backup`, `rollback_snapshot`, `delete_snapshot`, `delete_backup`, `delete_iso`, `resize_disk` (shrink) | change set: plan → fingerprint → approve → apply |
 

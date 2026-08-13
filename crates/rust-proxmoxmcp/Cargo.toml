@@ -37,7 +37,6 @@ tracing          = { workspace = true }
 [dev-dependencies]
 mecmcp-transport = { workspace = true }
 tokio            = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
-wiremock         = { workspace = true }
 
 [lints]
 workspace = true
