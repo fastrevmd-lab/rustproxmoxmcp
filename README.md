@@ -18,7 +18,11 @@
 
 Release 0.1 delivers the complete read-only catalog: 16 tools covering cluster status, nodes, guests (QEMU VMs and LXC containers), storage, backups, ISO images, templates, snapshots, and tasks. **No mutating tools exist yet** — every destructive operation (`delete_vm`, `clone_vm`, snapshot/backup lifecycle, etc.) is deferred to release 0.2.
 
-**Testing status:** All 78 tests pass, including an adversarial suite covering the authorization spine and the protection union. The test suite exercises the code against **mock Proxmox servers only** — release 0.1 has not been run against a real Proxmox cluster.
+**Testing status:** All 78 tests pass, including an adversarial suite covering the authorization spine and the protection union. Release 0.1 was installed from a release tarball onto a Debian 13 LXC and run against a live two-node Proxmox VE cluster with a read-only API token. Confirmed there: all 16 read tools listed with in-scope filtering; guest reads returned live cluster data; out-of-scope guest access was refused without disclosing the guest's name; `delete_vm` was refused at stage-1 preflight with HTTP 403 despite a wildcard tool scope; the node was resolved server-side; a protected guest reported both protection reasons (tag and inventory pin); audit events were emitted for allowed and refused calls; SIGHUP reloaded configuration in place.
+
+**Not validated:** No mutating operation was exercised (none exists in this release). The rig ran plaintext on loopback; a TLS-terminated deployment has not been exercised. Only one cluster was configured; the multi-cluster path is untested against real hardware. Validation ran on a disposable rehearsal rig, not on an operational deployment.
+
+Five defects were found by live-cluster validation and are fixed in release 0.1.1.
 
 ### What's implemented
 
