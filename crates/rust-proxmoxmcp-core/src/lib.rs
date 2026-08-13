@@ -27,3 +27,4 @@ pub use error::ProxmoxError;
 pub use grant::{ProxmoxAction, ProxmoxGrant};
 pub use inventory::{Cluster, ClusterInventory, ClusterPolicy};
 pub use selector::{GuestType, Selector};
+pub use tier::Tier;
