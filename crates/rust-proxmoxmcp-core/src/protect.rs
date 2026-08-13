@@ -182,7 +182,11 @@ mod tests {
 
     #[test]
     fn an_untagged_unpinned_known_guest_is_unprotected() {
-        let verdict = protection_of(&cluster(vec![905]), Some(&guest(606, &["disposable"])), false);
+        let verdict = protection_of(
+            &cluster(vec![905]),
+            Some(&guest(606, &["disposable"])),
+            false,
+        );
         assert!(!verdict.is_protected());
     }
 
@@ -196,7 +200,11 @@ mod tests {
 
     #[test]
     fn every_applicable_reason_is_reported_not_just_the_first() {
-        let verdict = protection_of(&cluster(vec![905]), Some(&guest(905, &["protected"])), false);
+        let verdict = protection_of(
+            &cluster(vec![905]),
+            Some(&guest(905, &["protected"])),
+            false,
+        );
         let Protection::Protected { reasons } = verdict else {
             panic!("expected protected");
         };

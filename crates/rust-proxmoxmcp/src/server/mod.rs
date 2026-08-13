@@ -2,25 +2,22 @@
 
 use mecmcp_auth::{CallerCtx, ScopeSet};
 use mecmcp_server::{
-    ResultFormat, ResultLimits, authorize_call, caller_from_extensions,
-    filter_tools_for_scope, tool_error, tool_result,
+    ResultFormat, ResultLimits, authorize_call, caller_from_extensions, filter_tools_for_scope,
+    tool_error, tool_result,
 };
 use rmcp::{
     RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Implementation, ListToolsResult, PaginatedRequestParams,
-        ServerCapabilities, ServerInfo},
+    model::{
+        CallToolResult, Implementation, ListToolsResult, PaginatedRequestParams,
+        ServerCapabilities, ServerInfo,
+    },
     service::RequestContext,
     tool, tool_handler, tool_router,
 };
 use rust_proxmoxmcp_core::{
-    ProxmoxGrant, Tier,
-    catalog::read_tool,
-    client::ProxmoxClient,
-    inventory::ClusterInventory,
-    resolve::GuestIndex,
-    selector::GuestType,
-    tier::WRITE_TOOLS,
+    ProxmoxGrant, Tier, catalog::read_tool, client::ProxmoxClient, inventory::ClusterInventory,
+    resolve::GuestIndex, selector::GuestType, tier::WRITE_TOOLS,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -262,7 +259,11 @@ impl ProxmoxServer {
         };
 
         match result {
-            Ok(value) => tool_result(Ok::<_, String>(value), ResultFormat::PrettyJson, RESULT_LIMITS),
+            Ok(value) => tool_result(
+                Ok::<_, String>(value),
+                ResultFormat::PrettyJson,
+                RESULT_LIMITS,
+            ),
             Err(error) => tool_error(error),
         }
     }
@@ -270,7 +271,10 @@ impl ProxmoxServer {
 
 #[tool_router(router = proxmox_tool_router, vis = "pub(crate)")]
 impl ProxmoxServer {
-    #[tool(name = "get_cluster_status", description = "Cluster quorum and node membership.")]
+    #[tool(
+        name = "get_cluster_status",
+        description = "Cluster quorum and node membership."
+    )]
     async fn get_cluster_status(
         &self,
         Parameters(args): Parameters<ClusterArgs>,
@@ -280,7 +284,10 @@ impl ProxmoxServer {
             .await
     }
 
-    #[tool(name = "get_nodes", description = "All nodes in the cluster with status and resource totals.")]
+    #[tool(
+        name = "get_nodes",
+        description = "All nodes in the cluster with status and resource totals."
+    )]
     async fn get_nodes(
         &self,
         Parameters(args): Parameters<ClusterArgs>,
@@ -290,7 +297,10 @@ impl ProxmoxServer {
             .await
     }
 
-    #[tool(name = "get_node_status", description = "Detailed status for one node.")]
+    #[tool(
+        name = "get_node_status",
+        description = "Detailed status for one node."
+    )]
     async fn get_node_status(
         &self,
         Parameters(args): Parameters<NodeArgs>,
@@ -306,7 +316,10 @@ impl ProxmoxServer {
         .await
     }
 
-    #[tool(name = "get_vms", description = "All QEMU guests across the cluster, with node, status and tags.")]
+    #[tool(
+        name = "get_vms",
+        description = "All QEMU guests across the cluster, with node, status and tags."
+    )]
     async fn get_vms(
         &self,
         Parameters(args): Parameters<ClusterArgs>,
@@ -316,7 +329,10 @@ impl ProxmoxServer {
             .await
     }
 
-    #[tool(name = "get_containers", description = "All LXC guests across the cluster, with node, status and tags.")]
+    #[tool(
+        name = "get_containers",
+        description = "All LXC guests across the cluster, with node, status and tags."
+    )]
     async fn get_containers(
         &self,
         Parameters(args): Parameters<ClusterArgs>,
@@ -326,27 +342,48 @@ impl ProxmoxServer {
             .await
     }
 
-    #[tool(name = "get_vm_config", description = "Configuration of one QEMU guest, including its Proxmox digest.")]
+    #[tool(
+        name = "get_vm_config",
+        description = "Configuration of one QEMU guest, including its Proxmox digest."
+    )]
     async fn get_vm_config(
         &self,
         Parameters(args): Parameters<GuestArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        self.serve_read("get_vm_config", &args.cluster, &[], Some(args.vmid), &context)
-            .await
+        self.serve_read(
+            "get_vm_config",
+            &args.cluster,
+            &[],
+            Some(args.vmid),
+            &context,
+        )
+        .await
     }
 
-    #[tool(name = "get_container_config", description = "Configuration of one LXC guest, including its Proxmox digest.")]
+    #[tool(
+        name = "get_container_config",
+        description = "Configuration of one LXC guest, including its Proxmox digest."
+    )]
     async fn get_container_config(
         &self,
         Parameters(args): Parameters<GuestArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        self.serve_read("get_container_config", &args.cluster, &[], Some(args.vmid), &context)
-            .await
+        self.serve_read(
+            "get_container_config",
+            &args.cluster,
+            &[],
+            Some(args.vmid),
+            &context,
+        )
+        .await
     }
 
-    #[tool(name = "get_container_ip", description = "Network interfaces and addresses of one LXC guest.")]
+    #[tool(
+        name = "get_container_ip",
+        description = "Network interfaces and addresses of one LXC guest."
+    )]
     async fn get_container_ip(
         &self,
         Parameters(args): Parameters<GuestArgs>,
@@ -354,7 +391,12 @@ impl ProxmoxServer {
     ) -> CallToolResult {
         // This tool is LXC-only. We need to resolve the guest first to check its type.
         let caller = Self::caller(&context);
-        if let Err(error) = authorize_call(caller.as_ref(), "get_container_ip", Some(&args.cluster), WRITE_TOOLS) {
+        if let Err(error) = authorize_call(
+            caller.as_ref(),
+            "get_container_ip",
+            Some(&args.cluster),
+            WRITE_TOOLS,
+        ) {
             return tool_error(error);
         }
 
@@ -385,10 +427,7 @@ impl ProxmoxServer {
         }
 
         let vmid_str = guest.vmid.to_string();
-        let params = vec![
-            ("node", guest.node.as_str()),
-            ("vmid", vmid_str.as_str()),
-        ];
+        let params = vec![("node", guest.node.as_str()), ("vmid", vmid_str.as_str())];
 
         tracing::info!(
             tool = "get_container_ip",
@@ -404,19 +443,32 @@ impl ProxmoxServer {
 
         let entry = read_tool("get_container_ip").expect("tool in catalog");
         match client.get_json(entry.path, &params, entry.query).await {
-            Ok(value) => tool_result(Ok::<_, String>(value), ResultFormat::PrettyJson, RESULT_LIMITS),
+            Ok(value) => tool_result(
+                Ok::<_, String>(value),
+                ResultFormat::PrettyJson,
+                RESULT_LIMITS,
+            ),
             Err(error) => tool_error(error),
         }
     }
 
-    #[tool(name = "get_guest_status", description = "Current runtime status of one guest.")]
+    #[tool(
+        name = "get_guest_status",
+        description = "Current runtime status of one guest."
+    )]
     async fn get_guest_status(
         &self,
         Parameters(args): Parameters<GuestArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        self.serve_read("get_guest_status", &args.cluster, &[], Some(args.vmid), &context)
-            .await
+        self.serve_read(
+            "get_guest_status",
+            &args.cluster,
+            &[],
+            Some(args.vmid),
+            &context,
+        )
+        .await
     }
 
     #[tool(name = "list_snapshots", description = "Snapshots of one guest.")]
@@ -425,11 +477,20 @@ impl ProxmoxServer {
         Parameters(args): Parameters<GuestArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        self.serve_read("list_snapshots", &args.cluster, &[], Some(args.vmid), &context)
-            .await
+        self.serve_read(
+            "list_snapshots",
+            &args.cluster,
+            &[],
+            Some(args.vmid),
+            &context,
+        )
+        .await
     }
 
-    #[tool(name = "get_storage", description = "Storage backends visible to one node, with usage.")]
+    #[tool(
+        name = "get_storage",
+        description = "Storage backends visible to one node, with usage."
+    )]
     async fn get_storage(
         &self,
         Parameters(args): Parameters<NodeArgs>,
@@ -445,7 +506,10 @@ impl ProxmoxServer {
         .await
     }
 
-    #[tool(name = "list_backups", description = "Backup archives on one storage backend.")]
+    #[tool(
+        name = "list_backups",
+        description = "Backup archives on one storage backend."
+    )]
     async fn list_backups(
         &self,
         Parameters(args): Parameters<StorageArgs>,
@@ -454,7 +518,10 @@ impl ProxmoxServer {
         self.serve_read(
             "list_backups",
             &args.cluster,
-            &[("node", args.node.as_str()), ("storage", args.storage.as_str())],
+            &[
+                ("node", args.node.as_str()),
+                ("storage", args.storage.as_str()),
+            ],
             None,
             &context,
         )
@@ -470,14 +537,20 @@ impl ProxmoxServer {
         self.serve_read(
             "list_isos",
             &args.cluster,
-            &[("node", args.node.as_str()), ("storage", args.storage.as_str())],
+            &[
+                ("node", args.node.as_str()),
+                ("storage", args.storage.as_str()),
+            ],
             None,
             &context,
         )
         .await
     }
 
-    #[tool(name = "list_templates", description = "Container templates on one storage backend.")]
+    #[tool(
+        name = "list_templates",
+        description = "Container templates on one storage backend."
+    )]
     async fn list_templates(
         &self,
         Parameters(args): Parameters<StorageArgs>,
@@ -486,7 +559,10 @@ impl ProxmoxServer {
         self.serve_read(
             "list_templates",
             &args.cluster,
-            &[("node", args.node.as_str()), ("storage", args.storage.as_str())],
+            &[
+                ("node", args.node.as_str()),
+                ("storage", args.storage.as_str()),
+            ],
             None,
             &context,
         )

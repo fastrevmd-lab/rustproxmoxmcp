@@ -3,9 +3,9 @@
 //! These tests use a hand-rolled TLS server because `mecmcp-http` rejects
 //! plaintext URLs at construction and `wiremock` has no TLS support.
 
-use rust_proxmoxmcp_core::testing::{cluster_for, Route, TlsMockServer};
 use rust_proxmoxmcp_core::client::ProxmoxClient;
 use rust_proxmoxmcp_core::error::ProxmoxError;
+use rust_proxmoxmcp_core::testing::{Route, TlsMockServer, cluster_for};
 use std::io::Write as _;
 use std::path::PathBuf;
 

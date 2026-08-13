@@ -3,14 +3,17 @@
 //! that cannot be constructed any other way.
 
 use rust_proxmoxmcp_core::{
-    client::ProxmoxClient, error::ProxmoxError, grant::{ProxmoxAction, ProxmoxGrant},
-    resolve::GuestIndex, tier::Tier,
+    client::ProxmoxClient,
+    error::ProxmoxError,
+    grant::{ProxmoxAction, ProxmoxGrant},
+    resolve::GuestIndex,
+    tier::Tier,
 };
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use rust_proxmoxmcp_core::testing::{cluster_for, Route, TlsMockServer};
+use rust_proxmoxmcp_core::testing::{Route, TlsMockServer, cluster_for};
 
 const RESOURCES: &[u8] = br#"{"data":[
   {"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2",
@@ -125,7 +128,13 @@ async fn a_protected_guest_still_authorizes_for_read_and_reports_protection() {
 async fn an_unknown_guest_is_not_found_and_never_yields_an_authorized_guest() {
     let (index, client, _server) = fixture().await;
     let error = index
-        .authorize(&client, "pve3", 4242, &ProxmoxGrant::read_only(), Tier::Read)
+        .authorize(
+            &client,
+            "pve3",
+            4242,
+            &ProxmoxGrant::read_only(),
+            Tier::Read,
+        )
         .await
         .expect_err("absent");
     assert!(matches!(error, ProxmoxError::NotFound { .. }));

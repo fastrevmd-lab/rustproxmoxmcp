@@ -8,7 +8,7 @@
 
 use rust_proxmoxmcp_core::{
     catalog::READ_TOOLS,
-    tier::{tier_of, Tier, WRITE_TOOLS},
+    tier::{Tier, WRITE_TOOLS, tier_of},
 };
 
 #[test]
@@ -92,7 +92,8 @@ fn the_write_registry_is_sorted_within_its_semantic_groups() {
     let mut low_sorted = low_tier.to_vec();
     low_sorted.sort_unstable();
     assert_eq!(
-        low_tier, low_sorted.as_slice(),
+        low_tier,
+        low_sorted.as_slice(),
         "low-tier section is not sorted"
     );
 
@@ -101,7 +102,8 @@ fn the_write_registry_is_sorted_within_its_semantic_groups() {
     let mut destructive_sorted = destructive.to_vec();
     destructive_sorted.sort_unstable();
     assert_eq!(
-        destructive, destructive_sorted.as_slice(),
+        destructive,
+        destructive_sorted.as_slice(),
         "destructive section is not sorted"
     );
 

@@ -12,11 +12,8 @@ use mecmcp_runtime::cli::{Command, TokenAction, Transport};
 use mecmcp_transport::{LimitsConfig, serve_router};
 use rmcp::ServiceExt as _;
 use rust_proxmoxmcp_core::{
-    ProxmoxAction, ProxmoxGrant,
-    client::ProxmoxClient,
-    inventory::ClusterInventory,
-    resolve::GuestIndex,
-    selector::Selector,
+    ProxmoxAction, ProxmoxGrant, client::ProxmoxClient, inventory::ClusterInventory,
+    resolve::GuestIndex, selector::Selector,
 };
 use server::ProxmoxServer;
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::Duration};
@@ -41,9 +38,8 @@ fn build_token_grant_from_add(
     // Validate each selector at mint time. A selector that cannot parse produces
     // a token that silently admits nothing, which an operator cannot diagnose.
     for term in guests {
-        Selector::parse(term).map_err(|error| {
-            anyhow::anyhow!("invalid --guests selector '{term}': {error}")
-        })?;
+        Selector::parse(term)
+            .map_err(|error| anyhow::anyhow!("invalid --guests selector '{term}': {error}"))?;
     }
 
     // Parse action names.
@@ -66,9 +62,7 @@ fn build_token_grant_from_add(
 }
 
 /// Convert `TokenCommand` to `TokenAction` and extract grant for Add.
-fn token_command_to_action(
-    command: TokenCommand,
-) -> Result<(TokenAction, Option<ProxmoxGrant>)> {
+fn token_command_to_action(command: TokenCommand) -> Result<(TokenAction, Option<ProxmoxGrant>)> {
     match command {
         TokenCommand::Add {
             tokens_file,
@@ -206,7 +200,7 @@ async fn main() -> Result<()> {
             // SIGHUP reloads the inventory in place. Stdio has no token store.
             install_sighup_reload(Arc::clone(&clusters), Arc::clone(&index), None)?;
             serve_stdio(clusters, clients, index).await
-        },
+        }
         Transport::StreamableHttp => {
             let token_store = load_http_token_store(&args.common)?;
 
@@ -335,22 +329,16 @@ fn load_http_token_store(
             );
             Ok(None)
         }
-        (Some(_), true) => {
-            Err(anyhow::anyhow!(
-                "contradictory flags: both --tokens-file and --allow-no-auth were given"
-            ))
-        }
-        (None, false) => {
-            Err(anyhow::anyhow!(
-                "Streamable HTTP requires either --tokens-file or --allow-no-auth"
-            ))
-        }
+        (Some(_), true) => Err(anyhow::anyhow!(
+            "contradictory flags: both --tokens-file and --allow-no-auth were given"
+        )),
+        (None, false) => Err(anyhow::anyhow!(
+            "Streamable HTTP requires either --tokens-file or --allow-no-auth"
+        )),
     }
 }
 
-fn load_listener_tls(
-    args: &mecmcp_runtime::cli::Cli,
-) -> Result<Option<Arc<rustls::ServerConfig>>> {
+fn load_listener_tls(args: &mecmcp_runtime::cli::Cli) -> Result<Option<Arc<rustls::ServerConfig>>> {
     let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) else {
         return Ok(None);
     };

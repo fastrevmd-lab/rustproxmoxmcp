@@ -9,10 +9,9 @@
 use crate::server::ProxmoxServer;
 use mecmcp_auth::{BearerSyntax, CallerCtx, TokenStoreFile};
 use mecmcp_transport::{
-    BearerAuthenticator, BearerBoundary, BearerResponseProfile, HostOriginPolicy,
-    HttpShutdown, HttpTransportBuildError, HttpTransportConfig, LimitsConfig,
-    MalformedArgumentsPolicy, TargetField, ToolScopePreflight,
-    TransportIdentity, build_streamable_http_router,
+    BearerAuthenticator, BearerBoundary, BearerResponseProfile, HostOriginPolicy, HttpShutdown,
+    HttpTransportBuildError, HttpTransportConfig, LimitsConfig, MalformedArgumentsPolicy,
+    TargetField, ToolScopePreflight, TransportIdentity, build_streamable_http_router,
 };
 use rust_proxmoxmcp_core::{ProxmoxGrant, tier::WRITE_TOOLS};
 use std::sync::Arc;
@@ -51,12 +50,8 @@ pub fn build_http_router(
     enable_metrics: bool,
     shutdown: CancellationToken,
 ) -> Result<(axum::Router, HttpShutdown), HttpTransportBuildError> {
-    let identity = TransportIdentity::new(
-        "rust-proxmoxmcp",
-        "proxmox",
-        "rust-proxmoxmcp",
-        ["cluster"],
-    );
+    let identity =
+        TransportIdentity::new("rust-proxmoxmcp", "proxmox", "rust-proxmoxmcp", ["cluster"]);
     let mut config = HttpTransportConfig::new(
         identity,
         limits,
@@ -109,9 +104,11 @@ mod tests {
         let clusters = ScopeSet::Allowlist(vec!["pve3".to_owned()]);
         let tools = ScopeSet::Allowlist(vec!["get_nodes".to_owned()]);
         let preflight = build_preflight();
-        assert!(preflight
-            .check(&call("get_nodes", "pve3"), scopes(&clusters, &tools))
-            .is_ok());
+        assert!(
+            preflight
+                .check(&call("get_nodes", "pve3"), scopes(&clusters, &tools))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -119,9 +116,11 @@ mod tests {
         let clusters = ScopeSet::Allowlist(vec!["pve3".to_owned()]);
         let tools = ScopeSet::Wildcard;
         let preflight = build_preflight();
-        assert!(preflight
-            .check(&call("get_nodes", "pve2"), scopes(&clusters, &tools))
-            .is_err());
+        assert!(
+            preflight
+                .check(&call("get_nodes", "pve2"), scopes(&clusters, &tools))
+                .is_err()
+        );
     }
 
     #[test]
@@ -131,9 +130,11 @@ mod tests {
         let clusters = ScopeSet::Wildcard;
         let tools = ScopeSet::Wildcard;
         let preflight = build_preflight();
-        assert!(preflight
-            .check(&call("delete_vm", "pve3"), scopes(&clusters, &tools))
-            .is_err());
+        assert!(
+            preflight
+                .check(&call("delete_vm", "pve3"), scopes(&clusters, &tools))
+                .is_err()
+        );
     }
 
     #[test]
@@ -143,8 +144,6 @@ mod tests {
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call",
                         "params":{"name":"get_nodes","arguments":"not-an-object"}}"#;
         let preflight = build_preflight();
-        assert!(preflight
-            .check(body, scopes(&clusters, &tools))
-            .is_err());
+        assert!(preflight.check(body, scopes(&clusters, &tools)).is_err());
     }
 }

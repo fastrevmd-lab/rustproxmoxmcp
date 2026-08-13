@@ -107,11 +107,12 @@ impl TlsMockServer {
         let key_pair = rcgen::KeyPair::generate().expect("generate key pair");
         let params = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
             .expect("create certificate params");
-        let cert = params.self_signed(&key_pair).expect("self-sign certificate");
+        let cert = params
+            .self_signed(&key_pair)
+            .expect("self-sign certificate");
 
         let cert_pem = cert.pem();
-        let key_der =
-            rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into();
+        let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into();
 
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut server_config = rustls::ServerConfig::builder_with_provider(provider)
