@@ -120,14 +120,22 @@ async fn main() -> Result<()> {
         clusters.policy().resource_cache_ttl_secs,
     )));
 
-    // SIGHUP reloads the inventory in place. A failed reload leaves the previous
-    // contents in effect and logs; it must never take the server down.
-    install_sighup_reload(Arc::clone(&clusters), Arc::clone(&index))?;
-
     match args.common.transport {
-        Transport::Stdio => serve_stdio(clusters, clients, index).await,
+        Transport::Stdio => {
+            // SIGHUP reloads the inventory in place. Stdio has no token store.
+            install_sighup_reload(Arc::clone(&clusters), Arc::clone(&index), None)?;
+            serve_stdio(clusters, clients, index).await
+        },
         Transport::StreamableHttp => {
             let token_store = load_http_token_store(&args.common)?;
+
+            // Install SIGHUP handler that reloads both inventory and token store.
+            install_sighup_reload(
+                Arc::clone(&clusters),
+                Arc::clone(&index),
+                token_store.clone(),
+            )?;
+
             let tls = load_listener_tls(&args.common)?;
             let host = args
                 .common
@@ -277,8 +285,10 @@ fn load_listener_tls(
 fn install_sighup_reload(
     clusters: Arc<ClusterInventory>,
     index: Arc<GuestIndex>,
+    token_store: Option<Arc<TokenStoreFile<ProxmoxGrant>>>,
 ) -> std::io::Result<()> {
     mecmcp_runtime::signals::install_hup_handler(move || {
+        // Reload cluster inventory.
         match clusters.reload() {
             Ok(count) => {
                 index.invalidate();
@@ -286,6 +296,19 @@ fn install_sighup_reload(
             }
             Err(error) => {
                 tracing::error!(%error, "cluster inventory reload failed; retaining previous snapshot");
+            }
+        }
+
+        // Reload token store if present (HTTP mode only).
+        if let Some(ref store) = token_store {
+            match store.reload() {
+                Ok(()) => {
+                    let count = store.store().len();
+                    tracing::info!(tokens = count, "token store reloaded");
+                }
+                Err(error) => {
+                    tracing::error!(%error, "token store reload failed; retaining previous snapshot");
+                }
             }
         }
     })
