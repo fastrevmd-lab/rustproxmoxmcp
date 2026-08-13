@@ -35,6 +35,9 @@ async fn main() -> Result<()> {
     );
     let args = parsed.cli;
 
+    mecmcp_runtime::cli_validate::validate(&args.common)
+        .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
+
     init_audit(&args.common)?;
 
     if let Some(Command::Token { action }) = args.common.command {
@@ -194,7 +197,16 @@ fn load_http_token_store(
             );
             Ok(None)
         }
-        _ => Ok(None),
+        (Some(_), true) => {
+            Err(anyhow::anyhow!(
+                "contradictory flags: both --tokens-file and --allow-no-auth were given"
+            ))
+        }
+        (None, false) => {
+            Err(anyhow::anyhow!(
+                "Streamable HTTP requires either --tokens-file or --allow-no-auth"
+            ))
+        }
     }
 }
 
