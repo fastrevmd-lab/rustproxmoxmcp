@@ -220,4 +220,42 @@ mod tests {
         let inventory = ClusterInventory::load(file.path()).expect("load");
         assert_eq!(inventory.policy().resource_cache_ttl_secs, 10);
     }
+
+    #[test]
+    fn defaults_protected_tags_when_omitted() {
+        let file = write_fixture(
+            r#"{
+              "version": 1,
+              "devices": {
+                "pve3": {
+                  "endpoint": "https://pve3.example.org:8006",
+                  "token_id": "root@pam!mcp",
+                  "token_secret_env": "PVE_PVE3_TOKEN"
+                }
+              }
+            }"#,
+        );
+        let inventory = ClusterInventory::load(file.path()).expect("load");
+        let cluster = inventory.get("pve3").expect("cluster");
+        assert_eq!(cluster.protected_tags, vec!["protected".to_owned()]);
+    }
+
+    #[test]
+    fn defaults_resource_cache_ttl_secs_via_serde() {
+        let file = write_fixture(
+            r#"{
+              "version": 1,
+              "devices": {
+                "pve3": {
+                  "endpoint": "https://pve3.example.org:8006",
+                  "token_id": "root@pam!mcp",
+                  "token_secret_env": "PVE_PVE3_TOKEN"
+                }
+              },
+              "policy": {}
+            }"#,
+        );
+        let inventory = ClusterInventory::load(file.path()).expect("load");
+        assert_eq!(inventory.policy().resource_cache_ttl_secs, 10);
+    }
 }

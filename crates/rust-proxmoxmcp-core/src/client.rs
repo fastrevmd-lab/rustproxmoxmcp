@@ -8,6 +8,7 @@
 use crate::error::ProxmoxError;
 use crate::inventory::Cluster;
 use mecmcp_http::{HttpClient, HttpClientConfig, HttpRequest, Method};
+use mecmcp_secret::OutboundSecret;
 use std::time::Duration;
 
 /// Requests in flight to one cluster.
@@ -27,7 +28,7 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 pub struct ProxmoxClient {
     cluster: Cluster,
     http: HttpClient,
-    authorization: String,
+    authorization: OutboundSecret,
 }
 
 impl ProxmoxClient {
@@ -50,7 +51,7 @@ impl ProxmoxClient {
         }
 
         let secret = cluster.load_secret()?;
-        let authorization = cluster.authorization_value(&secret);
+        let authorization = OutboundSecret::new_unchecked(cluster.authorization_value(&secret));
 
         let mut extra_root_certificates = Vec::new();
         if let Some(path) = &cluster.ca_pem_path {
@@ -124,7 +125,7 @@ impl ProxmoxClient {
 
         let request = HttpRequest::new(Method::Get, &url)?
             .header("Accept", "application/json")?
-            .header_bytes("Authorization", self.authorization.as_bytes())?;
+            .secret_header("Authorization", &self.authorization)?;
 
         let response = self.http.send(request).await?;
         if response.status() >= 400 {
