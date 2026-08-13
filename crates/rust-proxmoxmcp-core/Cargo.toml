@@ -30,6 +30,7 @@ tokio-rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
+trybuild = "1"
 
 [features]
 testing = ["dep:rcgen", "dep:rustls", "dep:tempfile", "dep:tokio-rustls"]
