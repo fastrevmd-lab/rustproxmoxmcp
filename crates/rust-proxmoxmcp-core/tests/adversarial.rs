@@ -44,11 +44,14 @@ fn no_catalog_tool_uses_a_mutating_method() {
 }
 
 #[test]
-fn every_write_tool_classifies_as_low_or_destructive() {
-    // The write registry is what excludes a tool from the wildcard scope. A
-    // destructive tool missing from it is reachable by a "tools": ["*"] token,
-    // and a read tool present in it narrows authority beyond what the spec
-    // requires.
+fn every_write_tool_has_a_tier_classification() {
+    // Every tool in the write registry must have a tier classification — if
+    // tier_of returns None, the tool is unclassified and its authority is
+    // undefined. Because tier_of checks WRITE_TOOLS before the catalog, this
+    // test cannot detect a read tool mistakenly added to WRITE_TOOLS (that case
+    // is guarded by no_read_tool_name_appears_in_the_write_registry). What this
+    // catches is a tool name that exists in neither the catalog nor the
+    // destructive list, which would be unreachable but listed as excluded.
     for tool in WRITE_TOOLS {
         let tier = tier_of(tool).unwrap_or_else(|| panic!("unclassified tool {tool}"));
         assert!(
