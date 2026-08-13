@@ -399,7 +399,7 @@ async fn serve_http(
     shutdown_timeout: Duration,
 ) -> Result<()> {
     let handler = ProxmoxServer::new(clusters, clients, index);
-    let (router, shutdown_token) = build_http_router(
+    let plan = build_http_router(
         handler,
         token_store,
         allowed_hosts,
@@ -410,7 +410,7 @@ async fn serve_http(
     )
     .map_err(|error| anyhow::anyhow!("building HTTP router: {error}"))?;
 
-    serve_router(router, address, tls, shutdown_token, shutdown_timeout)
+    serve_router(plan, address, tls, shutdown_timeout)
         .await
         .map_err(anyhow::Error::from)
 }

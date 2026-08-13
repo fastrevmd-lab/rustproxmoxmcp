@@ -41,6 +41,7 @@ rust-proxmoxmcp-core = { workspace = true, features = ["testing"] }
 serde_json       = { workspace = true }
 tempfile         = "3"
 tokio            = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+uuid             = { workspace = true }
 
 [lints]
 workspace = true

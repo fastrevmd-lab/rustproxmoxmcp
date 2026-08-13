@@ -23,7 +23,11 @@ use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
+
+/// Allocate a unique test port for each TestServer instance.
+static TEST_PORT_COUNTER: AtomicU16 = AtomicU16::new(19888);
 
 /// Token specification for test scenarios.
 pub struct TokenSpec {
@@ -196,29 +200,32 @@ impl TestServer {
             Arc::new(TokenStoreFile::<ProxmoxGrant>::load(&tokens_path).expect("load tokens.json"));
         let shutdown = tokio_util::sync::CancellationToken::new();
 
-        let (router, _shutdown_token) = build_http_router(
+        let plan = build_http_router(
             handler,
             Some(token_store_arc),
             vec![],
             vec![],
             LimitsConfig::default(),
             false,
-            shutdown,
+            shutdown.clone(),
         )
         .expect("build HTTP router");
 
-        // Bind to 127.0.0.1:0 and serve the router.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind listener");
-        let addr = listener.local_addr().expect("get local addr");
+        // Allocate a unique test port for this instance to allow parallel test execution.
+        use std::net::SocketAddr;
+        let port = TEST_PORT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let addr: SocketAddr = format!("127.0.0.1:{port}")
+            .parse()
+            .expect("parse test address");
 
         tokio::spawn(async move {
-            axum::serve(listener, router).await.expect("serve router");
+            mecmcp_transport::serve_router(plan, addr, None, Duration::from_secs(30))
+                .await
+                .expect("serve router");
         });
 
-        // Give the server a moment to start.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Give the server a moment to bind and start.
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         Self {
             url: format!("http://{addr}"),

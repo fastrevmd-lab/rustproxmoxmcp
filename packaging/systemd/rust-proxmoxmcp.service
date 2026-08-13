@@ -13,6 +13,7 @@ ExecStart=/usr/local/bin/rust-proxmoxmcp \
     --transport streamable-http \
     --host 0.0.0.0 --port 30031 \
     --allowed-host proxmoxmcp.example.org \
+    --allowed-origin https://proxmoxmcp.example.org \
     --tls-cert /etc/proxmoxmcp/tls/fullchain.pem \
     --tls-key /etc/proxmoxmcp/tls/privkey.pem \
     --audit-format json \

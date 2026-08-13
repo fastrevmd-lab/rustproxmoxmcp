@@ -9,9 +9,10 @@
 use crate::server::ProxmoxServer;
 use mecmcp_auth::{BearerSyntax, CallerCtx, TokenStoreFile};
 use mecmcp_transport::{
-    BearerAuthenticator, BearerBoundary, BearerResponseProfile, HostOriginPolicy, HttpShutdown,
+    BearerAuthenticator, BearerBoundary, BearerResponseProfile, HostOriginPolicy,
     HttpTransportBuildError, HttpTransportConfig, LimitsConfig, MalformedArgumentsPolicy,
-    TargetField, ToolScopePreflight, TransportIdentity, build_streamable_http_router,
+    NoAuthAcknowledgement, ServePlan, TargetField, ToolScopePreflight, TransportIdentity,
+    build_streamable_http_router,
 };
 use rust_proxmoxmcp_core::{ProxmoxGrant, tier::WRITE_TOOLS};
 use std::sync::Arc;
@@ -49,18 +50,12 @@ pub fn build_http_router(
     limits: LimitsConfig,
     enable_metrics: bool,
     shutdown: CancellationToken,
-) -> Result<(axum::Router, HttpShutdown), HttpTransportBuildError> {
+) -> Result<ServePlan, HttpTransportBuildError> {
     let identity =
         TransportIdentity::new("rust-proxmoxmcp", "proxmox", "rust-proxmoxmcp", ["cluster"]);
-    let mut config = HttpTransportConfig::new(
-        identity,
-        limits,
-        HostOriginPolicy::enforced(allowed_hosts, allowed_origins),
-        shutdown,
-    )
-    .with_metrics(enable_metrics);
+    let host_origin = HostOriginPolicy::enforced(allowed_hosts, allowed_origins);
 
-    if let Some(store_file) = token_store {
+    let config = if let Some(store_file) = token_store {
         let auth_store = store_file.clone();
         let authenticator = BearerAuthenticator::new(BearerSyntax::Strict, move |candidate| {
             let snapshot = auth_store.store();
@@ -71,8 +66,18 @@ pub fn build_http_router(
             BearerResponseProfile::detailed("rust-proxmoxmcp"),
         )
         .with_preflight(build_preflight());
-        config = config.with_bearer(boundary);
-    }
+        HttpTransportConfig::authenticated(identity, limits, host_origin, shutdown, boundary)
+            .with_metrics(enable_metrics)
+    } else {
+        HttpTransportConfig::unauthenticated(
+            identity,
+            limits,
+            host_origin,
+            shutdown,
+            NoAuthAcknowledgement::operator_allowed_no_auth(),
+        )
+        .with_metrics(enable_metrics)
+    };
 
     build_streamable_http_router(move || Ok::<_, std::io::Error>(handler.clone()), config)
 }
