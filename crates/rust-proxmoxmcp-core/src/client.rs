@@ -55,8 +55,9 @@ impl ProxmoxClient {
 
         let mut extra_root_certificates = Vec::new();
         if let Some(path) = &cluster.ca_pem_path {
-            let pem = std::fs::read_to_string(path)
-                .map_err(|error| ProxmoxError::Config(format!("ca_pem_path {}: {error}", path.display())))?;
+            let pem = std::fs::read_to_string(path).map_err(|error| {
+                ProxmoxError::Config(format!("ca_pem_path {}: {error}", path.display()))
+            })?;
             extra_root_certificates.push(pem);
         }
 
@@ -110,13 +111,7 @@ impl ProxmoxClient {
         if !query.is_empty() {
             let query_string = query
                 .iter()
-                .map(|(key, value)| {
-                    format!(
-                        "{}={}",
-                        percent_encode(key),
-                        percent_encode(value)
-                    )
-                })
+                .map(|(key, value)| format!("{}={}", percent_encode(key), percent_encode(value)))
                 .collect::<Vec<_>>()
                 .join("&");
             url.push('?');

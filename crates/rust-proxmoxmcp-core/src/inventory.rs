@@ -163,8 +163,11 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().expect("temp file");
         file.write_all(contents.as_bytes()).expect("write");
         // The hardened loader requires 0600.
-        std::fs::set_permissions(file.path(), std::os::unix::fs::PermissionsExt::from_mode(0o600))
-            .expect("chmod");
+        std::fs::set_permissions(
+            file.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .expect("chmod");
         file
     }
 

@@ -8,7 +8,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use rust_proxmoxmcp_core::testing::{cluster_for, Route, TlsMockServer};
+use rust_proxmoxmcp_core::testing::{Route, TlsMockServer, cluster_for};
 
 const RESOURCES: &[u8] = br#"{"data":[
   {"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2",
@@ -53,7 +53,7 @@ async fn index_and_client() -> (GuestIndex, ProxmoxClient, TlsMockServer) {
     }])
     .await;
 
-    let secret_path = create_secret_file("0123456789abcdef");
+    let secret_path = create_secret_file("not-a-real-secret-0123456789abcdef");
     let mut cluster = cluster_for(server.uri(), server.ca_pem_path());
     cluster.token_secret_file = Some(secret_path);
 
@@ -66,10 +66,7 @@ async fn index_and_client() -> (GuestIndex, ProxmoxClient, TlsMockServer) {
 #[tokio::test]
 async fn resolves_a_guest_to_its_current_node() {
     let (index, client, _server) = index_and_client().await;
-    let guest = index
-        .resolve(&client, "pve3", 905)
-        .await
-        .expect("resolve");
+    let guest = index.resolve(&client, "pve3", 905).await.expect("resolve");
     assert_eq!(guest.node, "pve2");
     assert_eq!(guest.name, "vsrx-prod");
     assert_eq!(guest.r#type, GuestType::Qemu);
@@ -78,10 +75,7 @@ async fn resolves_a_guest_to_its_current_node() {
 #[tokio::test]
 async fn splits_semicolon_separated_tags() {
     let (index, client, _server) = index_and_client().await;
-    let guest = index
-        .resolve(&client, "pve3", 606)
-        .await
-        .expect("resolve");
+    let guest = index.resolve(&client, "pve3", 606).await.expect("resolve");
     assert_eq!(guest.tags, vec!["disposable".to_owned(), "lab".to_owned()]);
 }
 
@@ -98,23 +92,14 @@ async fn an_absent_vmid_is_not_found_rather_than_a_default() {
 #[tokio::test]
 async fn a_guest_with_no_pool_resolves_with_none() {
     let (index, client, _server) = index_and_client().await;
-    let guest = index
-        .resolve(&client, "pve3", 606)
-        .await
-        .expect("resolve");
+    let guest = index.resolve(&client, "pve3", 606).await.expect("resolve");
     assert_eq!(guest.pool, None);
 }
 
 #[tokio::test]
 async fn a_second_resolve_within_the_ttl_issues_no_second_request() {
     let (index, client, server) = index_and_client().await;
-    index
-        .resolve(&client, "pve3", 905)
-        .await
-        .expect("first");
-    index
-        .resolve(&client, "pve3", 606)
-        .await
-        .expect("second");
+    index.resolve(&client, "pve3", 905).await.expect("first");
+    index.resolve(&client, "pve3", 606).await.expect("second");
     assert_eq!(server.request_count(), 1);
 }

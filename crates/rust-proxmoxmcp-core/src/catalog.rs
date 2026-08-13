@@ -215,7 +215,12 @@ mod tests {
     #[test]
     fn no_path_is_absolute_against_a_different_api_root() {
         for tool in READ_TOOLS {
-            assert!(tool.path.starts_with("/api2/json/"), "{} path {}", tool.name, tool.path);
+            assert!(
+                tool.path.starts_with("/api2/json/"),
+                "{} path {}",
+                tool.name,
+                tool.path
+            );
         }
     }
 
@@ -230,9 +235,20 @@ mod tests {
         // Both hit /cluster/resources; without the filter one of them would lie.
         let vms = read_tool("get_vms").expect("get_vms");
         let containers = read_tool("get_containers").expect("get_containers");
-        assert_eq!(vms.path, containers.path, "tools should share the same path");
-        assert_eq!(vms.type_filter, Some(GuestType::Qemu), "get_vms should filter to QEMU");
-        assert_eq!(containers.type_filter, Some(GuestType::Lxc), "get_containers should filter to LXC");
+        assert_eq!(
+            vms.path, containers.path,
+            "tools should share the same path"
+        );
+        assert_eq!(
+            vms.type_filter,
+            Some(GuestType::Qemu),
+            "get_vms should filter to QEMU"
+        );
+        assert_eq!(
+            containers.type_filter,
+            Some(GuestType::Lxc),
+            "get_containers should filter to LXC"
+        );
     }
 
     #[test]
@@ -240,11 +256,29 @@ mod tests {
         let backups = read_tool("list_backups").expect("list_backups");
         let isos = read_tool("list_isos").expect("list_isos");
         let templates = read_tool("list_templates").expect("list_templates");
-        assert_eq!(backups.path, isos.path, "backups and isos should share the same path");
-        assert_eq!(isos.path, templates.path, "isos and templates should share the same path");
-        assert_eq!(backups.query, &[("content", "backup")], "list_backups should filter by backup content");
-        assert_eq!(isos.query, &[("content", "iso")], "list_isos should filter by iso content");
-        assert_eq!(templates.query, &[("content", "vztmpl")], "list_templates should filter by vztmpl content");
+        assert_eq!(
+            backups.path, isos.path,
+            "backups and isos should share the same path"
+        );
+        assert_eq!(
+            isos.path, templates.path,
+            "isos and templates should share the same path"
+        );
+        assert_eq!(
+            backups.query,
+            &[("content", "backup")],
+            "list_backups should filter by backup content"
+        );
+        assert_eq!(
+            isos.query,
+            &[("content", "iso")],
+            "list_isos should filter by iso content"
+        );
+        assert_eq!(
+            templates.query,
+            &[("content", "vztmpl")],
+            "list_templates should filter by vztmpl content"
+        );
     }
 
     #[test]
@@ -257,7 +291,8 @@ mod tests {
                 if tool.path != other.path {
                     continue;
                 }
-                let distinguished = tool.type_filter != other.type_filter || tool.query != other.query;
+                let distinguished =
+                    tool.type_filter != other.type_filter || tool.query != other.query;
                 assert!(
                     distinguished,
                     "{} and {} share a path with no discriminator",

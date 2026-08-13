@@ -1,0 +1,12 @@
+# Gitleaks configuration extending the default rules.
+# This allowlist covers test fixtures that carry an explicit "not-a-real-secret-"
+# marker, so a genuine credential without the marker cannot match.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures with explicit not-a-real-secret marker"
+regexes = [
+  '''not-a-real-secret-[A-Za-z0-9]+''',
+]

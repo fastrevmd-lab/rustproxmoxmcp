@@ -1,0 +1,73 @@
+name: security
+
+# Secret scan + Rust supply-chain checks. Actions pinned to commit SHAs.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Download gitleaks
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz | tar -xz
+          chmod +x gitleaks
+          ./gitleaks version
+
+      - name: Run gitleaks
+        run: ./gitleaks detect --no-banner
+
+  cargo:
+    name: cargo-audit + cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: 1.97.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Ensure Cargo.lock exists
+        run: test -f Cargo.lock || cargo generate-lockfile
+
+      # Installed directly rather than via cargo-deny-action, which builds its
+      # own image and so depends on Docker Hub at run time. That dependency has
+      # now failed this job for real: three retries of
+      # "dial tcp ...:443: i/o timeout" pulling rust:1.85.0-alpine3.20, with
+      # nothing wrong in the repo. A supply-chain gate that goes red on an
+      # unrelated registry outage is a gate people learn to ignore, which is
+      # worse than not having it. Slower, but it depends only on crates.io,
+      # which this job already needs. Matches mecmcp and rustpanosmcp.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: cargo-audit (RUSTSEC advisories)
+        run: cargo audit
+
+      - name: cargo-deny (bans + sources)
+        run: cargo deny check bans sources

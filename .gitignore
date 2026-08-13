@@ -17,4 +17,3 @@ tokens.json
 *.tokens.json
 
 .DS_Store
-Cargo.lock

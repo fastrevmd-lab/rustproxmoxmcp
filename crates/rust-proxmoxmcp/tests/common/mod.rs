@@ -14,7 +14,7 @@ use rust_proxmoxmcp::http_transport::build_http_router;
 use rust_proxmoxmcp::server::ProxmoxServer;
 use rust_proxmoxmcp_core::testing::{Route, TlsMockServer};
 use rust_proxmoxmcp_core::{
-    ProxmoxGrant, ProxmoxAction,
+    ProxmoxAction, ProxmoxGrant,
     client::ProxmoxClient,
     inventory::{Cluster, ClusterInventory},
     resolve::GuestIndex,
@@ -122,10 +122,14 @@ impl TestServer {
             }
         });
 
-        let mut clusters_file = std::fs::File::create(&clusters_path)
-            .expect("create clusters.json");
+        let mut clusters_file =
+            std::fs::File::create(&clusters_path).expect("create clusters.json");
         clusters_file
-            .write_all(serde_json::to_string_pretty(&inventory_json).expect("serialize").as_bytes())
+            .write_all(
+                serde_json::to_string_pretty(&inventory_json)
+                    .expect("serialize")
+                    .as_bytes(),
+            )
             .expect("write clusters.json");
 
         #[cfg(unix)]
@@ -170,9 +174,8 @@ impl TestServer {
         }
 
         // Load the inventory and build clients.
-        let clusters = Arc::new(
-            ClusterInventory::load(&clusters_path).expect("load clusters.json"),
-        );
+        let clusters =
+            Arc::new(ClusterInventory::load(&clusters_path).expect("load clusters.json"));
         let mut clients = BTreeMap::new();
         for name in clusters.names() {
             let cluster = clusters.get(&name).expect("get cluster");
@@ -189,10 +192,8 @@ impl TestServer {
 
         // Build the HTTP router using the same function `main` uses.
         let handler = ProxmoxServer::new(clusters, clients, index);
-        let token_store_arc = Arc::new(
-            TokenStoreFile::<ProxmoxGrant>::load(&tokens_path)
-                .expect("load tokens.json"),
-        );
+        let token_store_arc =
+            Arc::new(TokenStoreFile::<ProxmoxGrant>::load(&tokens_path).expect("load tokens.json"));
         let shutdown = tokio_util::sync::CancellationToken::new();
 
         let (router, _shutdown_token) = build_http_router(
@@ -213,9 +214,7 @@ impl TestServer {
         let addr = listener.local_addr().expect("get local addr");
 
         tokio::spawn(async move {
-            axum::serve(listener, router)
-                .await
-                .expect("serve router");
+            axum::serve(listener, router).await.expect("serve router");
         });
 
         // Give the server a moment to start.

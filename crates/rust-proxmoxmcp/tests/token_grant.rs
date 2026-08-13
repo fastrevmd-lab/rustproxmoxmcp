@@ -3,8 +3,8 @@
 //! Verifies that `--guests` and `--actions` produce a token with the expected
 //! grant, validated at mint time.
 
-use rust_proxmoxmcp_core::{ProxmoxAction, ProxmoxGrant};
 use mecmcp_auth::TokenStoreFile;
+use rust_proxmoxmcp_core::{ProxmoxAction, ProxmoxGrant};
 use std::process::Command;
 
 #[test]
@@ -14,8 +14,11 @@ fn token_add_with_guests_and_actions_stores_grant() {
 
     // Create an empty token store.
     std::fs::write(&tokens_path, r#"{"version":1,"tokens":[]}"#).expect("write");
-    std::fs::set_permissions(&tokens_path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-        .expect("chmod");
+    std::fs::set_permissions(
+        &tokens_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .expect("chmod");
 
     // Mint a token with guest scope and actions.
     // Grant flags now appear AFTER the subcommand.
@@ -66,8 +69,11 @@ fn token_add_with_invalid_selector_fails_at_mint_time() {
     let tokens_path = dir.path().join("tokens.json");
 
     std::fs::write(&tokens_path, r#"{"version":1,"tokens":[]}"#).expect("write");
-    std::fs::set_permissions(&tokens_path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-        .expect("chmod");
+    std::fs::set_permissions(
+        &tokens_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .expect("chmod");
 
     let output = Command::new(env!("CARGO_BIN_EXE_rust-proxmoxmcp"))
         .args([
@@ -82,15 +88,12 @@ fn token_add_with_invalid_selector_fails_at_mint_time() {
             "--tools",
             "*",
             "--guests",
-            "site:emea",  // Invalid selector
+            "site:emea", // Invalid selector
         ])
         .output()
         .expect("spawn");
 
-    assert!(
-        !output.status.success(),
-        "should reject invalid selector"
-    );
+    assert!(!output.status.success(), "should reject invalid selector");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("invalid --guests selector"),
@@ -108,8 +111,11 @@ fn token_add_without_guests_prints_note_and_creates_grantless_token() {
     let tokens_path = dir.path().join("tokens.json");
 
     std::fs::write(&tokens_path, r#"{"version":1,"tokens":[]}"#).expect("write");
-    std::fs::set_permissions(&tokens_path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-        .expect("chmod");
+    std::fs::set_permissions(
+        &tokens_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .expect("chmod");
 
     let output = Command::new(env!("CARGO_BIN_EXE_rust-proxmoxmcp"))
         .args([
@@ -160,8 +166,11 @@ fn token_add_accepts_wildcard_guests() {
     let tokens_path = dir.path().join("tokens.json");
 
     std::fs::write(&tokens_path, r#"{"version":1,"tokens":[]}"#).expect("write");
-    std::fs::set_permissions(&tokens_path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-        .expect("chmod");
+    std::fs::set_permissions(
+        &tokens_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .expect("chmod");
 
     let output = Command::new(env!("CARGO_BIN_EXE_rust-proxmoxmcp"))
         .args([

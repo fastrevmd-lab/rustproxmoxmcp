@@ -166,10 +166,16 @@ mod tests {
     #[test]
     fn parses_every_documented_term() {
         assert_eq!(Selector::parse("*").expect("parse"), Selector::Any);
-        assert_eq!(Selector::parse("vmid:905").expect("parse"), Selector::Vmid(905));
+        assert_eq!(
+            Selector::parse("vmid:905").expect("parse"),
+            Selector::Vmid(905)
+        );
         assert_eq!(
             Selector::parse("vmid:600-699").expect("parse"),
-            Selector::VmidRange { low: 600, high: 699 }
+            Selector::VmidRange {
+                low: 600,
+                high: 699
+            }
         );
         assert_eq!(
             Selector::parse("tag:ci").expect("parse"),

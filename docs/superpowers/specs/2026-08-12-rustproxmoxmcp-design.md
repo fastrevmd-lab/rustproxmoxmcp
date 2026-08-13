@@ -326,7 +326,7 @@ ClusterPolicy>` trait with the hardened loader, hot-reloaded on SIGHUP:
 ```jsonc
 { "version": 1, "clusters": {
   "pve3": {
-    "endpoint": "https://pve3.mechub.org:8006",
+    "endpoint": "https://pve3.example.org:8006",
     "token_id": "root@pam!mcp",
     "token_secret_env": "PVE_PVE3_TOKEN",
     "ca_pem_path": "/etc/proxmoxmcp/ca/pve3.pem",

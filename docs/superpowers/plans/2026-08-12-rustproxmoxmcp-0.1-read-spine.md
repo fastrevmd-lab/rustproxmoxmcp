@@ -1682,12 +1682,12 @@ fn cluster_for(endpoint: &str, ca_pem: &std::path::Path) -> Cluster {
 #[tokio::test]
 async fn unwraps_the_data_envelope() {
     // SAFETY OF TEST ENV: single-threaded test, variable removed at the end.
-    unsafe { std::env::set_var("PVE_TEST_TOKEN", "0123456789abcdef") };
+    unsafe { std::env::set_var("PVE_TEST_TOKEN", "not-a-real-secret-0123456789abcdef") };
     let (server, ca_pem) = common::tls_mock_server().await;
 
     Mock::given(method("GET"))
         .and(path("/api2/json/nodes"))
-        .and(header("Authorization", "PVEAPIToken=root@pam!mcp=0123456789abcdef"))
+        .and(header("Authorization", "PVEAPIToken=root@pam!mcp=not-a-real-secret-0123456789abcdef"))
         .respond_with(ResponseTemplate::new(200).set_body_raw(
             br#"{"data":[{"node":"pve2","status":"online"}]}"#.to_vec(),
             "application/json",
@@ -1703,7 +1703,7 @@ async fn unwraps_the_data_envelope() {
 
 #[tokio::test]
 async fn expands_a_path_template_and_percent_encodes_the_value() {
-    unsafe { std::env::set_var("PVE_TEST_TOKEN", "0123456789abcdef") };
+    unsafe { std::env::set_var("PVE_TEST_TOKEN", "not-a-real-secret-0123456789abcdef") };
     let (server, ca_pem) = common::tls_mock_server().await;
 
     Mock::given(method("GET"))
@@ -1729,7 +1729,7 @@ async fn expands_a_path_template_and_percent_encodes_the_value() {
 
 #[tokio::test]
 async fn a_path_parameter_cannot_escape_its_segment() {
-    unsafe { std::env::set_var("PVE_TEST_TOKEN", "0123456789abcdef") };
+    unsafe { std::env::set_var("PVE_TEST_TOKEN", "not-a-real-secret-0123456789abcdef") };
     let (server, ca_pem) = common::tls_mock_server().await;
     let client = ProxmoxClient::new(cluster_for(&server.uri(), ca_pem.path())).expect("client");
 
@@ -1746,13 +1746,13 @@ async fn a_path_parameter_cannot_escape_its_segment() {
 
 #[tokio::test]
 async fn a_401_becomes_unauthorized_without_echoing_the_body() {
-    unsafe { std::env::set_var("PVE_TEST_TOKEN", "0123456789abcdef") };
+    unsafe { std::env::set_var("PVE_TEST_TOKEN", "not-a-real-secret-0123456789abcdef") };
     let (server, ca_pem) = common::tls_mock_server().await;
 
     Mock::given(method("GET"))
         .and(path("/api2/json/nodes"))
         .respond_with(ResponseTemplate::new(401).set_body_raw(
-            b"authentication failure: token 0123456789abcdef".to_vec(),
+            b"authentication failure: token not-a-real-secret-0123456789abcdef".to_vec(),
             "text/plain",
         ))
         .mount(&server)
@@ -1762,12 +1762,12 @@ async fn a_401_becomes_unauthorized_without_echoing_the_body() {
     let error = client.get_json("/api2/json/nodes", &[]).await.expect_err("401");
 
     assert!(matches!(error, ProxmoxError::Unauthorized));
-    assert!(!error.to_string().contains("0123456789abcdef"));
+    assert!(!error.to_string().contains("not-a-real-secret-0123456789abcdef"));
 }
 
 #[tokio::test]
 async fn a_plaintext_endpoint_is_refused_at_construction() {
-    unsafe { std::env::set_var("PVE_TEST_TOKEN", "0123456789abcdef") };
+    unsafe { std::env::set_var("PVE_TEST_TOKEN", "not-a-real-secret-0123456789abcdef") };
     let (_, ca_pem) = common::tls_mock_server().await;
     let mut cluster = cluster_for("http://pve3.example.org:8006", ca_pem.path());
     cluster.ca_pem_path = None;
@@ -1990,7 +1990,7 @@ const RESOURCES: &[u8] = br#"{"data":[
 ]}"#;
 
 async fn index_and_client() -> (GuestIndex, ProxmoxClient, MockServer, tempfile::NamedTempFile) {
-    unsafe { std::env::set_var("PVE_TEST_TOKEN", "0123456789abcdef") };
+    unsafe { std::env::set_var("PVE_TEST_TOKEN", "not-a-real-secret-0123456789abcdef") };
     let (server, ca) = common::tls_mock_server().await;
     Mock::given(method("GET"))
         .and(path("/api2/json/cluster/resources"))
@@ -2545,7 +2545,7 @@ const RESOURCES: &[u8] = br#"{"data":[
 ]}"#;
 
 async fn fixture() -> (GuestIndex, ProxmoxClient, MockServer, tempfile::NamedTempFile) {
-    unsafe { std::env::set_var("PVE_TEST_TOKEN", "0123456789abcdef") };
+    unsafe { std::env::set_var("PVE_TEST_TOKEN", "not-a-real-secret-0123456789abcdef") };
     let (server, ca) = common::tls_mock_server().await;
     Mock::given(method("GET"))
         .and(path("/api2/json/cluster/resources"))
@@ -3635,7 +3635,7 @@ ExecStart=/usr/local/bin/rust-proxmoxmcp \
     --tokens-file /etc/proxmoxmcp/tokens.json \
     --transport streamable-http \
     --host 0.0.0.0 --port 30031 \
-    --allowed-host proxmoxmcp.mechub.org \
+    --allowed-host proxmoxmcp.example.org \
     --tls-cert /etc/proxmoxmcp/tls/fullchain.pem \
     --tls-key /etc/proxmoxmcp/tls/privkey.pem \
     --audit-format json \
