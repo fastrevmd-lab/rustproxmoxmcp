@@ -76,19 +76,19 @@ impl Cluster {
     /// Load this cluster's API token secret.
     ///
     /// # Errors
-    /// Returns [`ProxmoxError::Malformed`] when neither or both sources are
+    /// Returns [`ProxmoxError::Config`] when neither or both sources are
     /// configured, or when the hardened loader refuses the source.
     pub fn load_secret(&self) -> Result<OutboundSecret, ProxmoxError> {
         let limits = SecretLimits::default();
         match (&self.token_secret_env, &self.token_secret_file) {
             (Some(variable), None) => load_from_env(variable, limits)
-                .map_err(|error| ProxmoxError::Malformed(error.to_string())),
+                .map_err(|error| ProxmoxError::Config(error.to_string())),
             (None, Some(path)) => load_from_file(path, limits)
-                .map_err(|error| ProxmoxError::Malformed(error.to_string())),
-            (Some(_), Some(_)) => Err(ProxmoxError::Malformed(
+                .map_err(|error| ProxmoxError::Config(error.to_string())),
+            (Some(_), Some(_)) => Err(ProxmoxError::Config(
                 "exactly one of token_secret_env or token_secret_file must be set, not both".into(),
             )),
-            (None, None) => Err(ProxmoxError::Malformed(
+            (None, None) => Err(ProxmoxError::Config(
                 "one of token_secret_env or token_secret_file must be set".into(),
             )),
         }
@@ -257,5 +257,40 @@ mod tests {
         );
         let inventory = ClusterInventory::load(file.path()).expect("load");
         assert_eq!(inventory.policy().resource_cache_ttl_secs, 10);
+    }
+
+    #[test]
+    fn missing_secret_file_reports_config_error_not_malformed_response() {
+        let file = write_fixture(
+            r#"{
+              "version": 1,
+              "devices": {
+                "pve3": {
+                  "endpoint": "https://pve3.example.org:8006",
+                  "token_id": "root@pam!mcp",
+                  "token_secret_file": "/nonexistent/pve3.token"
+                }
+              }
+            }"#,
+        );
+        let inventory = ClusterInventory::load(file.path()).expect("load");
+        let cluster = inventory.get("pve3").expect("cluster");
+        let result = cluster.load_secret();
+        let rendered = match result {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("should fail to load missing secret file"),
+        };
+        assert!(
+            !rendered.contains("malformed"),
+            "error should not mention 'malformed', got: {rendered}"
+        );
+        assert!(
+            rendered.contains("configuration error") || rendered.contains("config"),
+            "error should mention configuration, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("/nonexistent/pve3.token"),
+            "error should mention the file path, got: {rendered}"
+        );
     }
 }

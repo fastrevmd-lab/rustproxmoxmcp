@@ -48,6 +48,12 @@ pub enum ProxmoxError {
     /// A response did not have the shape the API documents.
     #[error("malformed proxmox response: {0}")]
     Malformed(String),
+    /// A local configuration or credential problem, before any request is made.
+    ///
+    /// Distinct from [`ProxmoxError::Malformed`], which describes a response that
+    /// arrived in the wrong shape. Nothing has been sent when this is returned.
+    #[error("configuration error: {0}")]
+    Config(String),
     /// The request named a cluster absent from the inventory.
     #[error("unknown cluster: {0}")]
     UnknownCluster(String),

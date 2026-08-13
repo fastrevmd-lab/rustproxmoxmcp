@@ -44,7 +44,7 @@ impl ProxmoxClient {
     pub fn new(cluster: Cluster) -> Result<Self, ProxmoxError> {
         // Reject plaintext endpoints early, before any HTTP client setup.
         if !cluster.endpoint.starts_with("https://") {
-            return Err(ProxmoxError::Malformed(format!(
+            return Err(ProxmoxError::Config(format!(
                 "endpoint must use https, got: {}",
                 cluster.endpoint
             )));
@@ -56,7 +56,7 @@ impl ProxmoxClient {
         let mut extra_root_certificates = Vec::new();
         if let Some(path) = &cluster.ca_pem_path {
             let pem = std::fs::read_to_string(path)
-                .map_err(|error| ProxmoxError::Malformed(format!("ca_pem_path: {error}")))?;
+                .map_err(|error| ProxmoxError::Config(format!("ca_pem_path {}: {error}", path.display())))?;
             extra_root_certificates.push(pem);
         }
 
@@ -164,4 +164,51 @@ fn percent_encode(s: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inventory::Cluster;
+    use std::path::PathBuf;
+
+    #[test]
+    fn missing_ca_pem_reports_config_error_not_malformed_response() {
+        // Write a minimal token file so the secret loads but CA PEM does not.
+        use std::io::Write;
+        let mut token_file = tempfile::NamedTempFile::new().expect("temp file");
+        token_file.write_all(b"test-secret-value").expect("write");
+        std::fs::set_permissions(
+            token_file.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .expect("chmod");
+
+        let cluster = Cluster {
+            endpoint: "https://pve3.example.org:8006".to_owned(),
+            token_id: "root@pam!mcp".to_owned(),
+            token_secret_env: None,
+            token_secret_file: Some(token_file.path().to_path_buf()),
+            ca_pem_path: Some(PathBuf::from("/nonexistent/ca.pem")),
+            protected_vmids: Vec::new(),
+            protected_tags: vec!["protected".to_owned()],
+        };
+        let result = ProxmoxClient::new(cluster);
+        let rendered = match result {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("should fail to load missing CA PEM"),
+        };
+        assert!(
+            !rendered.contains("malformed"),
+            "error should not mention 'malformed', got: {rendered}"
+        );
+        assert!(
+            rendered.contains("configuration error") || rendered.contains("config"),
+            "error should mention configuration, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("/nonexistent/ca.pem"),
+            "error should mention the file path, got: {rendered}"
+        );
+    }
 }
