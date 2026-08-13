@@ -72,7 +72,7 @@ fi
 
 if [ ! -f /etc/proxmoxmcp/tokens.json ]; then
     echo "    Creating empty tokens.json..."
-    printf '{"version":1,"tokens":{}}\n' > /etc/proxmoxmcp/tokens.json
+    printf '{"version":1,"tokens":[]}\n' > /etc/proxmoxmcp/tokens.json
     chown proxmoxmcp:proxmoxmcp /etc/proxmoxmcp/tokens.json
     chmod 0600 /etc/proxmoxmcp/tokens.json
 else
