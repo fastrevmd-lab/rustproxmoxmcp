@@ -8,17 +8,65 @@ use anyhow::{Context as _, Result};
 use cli::ProxmoxCli;
 use http_transport::build_http_router;
 use mecmcp_auth::TokenStoreFile;
-use mecmcp_runtime::cli::{Command, Transport};
+use mecmcp_runtime::cli::{Command, TokenAction, Transport};
 use mecmcp_transport::{LimitsConfig, serve_router};
 use rmcp::ServiceExt as _;
 use rust_proxmoxmcp_core::{
-    ProxmoxGrant,
+    ProxmoxAction, ProxmoxGrant,
     client::ProxmoxClient,
     inventory::ClusterInventory,
     resolve::GuestIndex,
+    selector::Selector,
 };
 use server::ProxmoxServer;
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::Duration};
+
+/// Build a vendor grant for token minting when --guests or --actions are given.
+///
+/// Returns `None` for non-Add operations or when no Proxmox-specific grant fields
+/// are present, allowing the caller to pass `None` to preserve grantless tokens.
+fn build_token_grant(args: &ProxmoxCli, action: &TokenAction) -> Result<Option<ProxmoxGrant>> {
+    // Only Add uses grants; other operations round-trip existing ones untouched.
+    if !matches!(action, TokenAction::Add { .. }) {
+        return Ok(None);
+    }
+
+    // No grant fields given: token will work for cluster-scoped tools only.
+    if args.guests.is_empty() {
+        eprintln!(
+            "Note: This token cannot use guest-addressed tools. \
+             Use --guests '*' or a selector (vmid:X, tag:Y, pool:Z) to grant guest access."
+        );
+        return Ok(None);
+    }
+
+    // Validate each selector at mint time. A selector that cannot parse produces
+    // a token that silently admits nothing, which an operator cannot diagnose.
+    for term in &args.guests {
+        Selector::parse(term).map_err(|error| {
+            anyhow::anyhow!("invalid --guests selector '{term}': {error}")
+        })?;
+    }
+
+    // Parse action names. Default is already set by clap to "read".
+    let actions: Result<Vec<ProxmoxAction>> = args
+        .actions
+        .iter()
+        .map(|name| match name.as_str() {
+            "read" => Ok(ProxmoxAction::Read),
+            "low" => Ok(ProxmoxAction::Low),
+            "destructive" => Ok(ProxmoxAction::Destructive),
+            other => Err(anyhow::anyhow!(
+                "invalid --actions value '{other}': must be read, low, or destructive"
+            )),
+        })
+        .collect();
+
+    Ok(Some(ProxmoxGrant {
+        guests: args.guests.clone(),
+        actions: actions?,
+    }))
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -33,21 +81,22 @@ async fn main() -> Result<()> {
         "rust-proxmoxmcp",
         env!("CARGO_PKG_VERSION"),
     );
-    let args = parsed.cli;
+    let mut args = parsed.cli;
 
     mecmcp_runtime::cli_validate::validate(&args.common)
         .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
 
     init_audit(&args.common)?;
 
-    if let Some(Command::Token { action }) = args.common.command {
+    if let Some(Command::Token { action }) = args.common.command.take() {
         // Token management is deliberately local: it validates against the fixed
         // tool registry and does not load cluster inventory or build clients.
+        let grant = build_token_grant(&args, &action)?;
         return mecmcp_runtime::token_cmd::run_with_grant::<ProxmoxGrant>(
             action,
             &[],
             server::KNOWN_TOOLS,
-            None,
+            grant,
         )
         .map_err(|error| anyhow::anyhow!("{error}"));
     }

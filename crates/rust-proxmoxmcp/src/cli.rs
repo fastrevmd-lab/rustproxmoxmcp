@@ -23,4 +23,19 @@ pub struct ProxmoxCli {
     /// Cluster inventory. Must be mode 0600 and owned by the service user.
     #[arg(long, default_value = "/etc/proxmoxmcp/clusters.json")]
     pub clusters_file: PathBuf,
+
+    /// Guest selectors for token grant (comma-separated).
+    ///
+    /// Only used with `token add`. A token carrying no guest grant cannot call
+    /// guest-addressed tools. Use '*' for all guests, or selectors like
+    /// 'vmid:600-699', 'tag:ci', 'pool:lab'.
+    #[arg(long, value_delimiter = ',')]
+    pub guests: Vec<String>,
+
+    /// Actions this token may invoke (comma-separated).
+    ///
+    /// Only used with `token add`. Valid actions: read, low, destructive.
+    /// Default: read.
+    #[arg(long, value_delimiter = ',', default_value = "read")]
+    pub actions: Vec<String>,
 }
