@@ -1,0 +1,39 @@
+[Unit]
+Description=rust-proxmoxmcp — one MCP server for many Proxmox VE clusters
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=proxmoxmcp
+Group=proxmoxmcp
+ExecStart=/usr/local/bin/rust-proxmoxmcp \
+    --clusters-file /etc/proxmoxmcp/clusters.json \
+    --tokens-file /etc/proxmoxmcp/tokens.json \
+    --transport streamable-http \
+    --host 0.0.0.0 --port 30031 \
+    --allowed-host proxmoxmcp.mechub.org \
+    --tls-cert /etc/proxmoxmcp/tls/fullchain.pem \
+    --tls-key /etc/proxmoxmcp/tls/privkey.pem \
+    --audit-format json \
+    --audit-log-file /var/lib/proxmoxmcp/audit.jsonl
+Restart=on-failure
+RestartSec=5
+
+# /etc/proxmoxmcp stays read-only to the service. This is deliberate: it is what
+# makes editing the inventory a root operation rather than something the server
+# could be talked into. rust-junosmcp's add_device fails under the same sandbox,
+# and keeping the sandbox narrow is the documented preference.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/proxmoxmcp
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

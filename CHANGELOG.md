@@ -1,0 +1,52 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.1.0] - 2026-08-12
+
+### Added
+
+- **Multi-cluster inventory:** One server process serves many Proxmox VE clusters from a single `clusters.json` file. Each cluster entry specifies its endpoint, API token reference, optional per-cluster CA certificate, and protection policy.
+- **Complete read-only catalog:** 16 tools covering cluster status, nodes, guests (QEMU and LXC), storage, backups, ISO images, templates, snapshots, and tasks.
+  - Cluster-scoped: `get_cluster_status`, `get_nodes`, `get_vms`, `get_containers`
+  - Node-scoped: `get_node_status`, `get_storage`, `list_tasks`
+  - Guest-scoped: `get_vm_config`, `get_container_config`, `get_container_ip` (LXC only), `get_guest_status`, `list_snapshots`
+  - Storage-scoped: `list_backups`, `list_isos`, `list_templates`
+  - Task-scoped: `get_task_status`
+- **Two-stage authorization:**
+  - Stage 1: Bearer token validation, tool and cluster scope checks (via `mecmcp-auth::authorize_call`)
+  - Stage 2 (guest tools only): Guest resolution, grant evaluation (`GuestFacts` against `ProxmoxGrant`), and fail-closed protection enforcement
+- **Protection union:** A guest is protected if it appears in `protected_vmids` **or** carries a tag from `protected_tags`. Protected guests cannot be addressed by mutating tools (when implemented), even with wildcard grants.
+- **`AuthorizedGuest`:** A type-level authorization proof that a guest passed stage-2 checks. Constructors are `pub(crate)` so guest-addressed catalog calls cannot bypass authorization.
+- **Complete `WRITE_TOOLS` registry:** The full mutating catalog is declared in `tier::WRITE_TOOLS` (23 tools across `low` and `destructive` tiers). None are implemented in this release; the registry exists so `authorize_call` refuses them before any catalog lookup.
+- **Catalog-driven dispatch:** Every tool's HTTP method, path template, query flag, and type filter is declared once in `catalog.rs`. The runtime resolves `{node}` and `{vmid}` path parameters without per-tool client code.
+- **Per-cluster CA pinning:** Each cluster can specify `ca_pem_path` to trust a private CA. No `--insecure` flag exists.
+- **SIGHUP reload:** `systemctl reload rust-proxmoxmcp` (or `kill -HUP <pid>`) reloads `clusters.json` in place, invalidates the guest index cache, and logs the result. A failed reload retains the previous snapshot and does not stop the server.
+- **Hardened systemd unit:** `ProtectSystem=strict` with `ReadWritePaths=/var/lib/proxmoxmcp` only. `/etc/proxmoxmcp` is read-only to the service process, making inventory edits a root operation.
+- **LXC packaging:** `packaging/lxc/install.sh` — a POSIX installer for Debian 13 that creates the service user, installs the binary, writes example configs (only if absent), and installs the systemd unit.
+- **Audit logging:** JSON-structured logs with optional PII redaction. Every tool call logs cluster, guest, tier, and protection status.
+- **Comprehensive test suite:** 78 tests including:
+  - Client retry, bearer token assembly, catalog integrity
+  - Authorization stage 1 and stage 2, including out-of-scope and protected-guest refusals
+  - Guest resolution, type filtering, protection union
+  - Adversarial cases: a token with no grant is refused; `get_container_ip` refuses QEMU guests; protected guests cannot be reached by mutating tools
+  - Compile-fail tests ensuring `AuthorizedGuest::new` is not public
+
+### Not Included
+
+- **No mutating tools.** Every destructive operation (`delete_vm`, `delete_container`, `delete_snapshot`, `delete_backup`, `restore_backup`, `rollback_snapshot`) and low-tier operation (`clone_vm`, `create_snapshot`, `create_backup`, start/stop/reset lifecycle) is registered in `WRITE_TOOLS` but unimplemented. Deferred to release 0.2.
+- **No override or lab mode.** `--lab-mode`, `--waivers-file`, and the `lab_unrestricted` token flag belong to release 0.3's change-control surface and are deliberately absent.
+- **No task streaming or UPID polling.** Task lifecycle (wait-for-completion, progress streaming) is deferred to release 0.2.
+- **No lab validation against a real Proxmox cluster.** All 78 tests pass against mock HTTPS servers; the code has not been run against a live Proxmox VE cluster.
+
+### Notes
+
+- The existing deployment (three Python MCP servers, one per cluster endpoint) **remains in service**. This release does not replace it.
+- The cluster inventory file uses the top-level key `devices` (the canonical envelope from `mecmcp-inventory`), not `clusters`. Each entry is read as a cluster.
+- A bearer token with no `grant` key is refused for guest-addressed tools. This is fail-closed: a grantless token must not become a wildcard.
+- The `rust-proxmoxmcp-core` crate has a non-default `testing` feature that pulls in mock-server machinery (`rcgen`, `rustls`, `tokio-rustls`, `tempfile`). This is **not** compiled into the release binary.
+
+[0.1.0]: https://github.com/fastrevmd-lab/rustproxmoxmcp/releases/tag/v0.1.0
