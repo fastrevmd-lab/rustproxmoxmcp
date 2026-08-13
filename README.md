@@ -22,14 +22,14 @@ Release 0.1 delivers the complete read-only catalog: 16 tools covering cluster s
 
 ### What's implemented
 
-- **Multi-cluster inventory:** One server, many clusters. Each cluster gets its own API token, TLS trust anchor, and protection policy.
+- **Multi-cluster inventory:** One server, many clusters. Each cluster gets its own API token and protection policy.
 - **Two-stage authorization:**
   1. **Stage 1** (before the catalog call): Bearer token validation, tool and cluster scope checks.
   2. **Stage 2** (guest-addressed tools only): Guest resolution, grant evaluation (VMID range, tag, pool selectors), and fail-closed protection.
 - **Protection union:** A guest is protected if it appears in `protected_vmids` **or** carries a tag from `protected_tags`. A protected guest cannot be addressed by any mutating tool, even with a wildcard token. (Read tools see protected guests normally.)
 - **Catalog-driven dispatch:** Every tool's HTTP method, path template, query flag, and type filter is declared once in `catalog.rs`. The runtime resolves `{node}` and `{vmid}` parameters and assembles the outbound call without hand-written per-tool client code.
 - **SIGHUP reload:** `systemctl reload` (or `kill -HUP`) reloads `clusters.json` in place without dropping in-flight calls. A failed reload logs and retains the previous snapshot.
-- **Per-cluster CA pinning:** Each cluster in the inventory can name a `ca_pem_path`. No `--insecure` flag exists at any layer.
+- **Per-cluster CA pinning:** Each cluster in the inventory can name a `ca_pem_path` to pin a specific trust anchor. When omitted, the server uses the system's default trust roots. This is only needed for clusters whose API certificate is self-signed or issued by a private CA; clusters with publicly-trusted certificates (e.g., Let's Encrypt) do not require it. No `--insecure` flag exists at any layer.
 - **Audit logging:** JSON-structured logs with optional PII redaction (HMAC-keyed or drop). Every tool call logs cluster, guest, tier, and protection status.
 
 ### What's deliberately absent
@@ -108,7 +108,6 @@ If the guest is out of scope or the action tier (`read`/`low`/`destructive`) is 
       "endpoint": "https://pve3.example.org:8006",
       "token_id": "root@pam!mcp",
       "token_secret_env": "PVE_PVE3_TOKEN",
-      "ca_pem_path": "/etc/proxmoxmcp/ca/pve3.pem",
       "protected_vmids": [905, 906, 907],
       "protected_tags": ["protected"]
     }
