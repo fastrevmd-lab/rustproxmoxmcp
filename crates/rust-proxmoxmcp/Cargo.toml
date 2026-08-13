@@ -1,0 +1,43 @@
+[package]
+name         = "rust-proxmoxmcp"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description  = "One MCP server for many Proxmox VE clusters."
+
+[[bin]]
+name = "rust-proxmoxmcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow           = { workspace = true }
+axum             = { workspace = true }
+axum-server      = { workspace = true }
+clap             = { workspace = true }
+http             = { workspace = true }
+mecmcp-audit     = { workspace = true }
+mecmcp-auth      = { workspace = true }
+mecmcp-runtime   = { workspace = true }
+mecmcp-server    = { workspace = true }
+mecmcp-transport = { workspace = true }
+rmcp             = { workspace = true }
+rust-proxmoxmcp-core = { path = "../rust-proxmoxmcp-core" }
+rustls           = { workspace = true }
+schemars         = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+thiserror        = { workspace = true }
+tokio            = { workspace = true }
+tokio-util       = { workspace = true }
+tracing          = { workspace = true }
+
+[dev-dependencies]
+mecmcp-transport = { workspace = true }
+tokio            = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+wiremock         = { workspace = true }
+
+[lints]
+workspace = true

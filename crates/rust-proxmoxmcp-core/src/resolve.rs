@@ -1,0 +1,1 @@
+//! Guest resolution and authorization.
