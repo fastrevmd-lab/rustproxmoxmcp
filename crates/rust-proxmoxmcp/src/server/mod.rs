@@ -142,7 +142,41 @@ impl ProxmoxServer {
             .get(cluster)
             .ok_or_else(|| tool_error(format!("unknown cluster: {cluster}")))
     }
+}
 
+/// Resolve the grant for a guest-addressed call.
+///
+/// Distinguishes two cases:
+/// - `caller` is `None` (stdio path, no bearer token): returns the wildcard read-only grant
+/// - `caller` is `Some` with `grant: None` (authenticated token that declared no scope): refuses
+///
+/// # Errors
+///
+/// Returns a `CallToolResult` error when an authenticated token carries no guest selector.
+fn resolve_grant(caller: Option<&CallerCtx<ProxmoxGrant>>) -> Result<ProxmoxGrant, CallToolResult> {
+    match caller {
+        None => Ok(rust_proxmoxmcp_core::ProxmoxGrant::read_only()),
+        Some(ctx) => ctx.grant.clone().ok_or_else(|| {
+            tool_error(format!(
+                "token '{}' carries no 'guests' selector; add one to tokens.json",
+                ctx.token_name
+            ))
+        }),
+    }
+}
+
+/// Derive a scope description from the caller's tool and device scopes.
+fn scope_desc(caller: Option<&CallerCtx<ProxmoxGrant>>) -> &'static str {
+    caller
+        .map(|c| match (&c.tools, &c.devices) {
+            (ScopeSet::Wildcard, ScopeSet::Wildcard) => "global",
+            (ScopeSet::Wildcard, ScopeSet::Allowlist(_)) => "device-scoped",
+            (ScopeSet::Allowlist(_), _) => "tool-scoped",
+        })
+        .unwrap_or("stdio")
+}
+
+impl ProxmoxServer {
     /// Execute one catalog-declared read.
     ///
     /// Guest-scoped tools resolve the guest and run stage-2 authorization,
@@ -175,10 +209,10 @@ impl ProxmoxServer {
             .collect();
 
         if let Some(vmid) = vmid {
-            let grant = caller
-                .as_ref()
-                .and_then(|caller| caller.grant.clone())
-                .unwrap_or_else(rust_proxmoxmcp_core::ProxmoxGrant::read_only);
+            let grant = match resolve_grant(caller.as_ref()) {
+                Ok(grant) => grant,
+                Err(error) => return error,
+            };
             let authorized = match self
                 .index
                 .authorize(client, cluster, vmid, &grant, Tier::Read)
@@ -192,16 +226,6 @@ impl ProxmoxServer {
             params.push(("vmid", guest.vmid.to_string()));
             params.push(("kind", guest.r#type.path_segment().to_owned()));
 
-            let scope_desc = caller.as_ref()
-                .map(|c| {
-                    match (&c.tools, &c.devices) {
-                        (ScopeSet::Wildcard, ScopeSet::Wildcard) => "global",
-                        (ScopeSet::Wildcard, ScopeSet::Allowlist(_)) => "device-scoped",
-                        (ScopeSet::Allowlist(_), _) => "tool-scoped",
-                    }
-                })
-                .unwrap_or("stdio");
-
             tracing::info!(
                 tool,
                 cluster,
@@ -210,7 +234,7 @@ impl ProxmoxServer {
                 guest_name = %guest.name,
                 tier = "read",
                 protection = %authorized.protection().summary(),
-                scope = scope_desc,
+                scope = scope_desc(caller.as_ref()),
                 "proxmox read authorized"
             );
         }
@@ -339,10 +363,10 @@ impl ProxmoxServer {
             Err(result) => return result,
         };
 
-        let grant = caller
-            .as_ref()
-            .and_then(|caller| caller.grant.clone())
-            .unwrap_or_else(rust_proxmoxmcp_core::ProxmoxGrant::read_only);
+        let grant = match resolve_grant(caller.as_ref()) {
+            Ok(grant) => grant,
+            Err(error) => return error,
+        };
         let authorized = match self
             .index
             .authorize(client, &args.cluster, args.vmid, &grant, Tier::Read)
@@ -366,16 +390,6 @@ impl ProxmoxServer {
             ("vmid", vmid_str.as_str()),
         ];
 
-        let scope_desc = caller.as_ref()
-            .map(|c| {
-                match (&c.tools, &c.devices) {
-                    (ScopeSet::Wildcard, ScopeSet::Wildcard) => "global",
-                    (ScopeSet::Wildcard, ScopeSet::Allowlist(_)) => "device-scoped",
-                    (ScopeSet::Allowlist(_), _) => "tool-scoped",
-                }
-            })
-            .unwrap_or("stdio");
-
         tracing::info!(
             tool = "get_container_ip",
             cluster = args.cluster,
@@ -384,7 +398,7 @@ impl ProxmoxServer {
             guest_name = %guest.name,
             tier = "read",
             protection = %authorized.protection().summary(),
-            scope = scope_desc,
+            scope = scope_desc(caller.as_ref()),
             "proxmox read authorized"
         );
 
@@ -592,5 +606,55 @@ mod tests {
             KNOWN_TOOLS.len(),
             "router has tools absent from KNOWN_TOOLS"
         );
+    }
+
+    #[test]
+    fn authenticated_token_without_grant_is_refused() {
+        use mecmcp_auth::{ActorType, ScopeSet};
+
+        // An authenticated caller (Some) with no grant (grant: None) must be refused.
+        // This is the grantless-token case: a token that omits the 'grant' key in
+        // tokens.json produces CallerCtx { grant: None, ... }.
+        let grantless_caller = CallerCtx {
+            token_name: "test-grantless-token".to_owned(),
+            grant: None,
+            tools: ScopeSet::Wildcard,
+            devices: ScopeSet::Wildcard,
+            provider: None,
+            provider_tier: None,
+            on_behalf_of: None,
+            actor_type: ActorType::Agent,
+            client_name: None,
+        };
+
+        let result = resolve_grant(Some(&grantless_caller));
+        assert!(
+            result.is_err(),
+            "grantless authenticated token must be refused, not granted wildcard access"
+        );
+
+        // The error must name the token so the operator can find it in tokens.json.
+        let error_result = result.expect_err("already checked is_err");
+        let error_text = format!("{error_result:?}");
+        assert!(
+            error_text.contains("test-grantless-token"),
+            "error message must name the token: {error_text}"
+        );
+        assert!(
+            error_text.contains("guests"),
+            "error message must mention 'guests' selector: {error_text}"
+        );
+    }
+
+    #[test]
+    fn stdio_path_gets_wildcard_read_grant() {
+        // The stdio path (caller = None, no bearer token) gets the wildcard read grant.
+        let grant = resolve_grant(None).expect("stdio path should succeed");
+        assert_eq!(
+            grant.guests.len(),
+            1,
+            "read_only grant should have one selector"
+        );
+        // The read_only grant is constructed as guests: ["*"], actions: [Read]
     }
 }
