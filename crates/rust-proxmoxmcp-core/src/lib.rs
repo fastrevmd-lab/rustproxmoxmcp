@@ -22,3 +22,5 @@ pub mod protect;
 pub mod resolve;
 pub mod selector;
 pub mod tier;
+
+pub use error::ProxmoxError;

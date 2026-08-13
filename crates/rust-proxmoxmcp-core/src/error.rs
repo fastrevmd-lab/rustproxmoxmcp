@@ -1,1 +1,138 @@
-//! Error types for Proxmox VE operations.
+//! Typed Proxmox VE API errors.
+//!
+//! Proxmox answers a failure with an HTTP status and, usually, a JSON body
+//! carrying an `errors` map. Both halves are peer-controlled, so neither is
+//! passed through verbatim: the text is bounded and stripped of control
+//! characters before it can reach a log or an MCP error message.
+
+use mecmcp_http::HttpError;
+
+/// Longest error detail retained from a peer-supplied body.
+const MAX_DETAIL_BYTES: usize = 512;
+
+/// A failure talking to a Proxmox VE cluster.
+#[derive(Debug, thiserror::Error)]
+pub enum ProxmoxError {
+    /// The outbound HTTP layer refused or failed the request.
+    #[error("http: {0}")]
+    Http(#[from] HttpError),
+    /// The cluster answered with an error status.
+    #[error("proxmox api error (status {status}): {message}")]
+    Api {
+        /// HTTP status returned by the cluster.
+        status: u16,
+        /// Bounded, control-stripped detail.
+        message: String,
+    },
+    /// The cluster rejected our credentials.
+    ///
+    /// Carries no body: a 401 body has been observed to echo the presented
+    /// credential back, and this error is rendered into logs and MCP results.
+    #[error("proxmox api rejected the configured credentials")]
+    Unauthorized,
+    /// The caller's token does not permit this.
+    ///
+    /// Distinct from [`ProxmoxError::Unauthorized`], which is the *cluster*
+    /// rejecting *our* credentials. This is us rejecting the caller's.
+    #[error("denied: {0}")]
+    Denied(String),
+    /// The cluster has no such object.
+    #[error("not found: {what}")]
+    NotFound {
+        /// What was looked up, in the server's own vocabulary.
+        what: String,
+    },
+    /// A response did not have the shape the API documents.
+    #[error("malformed proxmox response: {0}")]
+    Malformed(String),
+    /// The request named a cluster absent from the inventory.
+    #[error("unknown cluster: {0}")]
+    UnknownCluster(String),
+}
+
+impl ProxmoxError {
+    /// Classify a non-success response.
+    ///
+    /// A 401 is deliberately reduced to [`ProxmoxError::Unauthorized`] with the
+    /// body discarded.
+    #[must_use]
+    pub fn from_response(status: u16, body: &[u8]) -> Self {
+        if status == 401 || status == 403 {
+            return Self::Unauthorized;
+        }
+        Self::Api {
+            status,
+            message: extract_detail(body),
+        }
+    }
+}
+
+/// Render a peer-supplied body into bounded, inert detail.
+fn extract_detail(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let detail = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| {
+            let errors = value.get("errors")?.as_object()?;
+            let mut parts: Vec<String> = errors
+                .iter()
+                .map(|(field, reason)| match reason.as_str() {
+                    Some(reason) => format!("{field}: {reason}"),
+                    None => format!("{field}: {reason}"),
+                })
+                .collect();
+            parts.sort();
+            Some(parts.join("; "))
+        })
+        .unwrap_or_else(|| text.into_owned());
+
+    sanitise(&detail)
+}
+
+/// Truncate on a character boundary and drop control characters.
+fn sanitise(input: &str) -> String {
+    let cleaned: String = input
+        .chars()
+        .filter(|character| !character.is_control() || *character == ' ')
+        .collect();
+    let mut end = MAX_DETAIL_BYTES.min(cleaned.len());
+    while end > 0 && !cleaned.is_char_boundary(end) {
+        end -= 1;
+    }
+    cleaned[..end].to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_proxmox_error_map_to_api_variant() {
+        let body = br#"{"data":null,"errors":{"vmid":"invalid format"}}"#;
+        let error = ProxmoxError::from_response(400, body);
+        match error {
+            ProxmoxError::Api { status, message } => {
+                assert_eq!(status, 400);
+                assert!(message.contains("vmid"), "message was {message}");
+                assert!(message.contains("invalid format"), "message was {message}");
+            }
+            other => panic!("expected Api, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_401_to_unauthorized_without_echoing_body() {
+        let error = ProxmoxError::from_response(401, b"authentication failure: token 'secret'");
+        assert!(matches!(error, ProxmoxError::Unauthorized));
+        assert!(!error.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn bounds_and_sanitises_unstructured_error_text() {
+        let body = format!("x\u{0007}{}", "y".repeat(4096));
+        let error = ProxmoxError::from_response(500, body.as_bytes());
+        let rendered = error.to_string();
+        assert!(rendered.len() <= 640, "rendered {} bytes", rendered.len());
+        assert!(!rendered.contains('\u{0007}'), "control byte survived");
+    }
+}
