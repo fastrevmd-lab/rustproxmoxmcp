@@ -25,3 +25,4 @@ pub mod tier;
 
 pub use error::ProxmoxError;
 pub use inventory::{Cluster, ClusterInventory, ClusterPolicy};
+pub use selector::{GuestType, Selector};
