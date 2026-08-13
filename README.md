@@ -121,7 +121,12 @@ If the guest is out of scope or the action tier (`read`/`low`/`destructive`) is 
 
 **Note:** The top-level key is `devices`, not `clusters` — this is the canonical envelope from `mecmcp-inventory`, and the server reads each entry as a cluster.
 
-Credentials never appear in this file. Each cluster names an environment variable (`token_secret_env`) or a separate 0600 file (`token_secret_file`), loaded through `mecmcp-secret` into an `OutboundSecret` that is zeroized on drop.
+**Credentials never appear in this file.** Each cluster references its API token secret through one of two mechanisms:
+
+- **`token_secret_file`** (default): Points to a separate file like `/etc/proxmoxmcp/secrets/<cluster>.token`. This is the stronger option — the file is read through the same hardened loader as `clusters.json` and `tokens.json` (0600, regular file, owned by the service user, `O_NOFOLLOW`), and the credential never enters the process environment where it could surface in crash dumps or `/proc/<pid>/environ`.
+- **`token_secret_env`**: Names an environment variable. Supported via `EnvironmentFile=-/etc/proxmoxmcp/secrets.env` in the systemd unit (the `-` prefix makes a missing file non-fatal). The environment-variable path is weaker because the credential becomes readable from the process environment.
+
+Both are loaded through `mecmcp-secret` into an `OutboundSecret` that is zeroized on drop and implements neither `Debug` nor `Serialize`.
 
 ### Token store: `tokens.json`
 

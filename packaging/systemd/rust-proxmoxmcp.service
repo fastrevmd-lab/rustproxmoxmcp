@@ -19,6 +19,7 @@ ExecStart=/usr/local/bin/rust-proxmoxmcp \
     --audit-log-file /var/lib/proxmoxmcp/audit.jsonl
 Restart=on-failure
 RestartSec=5
+EnvironmentFile=-/etc/proxmoxmcp/secrets.env
 
 # /etc/proxmoxmcp stays read-only to the service. This is deliberate: it is what
 # makes editing the inventory a root operation rather than something the server

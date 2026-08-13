@@ -47,8 +47,16 @@ fi
 echo "    Installing binary to /usr/local/bin/rust-proxmoxmcp..."
 install -m 0755 -o root -g root rust-proxmoxmcp /usr/local/bin/rust-proxmoxmcp
 
-# Create /etc/proxmoxmcp
+# Create /etc/proxmoxmcp and secrets directory
 mkdir -p /etc/proxmoxmcp
+if [ ! -d /etc/proxmoxmcp/secrets ]; then
+    echo "    Creating /etc/proxmoxmcp/secrets/..."
+    mkdir -p /etc/proxmoxmcp/secrets
+    chown proxmoxmcp:proxmoxmcp /etc/proxmoxmcp/secrets
+    chmod 0700 /etc/proxmoxmcp/secrets
+else
+    echo "    /etc/proxmoxmcp/secrets/ exists"
+fi
 
 # Install example config files only if absent
 if [ ! -f /etc/proxmoxmcp/clusters.json ]; then
@@ -85,7 +93,9 @@ echo "==> Installation complete"
 echo ""
 echo "Next steps:"
 echo "  1. Edit /etc/proxmoxmcp/clusters.json with your cluster details"
-echo "  2. Set token secrets as environment variables or files referenced in clusters.json"
+echo "  2. Write each cluster's API token secret to /etc/proxmoxmcp/secrets/<cluster>.token"
+echo "     (mode 0600, owned by proxmoxmcp). Alternatively, use token_secret_env and"
+echo "     create /etc/proxmoxmcp/secrets.env with KEY=value lines."
 echo "  3. Mint a token with: rust-proxmoxmcp token add <name>"
 echo "  4. (Optional) Configure TLS certificates at /etc/proxmoxmcp/tls/{fullchain,privkey}.pem"
 echo "  5. Start the service: systemctl start rust-proxmoxmcp"
