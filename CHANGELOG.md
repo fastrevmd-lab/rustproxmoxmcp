@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-08-13
+
+### Fixed
+
+Five defects found by installing and running release 0.1.0 against a live Proxmox VE cluster:
+
+- **Blocker:** A fresh install could not mint its first token. The installer seeded `tokens.json` with a JSON object (`{"version": 1, "tokens": {}}`) where the loader requires an array (`{"version": 1, "tokens": []}`). Fixed by changing the installer to write the correct envelope.
+- **Blocker:** `token add` had no way to set a token's guest grant, so no mintable token could call guest-addressed tools. Added `--guests <selector>` and `--actions <tier>` flags to `rust-proxmoxmcp token add`.
+- SIGHUP reloaded the cluster inventory but not the token store, so minting a token and reloading the service appeared to do nothing until a full restart. Fixed by adding `TokenStore` to the `ReloadableState` struct.
+- A missing credential file or unreadable CA certificate reported "malformed proxmox response", pointing operators at their Proxmox cluster instead of their filesystem. Fixed by surfacing the underlying I/O error as a configuration error in the reload handler.
+- The example inventory (`clusters.example.json`) named a `ca_pem_path` the installer never creates, breaking startup for any cluster with a publicly-trusted certificate. Fixed by removing the key from the example; `ca_pem_path` is now documented as optional and only needed for private CAs.
+
 ## [0.1.0] - 2026-08-12
 
 ### Added
@@ -49,4 +61,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A bearer token with no `grant` key is refused for guest-addressed tools. This is fail-closed: a grantless token must not become a wildcard.
 - The `rust-proxmoxmcp-core` crate has a non-default `testing` feature that pulls in mock-server machinery (`rcgen`, `rustls`, `tokio-rustls`, `tempfile`). This is **not** compiled into the release binary.
 
+[0.1.1]: https://github.com/fastrevmd-lab/rustproxmoxmcp/releases/tag/v0.1.1
 [0.1.0]: https://github.com/fastrevmd-lab/rustproxmoxmcp/releases/tag/v0.1.0

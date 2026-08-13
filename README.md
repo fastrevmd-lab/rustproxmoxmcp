@@ -18,23 +18,27 @@
 
 Release 0.1 delivers the complete read-only catalog: 16 tools covering cluster status, nodes, guests (QEMU VMs and LXC containers), storage, backups, ISO images, templates, snapshots, and tasks. **No mutating tools exist yet** — every destructive operation (`delete_vm`, `clone_vm`, snapshot/backup lifecycle, etc.) is deferred to release 0.2.
 
-**Testing status:** All 78 tests pass, including an adversarial suite covering the authorization spine and the protection union. The test suite exercises the code against **mock Proxmox servers only** — release 0.1 has not been run against a real Proxmox cluster.
+**Testing status:** All 78 tests pass, including an adversarial suite covering the authorization spine and the protection union. Release 0.1 was installed from a release tarball onto a Debian 13 LXC and run against a live two-node Proxmox VE cluster with a read-only API token. Confirmed there: all 16 read tools listed with in-scope filtering; guest reads returned live cluster data; out-of-scope guest access was refused without disclosing the guest's name; `delete_vm` was refused at stage-1 preflight with HTTP 403 despite a wildcard tool scope; the node was resolved server-side; a protected guest reported both protection reasons (tag and inventory pin); audit events were emitted for allowed and refused calls; SIGHUP reloaded configuration in place.
+
+**Not validated:** No mutating operation was exercised (none exists in this release). The rig ran plaintext on loopback; a TLS-terminated deployment has not been exercised. Only one cluster was configured; the multi-cluster path is untested against real hardware. Validation ran on a disposable rehearsal rig, not on an operational deployment.
+
+Five defects were found by live-cluster validation and are fixed in release 0.1.1.
 
 ### What's implemented
 
-- **Multi-cluster inventory:** One server, many clusters. Each cluster gets its own API token, TLS trust anchor, and protection policy.
+- **Multi-cluster inventory:** One server, many clusters. Each cluster gets its own API token and protection policy.
 - **Two-stage authorization:**
   1. **Stage 1** (before the catalog call): Bearer token validation, tool and cluster scope checks.
   2. **Stage 2** (guest-addressed tools only): Guest resolution, grant evaluation (VMID range, tag, pool selectors), and fail-closed protection.
 - **Protection union:** A guest is protected if it appears in `protected_vmids` **or** carries a tag from `protected_tags`. A protected guest cannot be addressed by any mutating tool, even with a wildcard token. (Read tools see protected guests normally.)
 - **Catalog-driven dispatch:** Every tool's HTTP method, path template, query flag, and type filter is declared once in `catalog.rs`. The runtime resolves `{node}` and `{vmid}` parameters and assembles the outbound call without hand-written per-tool client code.
 - **SIGHUP reload:** `systemctl reload` (or `kill -HUP`) reloads `clusters.json` in place without dropping in-flight calls. A failed reload logs and retains the previous snapshot.
-- **Per-cluster CA pinning:** Each cluster in the inventory can name a `ca_pem_path`. No `--insecure` flag exists at any layer.
+- **Per-cluster CA pinning:** Each cluster in the inventory can name a `ca_pem_path` to pin a specific trust anchor. When omitted, the server uses the system's default trust roots. This is only needed for clusters whose API certificate is self-signed or issued by a private CA; clusters with publicly-trusted certificates (e.g., Let's Encrypt) do not require it. No `--insecure` flag exists at any layer.
 - **Audit logging:** JSON-structured logs with optional PII redaction (HMAC-keyed or drop). Every tool call logs cluster, guest, tier, and protection status.
 
 ### What's deliberately absent
 
-- **Every mutating tool.** The complete destructive tier (`delete_vm`, `delete_container`, `delete_snapshot`, `delete_backup`, `restore_backup`, `rollback_snapshot`) and the low tier (`clone_vm`, `create_snapshot`, `create_backup`, `start_vm`, `stop_vm`, etc.) are registered in `WRITE_TOOLS` but unimplemented. A token with `"tools": ["*"]` cannot call them because they are unregistered; the catalog refuses the call before authorization runs.
+- **Every mutating tool.** The complete destructive tier (`delete_vm`, `delete_container`, `delete_snapshot`, `delete_backup`, `restore_backup`, `rollback_snapshot`) and the low tier (`clone_vm`, `create_snapshot`, `create_backup`, `start_vm`, `stop_vm`, etc.) are registered in `WRITE_TOOLS` but unimplemented. A token with `"tools": ["*"]` cannot call them: `WRITE_TOOLS` names every mutating tool — including ones no release has registered yet — and a wildcard tool scope deliberately excludes that registry, so the stage-1 preflight refuses the call with `403 insufficient_scope` before it reaches dispatch. The registry is complete ahead of the tools it names, so the guard is already in place when release 0.2 begins registering them.
 - **Override and lab mode** (release 0.3): `--lab-mode`, `--waivers-file`, and the `lab_unrestricted` token flag. These belong to release 0.3's change-control surface and are deliberately omitted so a flag that is present but ignored cannot confuse an operator.
 
 ### The 16 read tools
@@ -108,7 +112,6 @@ If the guest is out of scope or the action tier (`read`/`low`/`destructive`) is 
       "endpoint": "https://pve3.example.org:8006",
       "token_id": "root@pam!mcp",
       "token_secret_env": "PVE_PVE3_TOKEN",
-      "ca_pem_path": "/etc/proxmoxmcp/ca/pve3.pem",
       "protected_vmids": [905, 906, 907],
       "protected_tags": ["protected"]
     }

@@ -72,7 +72,7 @@ fi
 
 if [ ! -f /etc/proxmoxmcp/tokens.json ]; then
     echo "    Creating empty tokens.json..."
-    printf '{"version":1,"tokens":{}}\n' > /etc/proxmoxmcp/tokens.json
+    printf '{"version":1,"tokens":[]}\n' > /etc/proxmoxmcp/tokens.json
     chown proxmoxmcp:proxmoxmcp /etc/proxmoxmcp/tokens.json
     chmod 0600 /etc/proxmoxmcp/tokens.json
 else
@@ -96,7 +96,11 @@ echo "  1. Edit /etc/proxmoxmcp/clusters.json with your cluster details"
 echo "  2. Write each cluster's API token secret to /etc/proxmoxmcp/secrets/<cluster>.token"
 echo "     (mode 0600, owned by proxmoxmcp). Alternatively, use token_secret_env and"
 echo "     create /etc/proxmoxmcp/secrets.env with KEY=value lines."
-echo "  3. Mint a token with: rust-proxmoxmcp token add <name>"
+echo "  3. Mint a token, e.g.:"
+echo "       rust-proxmoxmcp token add --tokens-file /etc/proxmoxmcp/tokens.json \\"
+echo "           --name reader --devices '*' --tools '*' --guests '*' --actions read"
+echo "     Omit --guests only for a token that will call cluster-scoped tools alone;"
+echo "     without it the token cannot address individual guests."
 echo "  4. (Optional) Configure TLS certificates at /etc/proxmoxmcp/tls/{fullchain,privkey}.pem"
 echo "  5. Start the service: systemctl start rust-proxmoxmcp"
 echo "  6. Enable on boot: systemctl enable rust-proxmoxmcp"

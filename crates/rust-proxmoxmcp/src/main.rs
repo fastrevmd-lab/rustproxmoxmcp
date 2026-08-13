@@ -5,20 +5,125 @@ mod http_transport;
 mod server;
 
 use anyhow::{Context as _, Result};
-use cli::ProxmoxCli;
+use cli::{ProxmoxCli, TokenCli, TokenCommand};
 use http_transport::build_http_router;
 use mecmcp_auth::TokenStoreFile;
-use mecmcp_runtime::cli::{Command, Transport};
+use mecmcp_runtime::cli::{Command, TokenAction, Transport};
 use mecmcp_transport::{LimitsConfig, serve_router};
 use rmcp::ServiceExt as _;
 use rust_proxmoxmcp_core::{
-    ProxmoxGrant,
+    ProxmoxAction, ProxmoxGrant,
     client::ProxmoxClient,
     inventory::ClusterInventory,
     resolve::GuestIndex,
+    selector::Selector,
 };
 use server::ProxmoxServer;
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::Duration};
+
+/// Build a vendor grant from TokenCommand::Add fields.
+///
+/// Returns `None` when no guest selectors are given, allowing cluster-scoped
+/// tokens. Validates selectors at mint time and prints a note when omitted.
+fn build_token_grant_from_add(
+    guests: &[String],
+    actions: &[String],
+) -> Result<Option<ProxmoxGrant>> {
+    // No grant fields given: token will work for cluster-scoped tools only.
+    if guests.is_empty() {
+        eprintln!(
+            "Note: This token cannot use guest-addressed tools. \
+             Use --guests '*' or a selector (vmid:X, tag:Y, pool:Z) to grant guest access."
+        );
+        return Ok(None);
+    }
+
+    // Validate each selector at mint time. A selector that cannot parse produces
+    // a token that silently admits nothing, which an operator cannot diagnose.
+    for term in guests {
+        Selector::parse(term).map_err(|error| {
+            anyhow::anyhow!("invalid --guests selector '{term}': {error}")
+        })?;
+    }
+
+    // Parse action names.
+    let parsed_actions: Result<Vec<ProxmoxAction>> = actions
+        .iter()
+        .map(|name| match name.as_str() {
+            "read" => Ok(ProxmoxAction::Read),
+            "low" => Ok(ProxmoxAction::Low),
+            "destructive" => Ok(ProxmoxAction::Destructive),
+            other => Err(anyhow::anyhow!(
+                "invalid --actions value '{other}': must be read, low, or destructive"
+            )),
+        })
+        .collect();
+
+    Ok(Some(ProxmoxGrant {
+        guests: guests.to_vec(),
+        actions: parsed_actions?,
+    }))
+}
+
+/// Convert `TokenCommand` to `TokenAction` and extract grant for Add.
+fn token_command_to_action(
+    command: TokenCommand,
+) -> Result<(TokenAction, Option<ProxmoxGrant>)> {
+    match command {
+        TokenCommand::Add {
+            tokens_file,
+            name,
+            devices,
+            tools,
+            guests,
+            actions,
+            provider,
+            provider_tier,
+            on_behalf_of,
+            actor_type,
+            server_pid,
+        } => {
+            let grant = build_token_grant_from_add(&guests, &actions)?;
+            let action = TokenAction::Add {
+                tokens_file,
+                name,
+                devices,
+                tools,
+                provider,
+                provider_tier,
+                on_behalf_of,
+                actor_type,
+                server_pid,
+            };
+            Ok((action, grant))
+        }
+        TokenCommand::Revoke {
+            tokens_file,
+            name,
+            server_pid,
+        } => Ok((
+            TokenAction::Revoke {
+                tokens_file,
+                name,
+                server_pid,
+            },
+            None,
+        )),
+        TokenCommand::List { tokens_file } => Ok((TokenAction::List { tokens_file }, None)),
+        TokenCommand::Rotate {
+            tokens_file,
+            name,
+            server_pid,
+        } => Ok((
+            TokenAction::Rotate {
+                tokens_file,
+                name,
+                server_pid,
+            },
+            None,
+        )),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -29,27 +134,52 @@ async fn main() -> Result<()> {
         .install_default()
         .map_err(|_| anyhow::anyhow!("a rustls crypto provider was already installed"))?;
 
+    // Dispatch token commands before parsing ProxmoxCli.
+    //
+    // This keeps grant-specific flags (--guests, --actions) off the server's help
+    // and allows them to appear after the subcommand where they belong. The
+    // flattened Cli still declares its own `token` subcommand, but TokenCli owns
+    // the complete token surface including --help when argv names `token`.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("token") {
+        use clap::Parser;
+        // Build args for TokenCli: [program_name, add/revoke/list/rotate, ...]
+        // Skip "token" at index 1 since TokenCli expects the subcommand directly.
+        let token_args = std::iter::once(args[0].clone())
+            .chain(args.iter().skip(2).cloned())
+            .collect::<Vec<_>>();
+        let token_cli = TokenCli::parse_from(token_args);
+        let (action, grant) = token_command_to_action(token_cli.command)?;
+        return mecmcp_runtime::token_cmd::run_with_grant::<ProxmoxGrant>(
+            action,
+            &[],
+            server::KNOWN_TOOLS,
+            grant,
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"));
+    }
+
     let parsed = mecmcp_runtime::cli::parse_with_provenance::<ProxmoxCli>(
         "rust-proxmoxmcp",
         env!("CARGO_PKG_VERSION"),
     );
-    let args = parsed.cli;
+    let mut args = parsed.cli;
 
     mecmcp_runtime::cli_validate::validate(&args.common)
         .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
 
     init_audit(&args.common)?;
 
-    if let Some(Command::Token { action }) = args.common.command {
-        // Token management is deliberately local: it validates against the fixed
-        // tool registry and does not load cluster inventory or build clients.
-        return mecmcp_runtime::token_cmd::run_with_grant::<ProxmoxGrant>(
-            action,
-            &[],
-            server::KNOWN_TOOLS,
-            None,
-        )
-        .map_err(|error| anyhow::anyhow!("{error}"));
+    if let Some(Command::Token { .. }) = args.common.command.take() {
+        // This path fires when a server flag precedes the subcommand
+        // (e.g., `--clusters-file X token add ...`). The early dispatch at argv[1]
+        // does not intercept it, so TokenCli's grant-specific flags (--guests,
+        // --actions) are unavailable. Refuse rather than silently minting a
+        // grantless token.
+        return Err(anyhow::anyhow!(
+            "token subcommand must appear before server flags; use: \
+             rust-proxmoxmcp token add [options]"
+        ));
     }
 
     let clusters = Arc::new(
@@ -71,14 +201,22 @@ async fn main() -> Result<()> {
         clusters.policy().resource_cache_ttl_secs,
     )));
 
-    // SIGHUP reloads the inventory in place. A failed reload leaves the previous
-    // contents in effect and logs; it must never take the server down.
-    install_sighup_reload(Arc::clone(&clusters), Arc::clone(&index))?;
-
     match args.common.transport {
-        Transport::Stdio => serve_stdio(clusters, clients, index).await,
+        Transport::Stdio => {
+            // SIGHUP reloads the inventory in place. Stdio has no token store.
+            install_sighup_reload(Arc::clone(&clusters), Arc::clone(&index), None)?;
+            serve_stdio(clusters, clients, index).await
+        },
         Transport::StreamableHttp => {
             let token_store = load_http_token_store(&args.common)?;
+
+            // Install SIGHUP handler that reloads both inventory and token store.
+            install_sighup_reload(
+                Arc::clone(&clusters),
+                Arc::clone(&index),
+                token_store.clone(),
+            )?;
+
             let tls = load_listener_tls(&args.common)?;
             let host = args
                 .common
@@ -228,8 +366,10 @@ fn load_listener_tls(
 fn install_sighup_reload(
     clusters: Arc<ClusterInventory>,
     index: Arc<GuestIndex>,
+    token_store: Option<Arc<TokenStoreFile<ProxmoxGrant>>>,
 ) -> std::io::Result<()> {
     mecmcp_runtime::signals::install_hup_handler(move || {
+        // Reload cluster inventory.
         match clusters.reload() {
             Ok(count) => {
                 index.invalidate();
@@ -237,6 +377,19 @@ fn install_sighup_reload(
             }
             Err(error) => {
                 tracing::error!(%error, "cluster inventory reload failed; retaining previous snapshot");
+            }
+        }
+
+        // Reload token store if present (HTTP mode only).
+        if let Some(ref store) = token_store {
+            match store.reload() {
+                Ok(()) => {
+                    let count = store.store().len();
+                    tracing::info!(tokens = count, "token store reloaded");
+                }
+                Err(error) => {
+                    tracing::error!(%error, "token store reload failed; retaining previous snapshot");
+                }
             }
         }
     })
