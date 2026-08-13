@@ -101,6 +101,17 @@ pub const READ_TOOLS: &[ReadTool] = &[
         type_filter: None,
         query: &[],
     },
+    // LXC-only: the path hardcodes 'lxc'. Task 11's executor must refuse a QEMU
+    // target for this tool rather than issuing a request that can only fail.
+    ReadTool {
+        name: "get_container_ip",
+        method: Method::Get,
+        path: "/api2/json/nodes/{node}/lxc/{vmid}/interfaces",
+        needs_guest: true,
+        description: "Network interfaces and addresses of one LXC guest.",
+        type_filter: None,
+        query: &[],
+    },
     ReadTool {
         name: "get_guest_status",
         method: Method::Get,
