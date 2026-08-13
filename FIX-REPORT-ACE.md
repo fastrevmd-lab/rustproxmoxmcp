@@ -234,30 +234,11 @@ Manual verification on LXC 970 after deployment:
 1. `aaa01c5` Fix misleading "malformed proxmox response" for local file errors
 2. `6b546a1` Add CLI support for minting tokens with guest grants  
 3. `c7de5b4` Reload token store on SIGHUP
+4. `eb27acc` Fix grant flags appearing in server help (Finding C refinement)
 
 ---
 
 ## Concerns
-
-### Finding C: Flag Position Requirement
-
-The `--guests` and `--actions` flags must appear BEFORE the `token` subcommand:
-```bash
-# Correct
-rust-proxmoxmcp --guests '*' token add ...
-
-# Wrong
-rust-proxmoxmcp token add --guests '*' ...
-```
-
-This is a structural constraint from flattening `mecmcp_runtime::cli::Cli` into `ProxmoxCli`. The flags are on the top-level struct, not inside the `Token` subcommand, so clap requires them before the subcommand.
-
-**Alternatives considered**:
-1. Parse args manually and inject into TokenAction - rejected (too invasive, bypasses clap validation)
-2. Fork mecmcp's CLI - rejected (breaks shared tooling guarantees)
-3. Document the requirement - chosen
-
-**Mitigation**: Tests and error messages clearly show the correct form. The help text from `--help` shows the flags in the right position.
 
 ### Finding E: No Direct Unit Test
 
@@ -267,6 +248,82 @@ The SIGHUP handler is signal-driven and not easily unit-testable in isolation. T
 
 ---
 
+---
+
+## Finding C Refinement: Grant Flags in Server Help
+
+### Review Finding
+
+After initial implementation, code review identified that `--guests` and `--actions` were sitting on the top-level `ProxmoxCli` struct, which meant they appeared in `rust-proxmoxmcp --help` as though they configured the server, but they were ignored on every server invocation. This violated the documented principle that "a flag that is present but ignored is worse than one that is absent, because the operator cannot tell."
+
+### Solution: Pre-Parse Dispatch
+
+**Intercept before parsing** rather than flatten grant flags onto ProxmoxCli.
+
+Created `TokenCli` - a dedicated `#[derive(Parser)]` that owns the complete token surface:
+```rust
+pub struct TokenCli {
+    #[command(subcommand)]
+    pub command: TokenCommand,
+}
+
+pub enum TokenCommand {
+    Add {
+        tokens_file: PathBuf,
+        name: String,
+        devices: Vec<String>,
+        tools: Vec<String>,
+        guests: Vec<String>,      // ← Now here, not on ProxmoxCli
+        actions: Vec<String>,     // ← Now here, not on ProxmoxCli
+        provider: Option<String>,
+        provider_tier: Option<String>,
+        on_behalf_of: Option<String>,
+        actor_type: Option<String>,
+        server_pid: Option<i32>,
+    },
+    Revoke { ... },
+    List { ... },
+    Rotate { ... },
+}
+```
+
+In `main()`, inspect `std::env::args()` before any parsing:
+```rust
+let args: Vec<String> = std::env::args().collect();
+if args.get(1).map(String::as_str) == Some("token") {
+    // Skip "token" and parse remainder as TokenCli
+    let token_args = std::iter::once(args[0].clone())
+        .chain(args.iter().skip(2).cloned())
+        .collect::<Vec<_>>();
+    let token_cli = TokenCli::parse_from(token_args);
+    // Handle and return
+}
+// Otherwise parse ProxmoxCli and run server
+```
+
+### Benefits
+
+1. **Grant flags off server help**: `rust-proxmoxmcp --help` shows only server flags
+2. **Natural invocation order**: `rust-proxmoxmcp token add --name X --guests '*'` (flags after subcommand)
+3. **Total interception**: `rust-proxmoxmcp token --help` shows complete token surface including grant flags
+4. **No flattened CLI duplication**: The shared `mecmcp_runtime::cli::Cli` stays untouched
+
+### Files Changed (Refinement)
+
+- `crates/rust-proxmoxmcp/src/cli.rs` - removed grant fields from ProxmoxCli, added TokenCli and TokenCommand
+- `crates/rust-proxmoxmcp/src/main.rs` - added pre-parse dispatch, token_command_to_action(), build_token_grant_from_add()
+- `crates/rust-proxmoxmcp/tests/token_grant.rs` - updated all tests to use new invocation order
+
+### Tests
+
+All 4 existing token grant tests pass with the new invocation order (flags after subcommand). Verified:
+- `token add --guests X --actions Y` works
+- `token add` without `--guests` prints note and creates grantless token
+- Invalid selectors fail at mint time with clear error
+- Wildcard `*` accepted
+
+---
+
 ## Conclusion
 
-All three findings are fixed with TDD (where testable), preserve existing behavior, and pass the full test suite. Finding C has a known constraint (flag position), and Finding E relies on mecmcp's tested reload method plus manual verification post-deployment.
+All three findings are fixed with TDD (where testable), preserve existing behavior, and pass the full test suite (87 tests). Finding C was refined after review to use pre-parse dispatch instead of flattened flags, removing grant flags from server help and enabling natural invocation order. Finding E relies on mecmcp's tested reload method plus manual verification post-deployment.
