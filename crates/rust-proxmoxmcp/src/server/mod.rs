@@ -701,6 +701,7 @@ mod tests {
             on_behalf_of: None,
             actor_type: ActorType::Agent,
             client_name: None,
+            request_id: uuid::Uuid::new_v4(),
         };
 
         let result = resolve_grant(Some(&grantless_caller));
