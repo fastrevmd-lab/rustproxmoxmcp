@@ -38,7 +38,7 @@ Five defects were found by live-cluster validation and are fixed in release 0.1.
 
 ### What's deliberately absent
 
-- **Every mutating tool.** The complete destructive tier (`delete_vm`, `delete_container`, `delete_snapshot`, `delete_backup`, `restore_backup`, `rollback_snapshot`) and the low tier (`clone_vm`, `create_snapshot`, `create_backup`, `start_vm`, `stop_vm`, etc.) are registered in `WRITE_TOOLS` but unimplemented. A token with `"tools": ["*"]` cannot call them because they are unregistered; the catalog refuses the call before authorization runs.
+- **Every mutating tool.** The complete destructive tier (`delete_vm`, `delete_container`, `delete_snapshot`, `delete_backup`, `restore_backup`, `rollback_snapshot`) and the low tier (`clone_vm`, `create_snapshot`, `create_backup`, `start_vm`, `stop_vm`, etc.) are registered in `WRITE_TOOLS` but unimplemented. A token with `"tools": ["*"]` cannot call them: `WRITE_TOOLS` names every mutating tool — including ones no release has registered yet — and a wildcard tool scope deliberately excludes that registry, so the stage-1 preflight refuses the call with `403 insufficient_scope` before it reaches dispatch. The registry is complete ahead of the tools it names, so the guard is already in place when release 0.2 begins registering them.
 - **Override and lab mode** (release 0.3): `--lab-mode`, `--waivers-file`, and the `lab_unrestricted` token flag. These belong to release 0.3's change-control surface and are deliberately omitted so a flag that is present but ignored cannot confuse an operator.
 
 ### The 16 read tools
