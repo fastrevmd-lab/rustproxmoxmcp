@@ -24,7 +24,7 @@ mecmcp-runtime   = { workspace = true }
 mecmcp-server    = { workspace = true }
 mecmcp-transport = { workspace = true }
 rmcp             = { workspace = true }
-rust-proxmoxmcp-core = { path = "../rust-proxmoxmcp-core" }
+rust-proxmoxmcp-core = { workspace = true }
 rustls           = { workspace = true }
 schemars         = { workspace = true }
 serde            = { workspace = true }
@@ -37,7 +37,7 @@ tracing          = { workspace = true }
 [dev-dependencies]
 mecmcp-auth      = { workspace = true }
 mecmcp-transport = { workspace = true }
-rust-proxmoxmcp-core = { path = "../rust-proxmoxmcp-core", features = ["testing"] }
+rust-proxmoxmcp-core = { workspace = true, features = ["testing"] }
 serde_json       = { workspace = true }
 tempfile         = "3"
 tokio            = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
