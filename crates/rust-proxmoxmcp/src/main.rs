@@ -170,17 +170,16 @@ async fn main() -> Result<()> {
 
     init_audit(&args.common)?;
 
-    if let Some(Command::Token { action }) = args.common.command.take() {
-        // This path is unreachable when argv[1] is "token" due to early dispatch,
-        // but it remains for the flattened Cli's own Token variant. In practice
-        // that variant is shadowed by TokenCli's interception.
-        return mecmcp_runtime::token_cmd::run_with_grant::<ProxmoxGrant>(
-            action,
-            &[],
-            server::KNOWN_TOOLS,
-            None,
-        )
-        .map_err(|error| anyhow::anyhow!("{error}"));
+    if let Some(Command::Token { .. }) = args.common.command.take() {
+        // This path fires when a server flag precedes the subcommand
+        // (e.g., `--clusters-file X token add ...`). The early dispatch at argv[1]
+        // does not intercept it, so TokenCli's grant-specific flags (--guests,
+        // --actions) are unavailable. Refuse rather than silently minting a
+        // grantless token.
+        return Err(anyhow::anyhow!(
+            "token subcommand must appear before server flags; use: \
+             rust-proxmoxmcp token add [options]"
+        ));
     }
 
     let clusters = Arc::new(
