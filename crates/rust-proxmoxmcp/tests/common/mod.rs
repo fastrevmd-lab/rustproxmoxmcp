@@ -8,6 +8,8 @@
 //! The harness exposes the base URL, the plaintext token, and the mock's
 //! request count to prove preflight rejection happens before any Proxmox request.
 
+#![allow(dead_code)]
+
 use mecmcp_auth::{KnownNames, ScopeSet, TokenStoreFile};
 use mecmcp_transport::LimitsConfig;
 use rust_proxmoxmcp::http_transport::build_http_router;
@@ -26,8 +28,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
-/// Allocate a unique test port for each TestServer instance.
-static TEST_PORT_COUNTER: AtomicU16 = AtomicU16::new(19888);
+/// Allocate unique test ports starting from a high range to avoid conflicts.
+static TEST_PORT_COUNTER: AtomicU16 = AtomicU16::new(35000);
 
 /// Token specification for test scenarios.
 pub struct TokenSpec {
@@ -195,7 +197,7 @@ impl TestServer {
         )
         .expect("build HTTP router");
 
-        // Allocate a unique test port for this instance to allow parallel test execution.
+        // Allocate a unique port for this test server instance.
         use std::net::SocketAddr;
         let port = TEST_PORT_COUNTER.fetch_add(1, Ordering::Relaxed);
         let addr: SocketAddr = format!("127.0.0.1:{port}")
@@ -208,11 +210,11 @@ impl TestServer {
                 .expect("serve router");
         });
 
-        // Give the server a moment to bind and start.
+        // Give the server time to bind and start accepting connections.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         Self {
-            url: format!("http://{addr}"),
+            url: format!("http://127.0.0.1:{port}"),
             token: plaintext.expose_secret().to_owned(),
             mock,
             _temp_dir: temp_dir,
@@ -294,8 +296,8 @@ fn ensure_crypto_provider() {
 /// # Parameters
 /// - `vmid`: The guest VMID to configure
 /// - `protected`: Whether the guest should be protected
-pub async fn handler_with_guest(vmid: u32, protected: bool) -> TestServer {
-    let tags = if protected { "protected" } else { "test" };
+pub async fn handler_with_guest(_vmid: u32, protected: bool) -> TestServer {
+    let _tags = if protected { "protected" } else { "test" };
     let spec = TokenSpec {
         clusters: vec!["pve3".to_owned()],
         tools: vec!["*".to_owned()],

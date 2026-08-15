@@ -140,10 +140,10 @@ impl ProxmoxServer {
     }
 
     /// Look up the client for a cluster the caller is entitled to reach.
-    fn client_for(&self, cluster: &str) -> Result<&ProxmoxClient, CallToolResult> {
+    fn client_for(&self, cluster: &str) -> Result<&ProxmoxClient, Box<CallToolResult>> {
         self.clients
             .get(cluster)
-            .ok_or_else(|| tool_error(format!("unknown cluster: {cluster}")))
+            .ok_or_else(|| Box::new(tool_error(format!("unknown cluster: {cluster}"))))
     }
 }
 
@@ -156,14 +156,14 @@ impl ProxmoxServer {
 /// # Errors
 ///
 /// Returns a `CallToolResult` error when an authenticated token carries no guest selector.
-fn resolve_grant(caller: Option<&CallerCtx<ProxmoxGrant>>) -> Result<ProxmoxGrant, CallToolResult> {
+fn resolve_grant(caller: Option<&CallerCtx<ProxmoxGrant>>) -> Result<ProxmoxGrant, Box<CallToolResult>> {
     match caller {
         None => Ok(rust_proxmoxmcp_core::ProxmoxGrant::read_only()),
         Some(ctx) => ctx.grant.clone().ok_or_else(|| {
-            tool_error(format!(
+            Box::new(tool_error(format!(
                 "token '{}' carries no 'guests' selector; add one to tokens.json",
                 ctx.token_name
-            ))
+            )))
         }),
     }
 }
@@ -203,7 +203,7 @@ impl ProxmoxServer {
         };
         let client = match self.client_for(cluster) {
             Ok(client) => client,
-            Err(result) => return result,
+            Err(result) => return *result,
         };
 
         let mut params: Vec<(&str, String)> = extra_params
@@ -214,7 +214,7 @@ impl ProxmoxServer {
         if let Some(vmid) = vmid {
             let grant = match resolve_grant(caller.as_ref()) {
                 Ok(grant) => grant,
-                Err(error) => return error,
+                Err(error) => return *error,
             };
             let authorized = match self
                 .index
@@ -408,12 +408,12 @@ impl ProxmoxServer {
 
         let client = match self.client_for(&args.cluster) {
             Ok(client) => client,
-            Err(result) => return result,
+            Err(result) => return *result,
         };
 
         let grant = match resolve_grant(caller.as_ref()) {
             Ok(grant) => grant,
-            Err(error) => return error,
+            Err(error) => return *error,
         };
         let authorized = match self
             .index
@@ -637,12 +637,12 @@ impl ProxmoxServer {
 
         let client = match self.client_for(&args.cluster) {
             Ok(client) => client,
-            Err(result) => return result,
+            Err(result) => return *result,
         };
 
         let grant = match resolve_grant(caller.as_ref()) {
             Ok(grant) => grant,
-            Err(error) => return error,
+            Err(error) => return *error,
         };
         let authorized = match self
             .index
@@ -953,7 +953,7 @@ impl ProxmoxServer {
 
         let client = match self.client_for(&args.cluster) {
             Ok(client) => client,
-            Err(result) => return result,
+            Err(result) => return *result,
         };
 
         let lab_mode = false;
@@ -971,7 +971,7 @@ impl ProxmoxServer {
         // Re-resolve and verify fingerprint.
         let grant = match resolve_grant(caller.as_ref()) {
             Ok(grant) => grant,
-            Err(error) => return error,
+            Err(error) => return *error,
         };
         let authorized = match self
             .index

@@ -2,7 +2,6 @@
 
 mod common;
 
-use common::TestServer;
 use serde_json::json;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -48,7 +47,7 @@ async fn applying_without_approval_is_refused() {
     )
     .await
     .expect_err("an unapproved change set must not apply");
-    assert!(format!("{err}").to_lowercase().contains("approv"), "{err}");
+    assert!(err.to_string().to_lowercase().contains("approv"), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -69,7 +68,7 @@ async fn the_planner_cannot_approve_its_own_change_set() {
     )
     .await
     .expect_err("self-approval must be refused");
-    assert!(format!("{err}").to_lowercase().contains("self"), "{err}");
+    assert!(err.to_string().to_lowercase().contains("self"), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -82,7 +81,7 @@ async fn planning_a_protected_guest_without_an_override_is_refused() {
     )
     .await
     .expect_err("protected without waiver must refuse");
-    assert!(format!("{err}").to_lowercase().contains("protect"), "{err}");
+    assert!(err.to_string().to_lowercase().contains("protect"), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -107,7 +106,7 @@ async fn a_fingerprint_that_moved_after_approval_refuses_the_apply() {
     .await
     .expect_err("a moved guest must refuse the apply");
     assert!(
-        format!("{err}").to_lowercase().contains("fingerprint"),
+        err.to_string().to_lowercase().contains("fingerprint"),
         "{err}"
     );
 }
