@@ -97,6 +97,14 @@ struct WaiverEntryRaw {
 }
 
 impl WaiverFile {
+    /// Create an empty waiver file (no waivers active).
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            waivers: Vec::new(),
+        }
+    }
+
     /// Load a waiver file from disk.
     ///
     /// An absent file returns an empty waiver list. A present file must be mode
