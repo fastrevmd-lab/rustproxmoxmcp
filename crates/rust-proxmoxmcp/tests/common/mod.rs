@@ -126,7 +126,11 @@ impl TestServer {
         // Mint a token and write tokens.json.
         let grant = ProxmoxGrant {
             guests: spec.guests.clone(),
-            actions: vec![ProxmoxAction::Read],
+            actions: vec![
+                ProxmoxAction::Read,
+                ProxmoxAction::Low,
+                ProxmoxAction::Destructive,
+            ],
         };
 
         let tool_refs: Vec<&str> = spec.tools.iter().map(|s| s.as_str()).collect();
@@ -303,7 +307,8 @@ pub async fn handler_with_guest(vmid: u32, protected: bool) -> TestServer {
         Route {
             path: "/api2/json/nodes",
             status: 200,
-            body: br#"{"data":[{"node":"pve2","status":"online"},{"node":"pve3","status":"online"}]}"#,
+            body:
+                br#"{"data":[{"node":"pve2","status":"online"},{"node":"pve3","status":"online"}]}"#,
         },
         Route {
             path: "/api2/json/cluster/resources",
@@ -321,6 +326,9 @@ pub async fn handler_with_guest(vmid: u32, protected: bool) -> TestServer {
 
 /// Make an MCP tool call.
 ///
+/// Uses McpClient with proper initialize handshake. McpClient is synchronous,
+/// so we spawn_blocking to avoid deadlocking against the server on the same runtime.
+///
 /// # Errors
 ///
 /// Returns an error if the tool call fails.
@@ -329,39 +337,40 @@ pub async fn call(
     tool: &str,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let client = reqwest::Client::new();
-    let response = client
-        .post(format!("{}/mcp", server.url))
-        .header("Authorization", format!("Bearer {}", server.token))
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": tool,
-                "arguments": args
-            }
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
+    use mecmcp_transport::test_client::McpClient;
 
-    let body: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("parse failed: {e}"))?;
+    let url = server.url.clone();
+    let token = server.token.clone();
+    let tool = tool.to_owned();
 
-    if let Some(error) = body.get("error") {
-        return Err(format!("{}", error));
-    }
+    tokio::task::spawn_blocking(move || {
+        let client = McpClient::new(&url)
+            .map_err(|e| format!("create client: {e}"))?
+            .with_bearer(&token);
+        let session_id = client
+            .initialize()
+            .map_err(|e| format!("initialize: {e}"))?;
+        let result = client
+            .tools_call(&session_id, &tool, args)
+            .map_err(|e| format!("call: {e}"))?;
 
-    body.get("result")
-        .and_then(|r| r.get("content"))
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("text"))
-        .and_then(|t| t.as_str())
-        .ok_or_else(|| "no result".to_owned())
-        .and_then(|text| serde_json::from_str(text).map_err(|e| format!("json parse: {e}")))
+        eprintln!(
+            "Full MCP result: {}",
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"))
+        );
+
+        // Extract the text content from the MCP response
+        let text = result
+            .get("content")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("text"))
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| format!("no result text, response: {result}"))?;
+
+        serde_json::from_str(text).map_err(|e| format!("json parse: {e}"))
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {e}"))?
 }
 
 /// Approve a change set as a second principal.

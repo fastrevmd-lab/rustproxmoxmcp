@@ -5,12 +5,16 @@ mod common;
 use common::TestServer;
 use serde_json::json;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn planning_a_destroy_binds_the_fingerprint_and_returns_a_preview() {
     let h = common::handler_with_guest(617, false).await;
-    let planned = common::call(&h, "plan_proxmox_destroy", json!({"cluster": "pve3", "vmid": 617}))
-        .await
-        .expect("plan");
+    let planned = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect("plan");
     assert!(planned["change_set_id"].is_string());
     assert!(
         planned["preview"]
@@ -26,7 +30,7 @@ async fn planning_a_destroy_binds_the_fingerprint_and_returns_a_preview() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn applying_without_approval_is_refused() {
     let h = common::handler_with_guest(617, false).await;
     let planned = common::call(
@@ -44,13 +48,10 @@ async fn applying_without_approval_is_refused() {
     )
     .await
     .expect_err("an unapproved change set must not apply");
-    assert!(
-        format!("{err}").to_lowercase().contains("approv"),
-        "{err}"
-    );
+    assert!(format!("{err}").to_lowercase().contains("approv"), "{err}");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_planner_cannot_approve_its_own_change_set() {
     let h = common::handler_with_guest(617, false).await;
     let planned = common::call(
@@ -71,19 +72,20 @@ async fn the_planner_cannot_approve_its_own_change_set() {
     assert!(format!("{err}").to_lowercase().contains("self"), "{err}");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn planning_a_protected_guest_without_an_override_is_refused() {
     let h = common::handler_with_guest(905, true).await;
-    let err = common::call(&h, "plan_proxmox_destroy", json!({"cluster": "pve3", "vmid": 905}))
-        .await
-        .expect_err("protected without waiver must refuse");
-    assert!(
-        format!("{err}").to_lowercase().contains("protect"),
-        "{err}"
-    );
+    let err = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 905}),
+    )
+    .await
+    .expect_err("protected without waiver must refuse");
+    assert!(format!("{err}").to_lowercase().contains("protect"), "{err}");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fingerprint_that_moved_after_approval_refuses_the_apply() {
     // Spec §4.4's renumber case, as a test.
     let h = common::handler_with_guest(617, false).await;

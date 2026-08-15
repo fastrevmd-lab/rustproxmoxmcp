@@ -626,9 +626,12 @@ impl ProxmoxServer {
         };
 
         let caller = Self::caller(&context);
-        if let Err(error) =
-            authorize_call(caller.as_ref(), "plan_proxmox_destroy", Some(&args.cluster), WRITE_TOOLS)
-        {
+        if let Err(error) = authorize_call(
+            caller.as_ref(),
+            "plan_proxmox_destroy",
+            Some(&args.cluster),
+            WRITE_TOOLS,
+        ) {
             return tool_error(error);
         }
 
@@ -654,8 +657,9 @@ impl ProxmoxServer {
         let protection = authorized.protection();
 
         // Load waivers.
-        let waivers = WaiverFile::load(std::path::Path::new("/dev/null"))
-            .unwrap_or_else(|_| WaiverFile::load(std::path::Path::new("/dev/null")).expect("empty waiver"));
+        let waivers = WaiverFile::load(std::path::Path::new("/dev/null")).unwrap_or_else(|_| {
+            WaiverFile::load(std::path::Path::new("/dev/null")).expect("empty waiver")
+        });
 
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -770,7 +774,12 @@ impl ProxmoxServer {
                 Err(error) => return tool_error(format!("waiver: {error}")),
             },
             Override::LabMode => match coordinator
-                .waive_approval(output.change_set_id.clone(), device.clone(), owner.clone(), output.digest.clone())
+                .waive_approval(
+                    output.change_set_id.clone(),
+                    device.clone(),
+                    owner.clone(),
+                    output.digest.clone(),
+                )
                 .await
             {
                 Ok(waived) => waived,
@@ -787,7 +796,11 @@ impl ProxmoxServer {
             expected_digest: Some(output.digest),
         };
 
-        tool_result(Ok::<_, String>(response), ResultFormat::PrettyJson, RESULT_LIMITS)
+        tool_result(
+            Ok::<_, String>(response),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
     }
 
     #[tool(
@@ -837,7 +850,11 @@ impl ProxmoxServer {
             expected_digest: Some(record.digest),
         };
 
-        tool_result(Ok::<_, String>(response), ResultFormat::PrettyJson, RESULT_LIMITS)
+        tool_result(
+            Ok::<_, String>(response),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
     }
 
     #[tool(
@@ -879,7 +896,12 @@ impl ProxmoxServer {
         };
 
         let output = match coordinator
-            .approve_change_set(args.change_set_id.clone(), device.clone(), approver, record.digest.clone())
+            .approve_change_set(
+                args.change_set_id.clone(),
+                device.clone(),
+                approver,
+                record.digest.clone(),
+            )
             .await
         {
             Ok(output) => output,
@@ -900,7 +922,11 @@ impl ProxmoxServer {
             expected_digest: Some(output.digest),
         };
 
-        tool_result(Ok::<_, String>(response), ResultFormat::PrettyJson, RESULT_LIMITS)
+        tool_result(
+            Ok::<_, String>(response),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
     }
 
     #[tool(
@@ -997,7 +1023,11 @@ impl ProxmoxServer {
             expected_digest: None,
         };
 
-        tool_result(Ok::<_, String>(response), ResultFormat::PrettyJson, RESULT_LIMITS)
+        tool_result(
+            Ok::<_, String>(response),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
     }
 }
 
