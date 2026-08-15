@@ -116,6 +116,8 @@ pub struct ProxmoxServer {
     clients: Arc<BTreeMap<String, ProxmoxClient>>,
     index: Arc<GuestIndex>,
     coordinator: Arc<mecmcp_changeset::ChangesetCoordinator>,
+    waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
+    lab_mode: bool,
     tool_router: ToolRouter<Self>,
 }
 
@@ -127,12 +129,16 @@ impl ProxmoxServer {
         clients: Arc<BTreeMap<String, ProxmoxClient>>,
         index: Arc<GuestIndex>,
         coordinator: Arc<mecmcp_changeset::ChangesetCoordinator>,
+        waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
+        lab_mode: bool,
     ) -> Self {
         Self {
             clusters: clusters.clone(),
             clients: clients.clone(),
             index: index.clone(),
             coordinator,
+            waivers,
+            lab_mode,
             tool_router: Self::proxmox_tool_router(),
         }
     }
@@ -146,9 +152,18 @@ impl ProxmoxServer {
         clusters: Arc<ClusterInventory>,
         clients: Arc<BTreeMap<String, ProxmoxClient>>,
         index: Arc<GuestIndex>,
+        waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
+        lab_mode: bool,
     ) -> Result<Self, mecmcp_changeset::CoordinatorError> {
-        let coordinator = change_set::build_coordinator(None, false)?;
-        Ok(Self::new(clusters, clients, index, coordinator))
+        let coordinator = change_set::build_coordinator(None, lab_mode)?;
+        Ok(Self::new(
+            clusters,
+            clients,
+            index,
+            coordinator,
+            waivers,
+            lab_mode,
+        ))
     }
 
     /// Recover the caller's context, or `None` on the stdio path.
@@ -641,7 +656,6 @@ impl ProxmoxServer {
             fingerprint::{GuestState, fingerprint},
             preview::{PreviewInput, render_preview},
             protect::{Override, destructive_allowed, protection_of},
-            waiver::WaiverFile,
         };
 
         let caller = Self::caller(&context);
@@ -671,9 +685,6 @@ impl ProxmoxServer {
         };
         let protection = protection_of(client.cluster(), Some(&guest), false);
 
-        // Load waivers (0.3 has no waiver file, so use empty).
-        let waivers = WaiverFile::empty();
-
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
@@ -681,11 +692,11 @@ impl ProxmoxServer {
 
         let override_ = destructive_allowed(
             &protection,
-            &waivers,
+            &self.waivers,
             &args.cluster,
             args.vmid,
             now_unix,
-            false, // lab_mode: always false in 0.3
+            self.lab_mode,
         );
 
         let override_applies = !matches!(override_, Override::None);
@@ -964,7 +975,6 @@ impl ProxmoxServer {
         use rust_proxmoxmcp_core::{
             fingerprint::{GuestState, fingerprint},
             protect::{Override, destructive_allowed, protection_of},
-            waiver::WaiverFile,
         };
 
         let caller = Self::caller(&context);
@@ -1003,9 +1013,6 @@ impl ProxmoxServer {
         };
         let protection = protection_of(client.cluster(), Some(&guest), false);
 
-        // Load waivers (0.3 has no waiver file, so use empty).
-        let waivers = WaiverFile::empty();
-
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
@@ -1013,11 +1020,11 @@ impl ProxmoxServer {
 
         let override_ = destructive_allowed(
             &protection,
-            &waivers,
+            &self.waivers,
             &args.cluster,
             args.vmid,
             now_unix,
-            false, // lab_mode: always false in 0.3
+            self.lab_mode,
         );
 
         let override_applies = !matches!(override_, Override::None);

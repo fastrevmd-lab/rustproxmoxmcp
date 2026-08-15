@@ -10,12 +10,14 @@
 
 #![allow(dead_code)]
 
+pub use rust_proxmoxmcp_core::testing::Route;
+
 use mecmcp_auth::{KnownNames, ScopeSet, TokenStoreFile};
 use mecmcp_transport::LimitsConfig;
 use mecmcp_transport::test_harness::serve_on_loopback;
 use rust_proxmoxmcp::http_transport::build_http_router;
 use rust_proxmoxmcp::server::ProxmoxServer;
-use rust_proxmoxmcp_core::testing::{Route, TlsMockServer};
+use rust_proxmoxmcp_core::testing::TlsMockServer;
 use rust_proxmoxmcp_core::{
     ProxmoxAction, ProxmoxGrant,
     client::ProxmoxClient,
@@ -74,6 +76,24 @@ impl TestServer {
     /// The server listens on `127.0.0.1:0` and is served over plain HTTP
     /// (the HTTPS requirement is for the outbound leg to Proxmox).
     pub async fn start_with_routes(spec: TokenSpec, routes: Vec<Route>) -> Self {
+        Self::start_with_config(
+            spec,
+            routes,
+            Arc::new(rust_proxmoxmcp_core::waiver::WaiverFile::empty()),
+            false,
+        )
+        .await
+    }
+
+    /// Start the test server with custom waivers and lab-mode setting.
+    ///
+    /// This is used for testing the two-person control override system.
+    pub async fn start_with_config(
+        spec: TokenSpec,
+        routes: Vec<Route>,
+        waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
+        lab_mode: bool,
+    ) -> Self {
         // Install crypto provider once for the test binary.
         ensure_crypto_provider();
 
@@ -196,8 +216,10 @@ impl TestServer {
         )));
 
         // Build the HTTP router using the same function `main` uses.
-        let handler = ProxmoxServer::new_with_default_coordinator(clusters, clients, index)
-            .expect("build server");
+        let handler = ProxmoxServer::new_with_default_coordinator(
+            clusters, clients, index, waivers, lab_mode,
+        )
+        .expect("build server");
         let token_store_arc =
             Arc::new(TokenStoreFile::<ProxmoxGrant>::load(&tokens_path).expect("load tokens.json"));
         let shutdown = tokio_util::sync::CancellationToken::new();
@@ -410,14 +432,24 @@ pub async fn call_with_token(
 
 /// Approve a change set as a second principal.
 pub async fn approve_as_second_principal(server: &TestServer, change_set_id: &str) {
+    approve_as_second_principal_for(server, change_set_id, "pve3", 617).await;
+}
+
+/// Approve a change set as a second principal for a specific cluster and vmid.
+pub async fn approve_as_second_principal_for(
+    server: &TestServer,
+    change_set_id: &str,
+    cluster: &str,
+    vmid: u32,
+) {
     call_with_token(
         server,
         &server.second_token,
         "approve_proxmox_change_set",
         serde_json::json!({
             "change_set_id": change_set_id,
-            "cluster": "pve3",
-            "vmid": 617
+            "cluster": cluster,
+            "vmid": vmid
         }),
     )
     .await

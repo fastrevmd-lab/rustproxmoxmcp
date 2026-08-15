@@ -111,17 +111,193 @@ async fn a_fingerprint_that_moved_after_approval_refuses_the_apply() {
     );
 }
 
-// TODO: These tests require waiver and lab-mode infrastructure in the server.
-// They are placeholders for when that infrastructure is implemented.
-//
-// #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-// #[ignore = "requires waiver file support in server"]
-// async fn a_protected_guest_with_matching_waiver_can_be_applied() { ... }
-//
-// #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-// #[ignore = "requires lab-mode support in server"]
-// async fn a_protected_guest_with_lab_mode_can_be_applied() { ... }
-//
-// #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-// #[ignore = "requires waiver file support in server"]
-// async fn a_protected_guest_with_expired_waiver_is_refused() { ... }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_protected_guest_with_matching_waiver_can_be_applied() {
+    use rust_proxmoxmcp_core::waiver::{WaiverEntry, WaiverFile};
+    use std::sync::Arc;
+
+    // Create a waiver that expires far in the future (year 2100).
+    let waiver = WaiverEntry::new(
+        "pve3".to_owned(),
+        905,
+        4102444800, // 2100-01-01 in Unix time
+        "test waiver".to_owned(),
+        Some("TEST-123".to_owned()),
+    );
+    let waivers = Arc::new(WaiverFile::with_entries(vec![waiver]));
+
+    let spec = common::TokenSpec {
+        clusters: vec!["pve3".to_owned()],
+        tools: vec![
+            "plan_proxmox_destroy".to_owned(),
+            "approve_proxmox_change_set".to_owned(),
+            "apply_proxmox_change_set".to_owned(),
+        ],
+        guests: vec!["*".to_owned()],
+    };
+
+    let routes = vec![
+        common::Route {
+            path: "/api2/json/nodes",
+            status: 200,
+            body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+        },
+        common::Route {
+            path: "/api2/json/cluster/resources",
+            status: 200,
+            body: br#"{"data":[{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"}]}"#,
+        },
+    ];
+
+    let h = common::TestServer::start_with_config(spec, routes, waivers, false).await;
+
+    // Plan the destroy.
+    let planned = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 905}),
+    )
+    .await
+    .expect("plan should succeed with matching waiver");
+
+    // The waiver allows planning. Check if approval is still needed.
+    let id = planned["change_set_id"].as_str().expect("id");
+    let state = planned["state"].as_str().expect("state");
+
+    // If not already approved, approve as second principal.
+    if state != "Approved" {
+        common::approve_as_second_principal_for(&h, id, "pve3", 905).await;
+    }
+
+    // Apply should succeed.
+    let result = common::call(
+        &h,
+        "apply_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 905}),
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "apply should succeed with matching waiver: {result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_protected_guest_with_lab_mode_can_be_applied() {
+    use rust_proxmoxmcp_core::waiver::WaiverFile;
+    use std::sync::Arc;
+
+    let spec = common::TokenSpec {
+        clusters: vec!["pve3".to_owned()],
+        tools: vec![
+            "plan_proxmox_destroy".to_owned(),
+            "approve_proxmox_change_set".to_owned(),
+            "apply_proxmox_change_set".to_owned(),
+        ],
+        guests: vec!["*".to_owned()],
+    };
+
+    let routes = vec![
+        common::Route {
+            path: "/api2/json/nodes",
+            status: 200,
+            body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+        },
+        common::Route {
+            path: "/api2/json/cluster/resources",
+            status: 200,
+            body: br#"{"data":[{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"}]}"#,
+        },
+    ];
+
+    let h = common::TestServer::start_with_config(
+        spec,
+        routes,
+        Arc::new(WaiverFile::empty()),
+        true, // lab_mode = true
+    )
+    .await;
+
+    // Plan the destroy.
+    let planned = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 905}),
+    )
+    .await
+    .expect("plan should succeed with lab_mode");
+
+    // Lab mode allows planning. Check if approval is still needed.
+    let id = planned["change_set_id"].as_str().expect("id");
+    let state = planned["state"].as_str().expect("state");
+
+    // If not already approved, approve as second principal.
+    if state != "Approved" {
+        common::approve_as_second_principal_for(&h, id, "pve3", 905).await;
+    }
+
+    // Apply should succeed.
+    let result = common::call(
+        &h,
+        "apply_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 905}),
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "apply should succeed with lab_mode: {result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_protected_guest_with_expired_waiver_is_refused() {
+    use rust_proxmoxmcp_core::waiver::{WaiverEntry, WaiverFile};
+    use std::sync::Arc;
+
+    // Create a waiver that expired in the past (year 2000).
+    let waiver = WaiverEntry::new(
+        "pve3".to_owned(),
+        905,
+        946684800, // 2000-01-01 in Unix time
+        "expired waiver".to_owned(),
+        None,
+    );
+    let waivers = Arc::new(WaiverFile::with_entries(vec![waiver]));
+
+    let spec = common::TokenSpec {
+        clusters: vec!["pve3".to_owned()],
+        tools: vec!["plan_proxmox_destroy".to_owned()],
+        guests: vec!["*".to_owned()],
+    };
+
+    let routes = vec![
+        common::Route {
+            path: "/api2/json/nodes",
+            status: 200,
+            body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+        },
+        common::Route {
+            path: "/api2/json/cluster/resources",
+            status: 200,
+            body: br#"{"data":[{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"}]}"#,
+        },
+    ];
+
+    let h = common::TestServer::start_with_config(spec, routes, waivers, false).await;
+
+    // Plan should fail because the waiver is expired.
+    let err = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 905}),
+    )
+    .await
+    .expect_err("plan should fail with expired waiver");
+
+    assert!(
+        err.to_string().to_lowercase().contains("protect"),
+        "error should mention protection: {err}"
+    );
+}

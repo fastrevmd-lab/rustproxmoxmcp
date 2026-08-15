@@ -195,11 +195,16 @@ async fn main() -> Result<()> {
         clusters.policy().resource_cache_ttl_secs,
     )));
 
+    let waivers = Arc::new(
+        rust_proxmoxmcp_core::waiver::WaiverFile::load(&args.waivers_file)
+            .with_context(|| format!("loading {}", args.waivers_file.display()))?,
+    );
+
     match args.common.transport {
         Transport::Stdio => {
             // SIGHUP reloads the inventory in place. Stdio has no token store.
             install_sighup_reload(Arc::clone(&clusters), Arc::clone(&index), None)?;
-            serve_stdio(clusters, clients, index).await
+            serve_stdio(clusters, clients, index, waivers, args.lab_mode).await
         }
         Transport::StreamableHttp => {
             let token_store = load_http_token_store(&args.common)?;
@@ -264,6 +269,8 @@ async fn main() -> Result<()> {
                 tls,
                 shutdown,
                 shutdown_timeout,
+                waivers,
+                args.lab_mode,
             )
             .await
         }
@@ -297,9 +304,12 @@ async fn serve_stdio(
     clusters: Arc<ClusterInventory>,
     clients: Arc<BTreeMap<String, ProxmoxClient>>,
     index: Arc<GuestIndex>,
+    waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
+    lab_mode: bool,
 ) -> Result<()> {
-    let handler = ProxmoxServer::new_with_default_coordinator(clusters, clients, index)
-        .context("build server")?;
+    let handler =
+        ProxmoxServer::new_with_default_coordinator(clusters, clients, index, waivers, lab_mode)
+            .context("build server")?;
     let service = handler
         .serve((tokio::io::stdin(), tokio::io::stdout()))
         .await
@@ -398,9 +408,12 @@ async fn serve_http(
     tls: Option<Arc<rustls::ServerConfig>>,
     shutdown: tokio_util::sync::CancellationToken,
     shutdown_timeout: Duration,
+    waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
+    lab_mode: bool,
 ) -> Result<()> {
-    let handler = ProxmoxServer::new_with_default_coordinator(clusters, clients, index)
-        .context("build server")?;
+    let handler =
+        ProxmoxServer::new_with_default_coordinator(clusters, clients, index, waivers, lab_mode)
+            .context("build server")?;
     let plan = build_http_router(
         handler,
         token_store,
