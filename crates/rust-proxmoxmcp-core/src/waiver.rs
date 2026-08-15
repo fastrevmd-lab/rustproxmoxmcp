@@ -9,22 +9,17 @@
 //! file is treated as an empty waiver list, not an error.
 
 use chrono::DateTime;
+use mecmcp_secret::{FileLimits, SecretError, read_hardened_file};
 use serde::Deserialize;
-use std::fs;
-use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use thiserror::Error;
 
 /// Errors loading or parsing a waiver file.
 #[derive(Debug, Error)]
 pub enum WaiverError {
-    /// File permission check failed.
-    #[error("waiver file must be mode 0600, found {0:04o}")]
-    InsecurePermissions(u32),
-    /// IO error reading the file.
-    #[error("io error reading waiver file: {0}")]
-    Io(#[from] io::Error),
+    /// Hardened file loader refused the file.
+    #[error("waiver file security check failed: {0}")]
+    SecurityCheck(#[from] SecretError),
     /// JSON parsing failed.
     #[error("waiver file is not valid json: {0}")]
     InvalidJson(#[from] serde_json::Error),
@@ -105,11 +100,11 @@ impl WaiverFile {
     /// Load a waiver file from disk.
     ///
     /// An absent file returns an empty waiver list. A present file must be mode
-    /// 0600 and contain version-1 JSON.
+    /// 0600, owned by the effective uid, and contain version-1 JSON.
     ///
     /// # Errors
     /// Returns [`WaiverError`] when the file exists but has wrong permissions,
-    /// unsupported version, or invalid JSON/timestamps.
+    /// wrong owner, unsupported version, or invalid JSON/timestamps.
     pub fn load(path: &Path) -> Result<Self, WaiverError> {
         // Absent file is empty, not an error.
         if !path.exists() {
@@ -118,16 +113,10 @@ impl WaiverFile {
             });
         }
 
-        // Check file permissions before reading.
-        let metadata = fs::metadata(path)?;
-        let mode = metadata.permissions().mode();
-        let file_mode = mode & 0o777;
-        if file_mode != 0o600 {
-            return Err(WaiverError::InsecurePermissions(file_mode));
-        }
-
-        // Load and parse JSON.
-        let contents = fs::read_to_string(path)?;
+        // Load through the hardened loader (checks mode 0600, regular file, owner).
+        let limits = FileLimits::default();
+        let contents_bytes = read_hardened_file(path, limits)?;
+        let contents = String::from_utf8_lossy(contents_bytes.expose());
         let raw: WaiverFileRaw = serde_json::from_str(&contents)?;
 
         // Check version.
