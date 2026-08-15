@@ -22,6 +22,7 @@ pub mod protect;
 pub mod resolve;
 pub mod selector;
 pub mod tier;
+pub mod waiver;
 
 #[cfg(feature = "testing")]
 pub mod testing;
