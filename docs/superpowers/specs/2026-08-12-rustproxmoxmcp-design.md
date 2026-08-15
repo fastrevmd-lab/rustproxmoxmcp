@@ -239,6 +239,25 @@ exactly when Proxmox considers the config to have moved.
 If any component changed between approval and apply, apply is refused rather
 than proceeding against a guest that is no longer the one described.
 
+**Verified live 2026-08-15** against pve2, read-only apart from one reverted
+description edit on the disposable LXC 617:
+
+- `digest` is present on **both** `/nodes/{node}/lxc/{vmid}/config` and
+  `/nodes/{node}/qemu/{vmid}/config`.
+- It is **stable across repeated reads**, so it will not invalidate approvals
+  spuriously.
+- It **moves on a config change** (`e94e30c4…` → `53804039…` on setting a
+  description) and returns to the prior value when the change is reverted.
+- Every `/cluster/resources` field the fingerprint hashes — `name`, `type`,
+  `node`, `status`, `tags` — is present.
+
+The revert behaviour is worth naming: `digest` is derived from config content,
+not a monotonic counter, so the fingerprint detects **current divergence from
+what was approved**, not *any* intervening edit. A config changed and changed
+back still matches. That is the correct semantic for "is this still the guest
+the approver saw?" — but it means the fingerprint is not an edit audit trail,
+and nothing should read it as one.
+
 This is not theoretical. On 2026-08-12 most of the fleet was renumbered across
 three waves — `103→905`, `604→970`, `611→800`, `114→907` and `900→908` moving
 node as well. A change set approved to destroy `604` before that window and
