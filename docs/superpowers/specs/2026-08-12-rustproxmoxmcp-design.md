@@ -594,11 +594,12 @@ than holding everything for cutover.
 built** — there is no mutation path, no UPID handling, and no `mecmcp-job`
 integration yet.
 
-LXC 617 `test-labmode-proxmox` exists at 192.168.1.237 with its service
-deliberately **disabled**, because `--lab-mode` is a 0.3 flag and a server whose
-name promises lab mode while running two-person control would be exactly the
-"flag that is present but ignored" this project refuses. It comes up when 0.3
-lands.
+**0.3 shipped 2026-08-15.** Destructive tier under change-set control: plan →
+approve → apply, with server-generated preview, Proxmox fingerprint binding,
+`--lab-mode`, and `--waivers-file`. **Only `delete_container` is implemented**
+of the eight destructive tools; the remaining seven are mechanical follow-ons.
+The `low` tier remains unbuilt. LXC 617 `test-labmode-proxmox` (192.168.1.237)
+can now be enabled.
 
 **0.3's implementation plan absorbs 0.2's mutation spine as its opening tasks.**
 The phasing above still describes the right order of *capability*, but the
