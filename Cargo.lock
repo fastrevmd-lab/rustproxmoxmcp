@@ -1469,6 +1469,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "mecmcp-device"
+version = "0.10.0"
+source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.10.0#e6a530da849247a979bbf9ae0c5b58184863d3bc"
+dependencies = [
+ "async-trait",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "mecmcp-http"
 version = "0.10.0"
 source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.10.0#e6a530da849247a979bbf9ae0c5b58184863d3bc"
@@ -1495,6 +1511,17 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "mecmcp-job"
+version = "0.10.0"
+source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.10.0#e6a530da849247a979bbf9ae0c5b58184863d3bc"
+dependencies = [
+ "mecmcp-device",
+ "thiserror",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -2152,6 +2179,7 @@ dependencies = [
  "mecmcp-audit",
  "mecmcp-auth",
  "mecmcp-changeset",
+ "mecmcp-job",
  "mecmcp-runtime",
  "mecmcp-server",
  "mecmcp-transport",
@@ -2178,6 +2206,7 @@ dependencies = [
  "mecmcp-auth",
  "mecmcp-http",
  "mecmcp-inventory",
+ "mecmcp-job",
  "mecmcp-openapi",
  "mecmcp-secret",
  "rcgen",
@@ -2189,6 +2218,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tracing",
  "trybuild",
 ]

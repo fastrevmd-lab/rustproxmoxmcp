@@ -117,9 +117,11 @@ async fn a_protected_guest_with_matching_waiver_can_be_applied() {
     use std::sync::Arc;
 
     // Create a waiver that expires far in the future (year 2100).
+    // Use vmid 618 (an lxc) instead of 905 (qemu) since destroy_container
+    // only handles lxc guests.
     let waiver = WaiverEntry::new(
         "pve3".to_owned(),
-        905,
+        618,
         4102444800, // 2100-01-01 in Unix time
         "test waiver".to_owned(),
         Some("TEST-123".to_owned()),
@@ -145,17 +147,28 @@ async fn a_protected_guest_with_matching_waiver_can_be_applied() {
         common::Route {
             path: "/api2/json/cluster/resources",
             status: 200,
-            body: br#"{"data":[{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"}]}"#,
+            body: br#"{"data":[{"id":"lxc/618","type":"lxc","vmid":618,"name":"test-protected","node":"pve2","status":"running","tags":"protected"}]}"#,
+        },
+        common::Route {
+            path: "/api2/json/nodes/pve2/lxc/618",
+            status: 200,
+            body: br#"{"data":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:618:root@pam:"}"#,
         },
     ];
 
     let h = common::TestServer::start_with_config(spec, routes, waivers, false).await;
 
+    // Script the task completion.
+    h.script_task_completion(
+        "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:618:root@pam:",
+        "OK",
+    );
+
     // Plan the destroy.
     let planned = common::call(
         &h,
         "plan_proxmox_destroy",
-        json!({"cluster": "pve3", "vmid": 905}),
+        json!({"cluster": "pve3", "vmid": 618}),
     )
     .await
     .expect("plan should succeed with matching waiver");
@@ -166,14 +179,14 @@ async fn a_protected_guest_with_matching_waiver_can_be_applied() {
 
     // If not already approved, approve as second principal.
     if state != "Approved" {
-        common::approve_as_second_principal_for(&h, id, "pve3", 905).await;
+        common::approve_as_second_principal_for(&h, id, "pve3", 618).await;
     }
 
     // Apply should succeed.
     let result = common::call(
         &h,
         "apply_proxmox_change_set",
-        json!({"change_set_id": id, "cluster": "pve3", "vmid": 905}),
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 618}),
     )
     .await;
 
@@ -198,6 +211,8 @@ async fn a_protected_guest_with_lab_mode_can_be_applied() {
         guests: vec!["*".to_owned()],
     };
 
+    // Use vmid 619 (an lxc) instead of 905 (qemu) since destroy_container
+    // only handles lxc guests.
     let routes = vec![
         common::Route {
             path: "/api2/json/nodes",
@@ -207,7 +222,12 @@ async fn a_protected_guest_with_lab_mode_can_be_applied() {
         common::Route {
             path: "/api2/json/cluster/resources",
             status: 200,
-            body: br#"{"data":[{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"}]}"#,
+            body: br#"{"data":[{"id":"lxc/619","type":"lxc","vmid":619,"name":"test-protected","node":"pve2","status":"running","tags":"protected"}]}"#,
+        },
+        common::Route {
+            path: "/api2/json/nodes/pve2/lxc/619",
+            status: 200,
+            body: br#"{"data":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:619:root@pam:"}"#,
         },
     ];
 
@@ -219,11 +239,17 @@ async fn a_protected_guest_with_lab_mode_can_be_applied() {
     )
     .await;
 
+    // Script the task completion.
+    h.script_task_completion(
+        "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:619:root@pam:",
+        "OK",
+    );
+
     // Plan the destroy.
     let planned = common::call(
         &h,
         "plan_proxmox_destroy",
-        json!({"cluster": "pve3", "vmid": 905}),
+        json!({"cluster": "pve3", "vmid": 619}),
     )
     .await
     .expect("plan should succeed with lab_mode");
@@ -234,14 +260,14 @@ async fn a_protected_guest_with_lab_mode_can_be_applied() {
 
     // If not already approved, approve as second principal.
     if state != "Approved" {
-        common::approve_as_second_principal_for(&h, id, "pve3", 905).await;
+        common::approve_as_second_principal_for(&h, id, "pve3", 619).await;
     }
 
     // Apply should succeed.
     let result = common::call(
         &h,
         "apply_proxmox_change_set",
-        json!({"change_set_id": id, "cluster": "pve3", "vmid": 905}),
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 619}),
     )
     .await;
 

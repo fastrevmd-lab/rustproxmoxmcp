@@ -25,11 +25,11 @@ pub struct Route {
 #[derive(Clone, Debug)]
 pub struct RecordedRequest {
     /// HTTP method (GET, POST, etc.).
-    #[allow(dead_code)]
     pub method: String,
     /// Full request target including query string.
-    #[allow(dead_code)]
     pub target: String,
+    /// Path component of the target (without query string).
+    pub path: String,
     /// Value of the Authorization header, if present.
     #[allow(dead_code)]
     pub authorization: Option<String>,
@@ -232,12 +232,14 @@ impl TlsMockServer {
         }
 
         // Record the request.
+        let path = target.split('?').next().expect("split target").to_owned();
         requests
             .lock()
             .expect("lock requests")
             .push(RecordedRequest {
                 method,
                 target: target.clone(),
+                path,
                 authorization,
             });
 

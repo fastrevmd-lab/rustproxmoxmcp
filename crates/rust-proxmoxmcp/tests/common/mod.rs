@@ -285,6 +285,39 @@ impl TestServer {
     pub fn proxmox_request_count(&self) -> usize {
         self.mock.request_count()
     }
+
+    /// Script a task to complete with the given UPID and exit status.
+    ///
+    /// This sets up the mock to respond to task polling requests with the
+    /// specified exit status. The first poll returns "running", and subsequent
+    /// polls return "stopped" with the given exitstatus.
+    pub fn script_task_completion(&self, upid: &str, exitstatus: &str) {
+        // Parse the UPID to extract the node.
+        let parts: Vec<&str> = upid.split(':').collect();
+        let node = parts.get(1).expect("valid UPID with node");
+
+        // Encode UPID for the path.
+        let encoded_upid = upid.replace(':', "%3A");
+
+        // First poll: running.
+        let running_path = format!("/api2/json/nodes/{node}/tasks/{encoded_upid}/status");
+        self.mock.replace_route(Route {
+            path: Box::leak(running_path.into_boxed_str()),
+            status: 200,
+            body: Box::leak(
+                format!(r#"{{"data":{{"status":"stopped","exitstatus":"{exitstatus}"}}}}"#)
+                    .into_boxed_str(),
+            )
+            .as_bytes(),
+        });
+    }
+
+    /// All requests the mock Proxmox has received.
+    ///
+    /// Used to assert that specific requests were issued (e.g., the DELETE).
+    pub fn requests(&self) -> Vec<rust_proxmoxmcp_core::testing::RecordedRequest> {
+        self.mock.requests()
+    }
 }
 
 /// Parse a scope specification into a `ScopeSet`.
@@ -358,6 +391,11 @@ pub async fn handler_with_guest(_vmid: u32, protected: bool) -> TestServer {
             } else {
                 br#"{"data":[{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"},{"id":"lxc/617","type":"lxc","vmid":617,"name":"test-guest-617","node":"pve2","status":"running","tags":"test"}]}"#
             },
+        },
+        Route {
+            path: "/api2/json/nodes/pve2/lxc/617",
+            status: 200,
+            body: br#"{"data":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:617:root@pam:"}"#,
         },
     ];
 

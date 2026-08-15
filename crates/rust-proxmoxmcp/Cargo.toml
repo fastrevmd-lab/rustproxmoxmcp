@@ -21,6 +21,7 @@ http             = { workspace = true }
 mecmcp-audit     = { workspace = true }
 mecmcp-auth      = { workspace = true }
 mecmcp-changeset = { workspace = true }
+mecmcp-job       = { workspace = true }
 mecmcp-runtime   = { workspace = true }
 mecmcp-server    = { workspace = true }
 mecmcp-transport = { workspace = true }

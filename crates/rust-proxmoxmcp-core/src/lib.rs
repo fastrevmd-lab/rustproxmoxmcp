@@ -18,6 +18,7 @@ pub mod client;
 pub mod error;
 pub mod fingerprint;
 pub mod grant;
+pub mod guests;
 pub mod inventory;
 pub mod preview;
 pub mod protect;

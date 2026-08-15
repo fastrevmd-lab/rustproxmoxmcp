@@ -138,6 +138,65 @@ impl ProxmoxClient {
             .ok_or_else(|| ProxmoxError::Malformed("response has no 'data' member".into()))
     }
 
+    /// Issue a DELETE against a path template and return the unwrapped `data`.
+    ///
+    /// The template is expanded by `mecmcp-openapi`, which rejects a parameter
+    /// that would span a segment, start a query, navigate the hierarchy,
+    /// collapse a segment, or carry a control byte. Nothing is sanitised: a
+    /// rewritten value is a value the caller did not send.
+    ///
+    /// Query parameters are percent-encoded and appended to the expanded path.
+    ///
+    /// # Errors
+    ///
+    /// Returns:
+    /// - [`ProxmoxError::Malformed`] for a rejected parameter, a response
+    ///   without a `data` member, or invalid JSON
+    /// - [`ProxmoxError::Unauthorized`] for 401 or 403 status
+    /// - [`ProxmoxError::Api`] for any other error status
+    /// - [`ProxmoxError::Http`] for network or protocol errors
+    pub async fn delete_json(
+        &self,
+        path_template: &str,
+        params: &[(&str, &str)],
+        query: &[(&str, &str)],
+    ) -> Result<serde_json::Value, ProxmoxError> {
+        let expanded = mecmcp_openapi::expand_path(path_template, params)
+            .map_err(|error| ProxmoxError::Malformed(error.to_string()))?;
+
+        let mut url = format!("{}{expanded}", self.cluster.endpoint.trim_end_matches('/'));
+
+        // Append query parameters if present.
+        if !query.is_empty() {
+            let query_string = query
+                .iter()
+                .map(|(key, value)| format!("{}={}", percent_encode(key), percent_encode(value)))
+                .collect::<Vec<_>>()
+                .join("&");
+            url.push('?');
+            url.push_str(&query_string);
+        }
+
+        let request = HttpRequest::new(Method::Delete, &url)?
+            .header("Accept", "application/json")?
+            .secret_header("Authorization", &self.authorization)?;
+
+        let response = self.http.send(request).await?;
+        if response.status() >= 400 {
+            return Err(ProxmoxError::from_response(
+                response.status(),
+                response.body(),
+            ));
+        }
+
+        let parsed: serde_json::Value = serde_json::from_slice(response.body())
+            .map_err(|error| ProxmoxError::Malformed(error.to_string()))?;
+        parsed
+            .get("data")
+            .cloned()
+            .ok_or_else(|| ProxmoxError::Malformed("response has no 'data' member".into()))
+    }
+
     /// The cluster this client is bound to.
     #[must_use]
     pub fn cluster(&self) -> &Cluster {

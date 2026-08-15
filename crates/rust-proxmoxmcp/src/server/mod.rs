@@ -971,7 +971,6 @@ impl ProxmoxServer {
         Parameters(args): Parameters<change_set::ChangeSetArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        use change_set::ChangeSetResponse;
         use rust_proxmoxmcp_core::{
             fingerprint::{GuestState, fingerprint},
             protect::{Override, destructive_allowed, protection_of},
@@ -1069,8 +1068,6 @@ impl ProxmoxServer {
             ));
         }
 
-        // For Task 6, validate the gates but don't actually destroy.
-        // Task 7 will implement the real destroy via apply_change_set.
         // Verify the change set is approved.
         if record.state != mecmcp_changeset::ChangeSetState::Approved {
             return tool_error(format!(
@@ -1079,19 +1076,112 @@ impl ProxmoxServer {
             ));
         }
 
-        let response = ChangeSetResponse {
-            change_set_id: args.change_set_id,
-            state: "gates-passed".to_owned(),
-            expected_fingerprint: record.expected_candidate_fingerprint,
-            preview: "(ready for Task 7)".to_owned(),
-            expected_digest: None,
+        // Issue the DELETE and get the UPID string.
+        let upid_str = match rust_proxmoxmcp_core::guests::destroy_container(
+            client,
+            &state.node,
+            args.vmid,
+            true, // purge
+        )
+        .await
+        {
+            Ok(upid) => upid,
+            Err(error) => return tool_error(error),
         };
 
-        tool_result(
-            Ok::<_, String>(response),
-            ResultFormat::PrettyJson,
-            RESULT_LIMITS,
-        )
+        // Parse the UPID to extract the node for polling.
+        // Per spec §7, the node is authoritative: guests migrate, so we must
+        // poll the node from the UPID, never a caller-supplied one.
+        let upid = match rust_proxmoxmcp_core::task::Upid::parse(&upid_str) {
+            Ok(upid) => upid,
+            Err(error) => return tool_error(error),
+        };
+
+        // Note: The UPID should be persisted into the operation record BEFORE
+        // polling (spec §8), but mecmcp-changeset doesn't yet expose a method
+        // to update a change set with the task ID. For now, we proceed without
+        // persistence, which means a crashed apply is detectable but not
+        // recoverable. This will be addressed in a follow-up task.
+
+        // Poll the task to completion using mecmcp_job.
+        let token = tokio_util::sync::CancellationToken::new();
+        let config = mecmcp_job::PollConfig {
+            first_interval: std::time::Duration::from_secs(1),
+            max_interval: std::time::Duration::from_secs(8),
+            multiplier: 2,
+            deadline: std::time::Duration::from_secs(300),
+        };
+
+        let poll_node = upid.node().to_owned();
+        let poll_upid = upid_str.clone();
+        let exitstatus = match mecmcp_job::poll_until_ready(&token, config, |_attempt| {
+            let node = poll_node.clone();
+            let upid_str = poll_upid.clone();
+            async move {
+                // URL-encode the UPID for the path.
+                let upid_encoded = upid_str.replace(':', "%3A");
+                let path = format!("/api2/json/nodes/{node}/tasks/{upid_encoded}/status");
+                let data = client
+                    .get_json(&path, &[], &[])
+                    .await
+                    .map_err(|error| format!("task status request failed: {error}"))?;
+
+                let status = data
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "status field missing or not a string".to_string())?;
+
+                if status == "running" {
+                    Ok(mecmcp_job::Probe::Pending)
+                } else if status == "stopped" {
+                    let exitstatus = data
+                        .get("exitstatus")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "exitstatus field missing or not a string".to_string())?;
+                    Ok(mecmcp_job::Probe::Ready(exitstatus.to_owned()))
+                } else {
+                    Err(format!("unexpected task status: {status}"))
+                }
+            }
+        })
+        .await
+        {
+            Ok(exitstatus) => exitstatus,
+            Err(mecmcp_job::PollError::Cancelled { attempts }) => {
+                return tool_error(format!("polling cancelled after {attempts} attempt(s)"));
+            }
+            Err(mecmcp_job::PollError::DeadlineExceeded { attempts, deadline }) => {
+                return tool_error(format!(
+                    "polling exceeded its {deadline:?} deadline after {attempts} attempt(s)"
+                ));
+            }
+            Err(mecmcp_job::PollError::Probe { attempts, source }) => {
+                return tool_error(format!("probe failed on attempt {attempts}: {source}"));
+            }
+            Err(mecmcp_job::PollError::Config(error)) => {
+                return tool_error(format!("invalid poll configuration: {error}"));
+            }
+        };
+
+        // Classify the exit status using the Task 3 classifier.
+        let outcome = rust_proxmoxmcp_core::task::classify_exit_status(&exitstatus);
+        match outcome {
+            rust_proxmoxmcp_core::task::TaskOutcome::Ok => {
+                let response = serde_json::json!({
+                    "outcome": "ok",
+                    "upid": upid_str,
+                    "exitstatus": exitstatus,
+                });
+                tool_result(
+                    Ok::<_, String>(response),
+                    ResultFormat::PrettyJson,
+                    RESULT_LIMITS,
+                )
+            }
+            rust_proxmoxmcp_core::task::TaskOutcome::Failed(message) => {
+                tool_error(format!("task failed: {message}"))
+            }
+        }
     }
 }
 
