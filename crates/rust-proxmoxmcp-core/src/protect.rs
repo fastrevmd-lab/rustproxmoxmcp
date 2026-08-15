@@ -16,6 +16,7 @@
 
 use crate::inventory::Cluster;
 use crate::resolve::ResolvedGuest;
+use crate::waiver::WaiverFile;
 
 /// Why a guest is protected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +41,24 @@ pub enum Protection {
         /// Every applicable reason, in a stable order.
         reasons: Vec<ProtectionReason>,
     },
+}
+
+/// Override allowing a destructive operation to proceed on a protected guest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Override {
+    /// No override applies.
+    None,
+    /// A matching waiver from the waivers file.
+    Waiver {
+        /// The reason stated in the waiver.
+        reason: String,
+        /// The change ticket, if any.
+        ticket: Option<String>,
+        /// The unix timestamp when this waiver expires.
+        until_unix: u64,
+    },
+    /// The server is in lab mode (single-operator workflow).
+    LabMode,
 }
 
 impl Protection {
@@ -106,6 +125,58 @@ pub fn protection_of(
     } else {
         Protection::Protected { reasons }
     }
+}
+
+/// Determine what override, if any, allows a destructive operation.
+///
+/// This evaluates the spec §4.2 rule:
+///
+/// ```text
+/// allowed := ¬protected ∨ waiver_matches(cluster, vmid, now) ∨ lab_mode
+/// ```
+///
+/// When the guest is unprotected, no override is needed. When the guest is
+/// protected, a matching waiver takes precedence over lab mode for auditability
+/// — the record should name the specific, ticketed authority rather than the
+/// blanket flag.
+///
+/// # Parameters
+/// - `protection`: the protection verdict from [`protection_of`]
+/// - `waivers`: the loaded waiver file
+/// - `cluster`: exact cluster name
+/// - `vmid`: exact VMID
+/// - `now_unix`: current unix timestamp
+/// - `lab_mode`: whether the server is in lab mode
+#[must_use]
+pub fn destructive_allowed(
+    protection: &Protection,
+    waivers: &WaiverFile,
+    cluster: &str,
+    vmid: u32,
+    now_unix: u64,
+    lab_mode: bool,
+) -> Override {
+    // Unprotected guests need no override.
+    if !protection.is_protected() {
+        return Override::None;
+    }
+
+    // Check for a matching waiver first (preferred over lab mode for auditability).
+    if let Some(entry) = waivers.matching(cluster, vmid, now_unix) {
+        return Override::Waiver {
+            reason: entry.reason().to_owned(),
+            ticket: entry.ticket().map(ToOwned::to_owned),
+            until_unix: entry.until_unix(),
+        };
+    }
+
+    // Lab mode is the fallback.
+    if lab_mode {
+        return Override::LabMode;
+    }
+
+    // No override available.
+    Override::None
 }
 
 #[cfg(test)]

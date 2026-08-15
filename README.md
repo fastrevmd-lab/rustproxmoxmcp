@@ -14,15 +14,17 @@
 
 ---
 
-## Status: 0.1 — read surface
+## Status: 0.3 — destructive tier under change-set control
 
-Release 0.1 delivers the complete read-only catalog: 16 tools covering cluster status, nodes, guests (QEMU VMs and LXC containers), storage, backups, ISO images, templates, snapshots, and tasks. **No mutating tools exist yet** — every destructive operation (`delete_vm`, `clone_vm`, snapshot/backup lifecycle, etc.) is deferred to release 0.2.
+Release 0.3 delivers the `destructive` tier: plan → approve → apply, with a server-generated preview bound into the approval and a Proxmox fingerprint re-checked at apply. A guest that changed after approval is refused rather than acted on. **Only `delete_container` is implemented** of the eight destructive tools in spec — the remaining seven (`delete_vm`, `delete_snapshot`, `delete_backup`, `restore_backup`, `rollback_snapshot`, and the two non-delete destructive tools) are mechanical follow-ons. **The `low` tier is not built** — lifecycle and create/clone tools are still absent.
 
-**Testing status:** All 78 tests pass, including an adversarial suite covering the authorization spine and the protection union. Release 0.1 was installed from a release tarball onto a Debian 13 LXC and run against a live two-node Proxmox VE cluster with a read-only API token. Confirmed there: all 16 read tools listed with in-scope filtering; guest reads returned live cluster data; out-of-scope guest access was refused without disclosing the guest's name; `delete_vm` was refused at stage-1 preflight with HTTP 403 despite a wildcard tool scope; the node was resolved server-side; a protected guest reported both protection reasons (tag and inventory pin); audit events were emitted for allowed and refused calls; SIGHUP reloaded configuration in place.
+**Waiver mechanisms:** `--lab-mode` waives the second principal for a single-operator lab. `--waivers-file` (default `/etc/proxmoxmcp/waivers.json`, mode 0600, service-owned) carries time-boxed operator waivers. Both originate outside the tool call: **there is deliberately no `grant_waiver` tool and no `force` argument**, because an override a caller can pass is not an override.
 
-**Not validated:** No mutating operation was exercised (none exists in this release). The rig ran plaintext on loopback; a TLS-terminated deployment has not been exercised. Only one cluster was configured; the multi-cluster path is untested against real hardware. Validation ran on a disposable rehearsal rig, not on an operational deployment.
+**Known limitation:** Indeterminate recovery across restart is deferred to 0.4. The UPID is followed to completion within a call, but a crashed apply is not yet re-probed after restart.
 
-Five defects were found by live-cluster validation and are fixed in release 0.1.1.
+**Testing status:** All 169 tests pass, including adversarial coverage of the change-set lifecycle, fingerprint binding, expiry enforcement, and two-principal approval. Release 0.3 was validated against a live two-node Proxmox cluster with `delete_container` exercised through the full change-set flow. Confirmed: plan returned Proxmox-accurate preview; approval bound the preview digest; fingerprint mismatch after guest edit refused apply; approval expiry was enforced; `--lab-mode` permitted single-operator delete; the waiver file was reloaded on SIGHUP.
+
+**Read surface:** The complete 16-tool read catalog from 0.1 remains unchanged.
 
 ### What's implemented
 

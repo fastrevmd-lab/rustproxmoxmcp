@@ -132,10 +132,17 @@ impl GuestIndex {
     /// value so the audit event and, from 0.3, the change-set preview can
     /// report it.
     ///
+    /// # Parameters
+    /// - `override_applies`: Whether a waiver or lab-mode override allows this
+    ///   destructive operation on a protected guest. The caller computes this
+    ///   via [`crate::protect::destructive_allowed`]. When `None`, defaults to
+    ///   no override (fail-closed).
+    ///
     /// # Errors
     /// Returns [`ProxmoxError::NotFound`] for an absent guest,
     /// [`ProxmoxError::Denied`] when the grant does not admit the guest, does
-    /// not carry the tier, or when the tier is gated by protection.
+    /// not carry the tier, or when the tier is gated by protection and no
+    /// override applies.
     pub async fn authorize(
         &self,
         client: &ProxmoxClient,
@@ -143,6 +150,7 @@ impl GuestIndex {
         vmid: u32,
         grant: &ProxmoxGrant,
         tier: Tier,
+        override_applies: Option<bool>,
     ) -> Result<AuthorizedGuest, ProxmoxError> {
         let guest = self.resolve(client, cluster, vmid).await?;
 
@@ -160,7 +168,10 @@ impl GuestIndex {
 
         let protection = protection_of(client.cluster(), Some(&guest), false);
 
-        if tier == Tier::Destructive && protection.is_protected() {
+        if tier == Tier::Destructive
+            && protection.is_protected()
+            && !override_applies.unwrap_or(false)
+        {
             return Err(ProxmoxError::Denied(format!(
                 "guest {vmid} is protected ({}); a destructive call needs a waiver",
                 protection.summary()

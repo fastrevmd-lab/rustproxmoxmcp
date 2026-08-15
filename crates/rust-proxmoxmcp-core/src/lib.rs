@@ -16,12 +16,17 @@ pub mod authorized;
 pub mod catalog;
 pub mod client;
 pub mod error;
+pub mod fingerprint;
 pub mod grant;
+pub mod guests;
 pub mod inventory;
+pub mod preview;
 pub mod protect;
 pub mod resolve;
 pub mod selector;
+pub mod task;
 pub mod tier;
+pub mod waiver;
 
 #[cfg(feature = "testing")]
 pub mod testing;

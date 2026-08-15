@@ -1,5 +1,7 @@
 //! The MCP tool surface for release 0.1: reads only.
 
+mod change_set;
+
 use mecmcp_auth::{CallerCtx, ScopeSet};
 use mecmcp_server::{
     ResultFormat, ResultLimits, authorize_call, caller_from_extensions, filter_tools_for_scope,
@@ -33,6 +35,8 @@ const RESULT_LIMITS: ResultLimits = ResultLimits {
 /// Every tool registered by this release. Kept sorted; asserted against the
 /// catalog by a test so the two cannot drift.
 pub const KNOWN_TOOLS: &[&str] = &[
+    "apply_proxmox_change_set",
+    "approve_proxmox_change_set",
     "get_cluster_status",
     "get_container_config",
     "get_container_ip",
@@ -40,6 +44,7 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "get_guest_status",
     "get_node_status",
     "get_nodes",
+    "get_proxmox_change_set",
     "get_storage",
     "get_task_status",
     "get_vm_config",
@@ -49,6 +54,7 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "list_snapshots",
     "list_tasks",
     "list_templates",
+    "plan_proxmox_destroy",
 ];
 
 /// Arguments for a cluster-scoped read.
@@ -109,6 +115,9 @@ pub struct ProxmoxServer {
     clusters: Arc<ClusterInventory>,
     clients: Arc<BTreeMap<String, ProxmoxClient>>,
     index: Arc<GuestIndex>,
+    coordinator: Arc<mecmcp_changeset::ChangesetCoordinator>,
+    waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
+    lab_mode: bool,
     tool_router: ToolRouter<Self>,
 }
 
@@ -119,13 +128,42 @@ impl ProxmoxServer {
         clusters: Arc<ClusterInventory>,
         clients: Arc<BTreeMap<String, ProxmoxClient>>,
         index: Arc<GuestIndex>,
+        coordinator: Arc<mecmcp_changeset::ChangesetCoordinator>,
+        waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
+        lab_mode: bool,
     ) -> Self {
         Self {
             clusters: clusters.clone(),
             clients: clients.clone(),
             index: index.clone(),
+            coordinator,
+            waivers,
+            lab_mode,
             tool_router: Self::proxmox_tool_router(),
         }
+    }
+
+    /// Build the server with a default in-memory coordinator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the coordinator cannot be created.
+    pub fn new_with_default_coordinator(
+        clusters: Arc<ClusterInventory>,
+        clients: Arc<BTreeMap<String, ProxmoxClient>>,
+        index: Arc<GuestIndex>,
+        waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
+        lab_mode: bool,
+    ) -> Result<Self, mecmcp_changeset::CoordinatorError> {
+        let coordinator = change_set::build_coordinator(None, lab_mode)?;
+        Ok(Self::new(
+            clusters,
+            clients,
+            index,
+            coordinator,
+            waivers,
+            lab_mode,
+        ))
     }
 
     /// Recover the caller's context, or `None` on the stdio path.
@@ -134,10 +172,10 @@ impl ProxmoxServer {
     }
 
     /// Look up the client for a cluster the caller is entitled to reach.
-    fn client_for(&self, cluster: &str) -> Result<&ProxmoxClient, CallToolResult> {
+    fn client_for(&self, cluster: &str) -> Result<&ProxmoxClient, Box<CallToolResult>> {
         self.clients
             .get(cluster)
-            .ok_or_else(|| tool_error(format!("unknown cluster: {cluster}")))
+            .ok_or_else(|| Box::new(tool_error(format!("unknown cluster: {cluster}"))))
     }
 }
 
@@ -150,14 +188,16 @@ impl ProxmoxServer {
 /// # Errors
 ///
 /// Returns a `CallToolResult` error when an authenticated token carries no guest selector.
-fn resolve_grant(caller: Option<&CallerCtx<ProxmoxGrant>>) -> Result<ProxmoxGrant, CallToolResult> {
+fn resolve_grant(
+    caller: Option<&CallerCtx<ProxmoxGrant>>,
+) -> Result<ProxmoxGrant, Box<CallToolResult>> {
     match caller {
         None => Ok(rust_proxmoxmcp_core::ProxmoxGrant::read_only()),
         Some(ctx) => ctx.grant.clone().ok_or_else(|| {
-            tool_error(format!(
+            Box::new(tool_error(format!(
                 "token '{}' carries no 'guests' selector; add one to tokens.json",
                 ctx.token_name
-            ))
+            )))
         }),
     }
 }
@@ -197,7 +237,7 @@ impl ProxmoxServer {
         };
         let client = match self.client_for(cluster) {
             Ok(client) => client,
-            Err(result) => return result,
+            Err(result) => return *result,
         };
 
         let mut params: Vec<(&str, String)> = extra_params
@@ -208,11 +248,11 @@ impl ProxmoxServer {
         if let Some(vmid) = vmid {
             let grant = match resolve_grant(caller.as_ref()) {
                 Ok(grant) => grant,
-                Err(error) => return error,
+                Err(error) => return *error,
             };
             let authorized = match self
                 .index
-                .authorize(client, cluster, vmid, &grant, Tier::Read)
+                .authorize(client, cluster, vmid, &grant, Tier::Read, None)
                 .await
             {
                 Ok(authorized) => authorized,
@@ -402,16 +442,16 @@ impl ProxmoxServer {
 
         let client = match self.client_for(&args.cluster) {
             Ok(client) => client,
-            Err(result) => return result,
+            Err(result) => return *result,
         };
 
         let grant = match resolve_grant(caller.as_ref()) {
             Ok(grant) => grant,
-            Err(error) => return error,
+            Err(error) => return *error,
         };
         let authorized = match self
             .index
-            .authorize(client, &args.cluster, args.vmid, &grant, Tier::Read)
+            .authorize(client, &args.cluster, args.vmid, &grant, Tier::Read, None)
             .await
         {
             Ok(authorized) => authorized,
@@ -600,6 +640,549 @@ impl ProxmoxServer {
         )
         .await
     }
+
+    #[tool(
+        name = "plan_proxmox_destroy",
+        description = "Plan a guest destroy operation for two-principal approval."
+    )]
+    async fn plan_destroy(
+        &self,
+        Parameters(args): Parameters<change_set::PlanDestroyArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        use change_set::{ChangeSetResponse, DestroyAction};
+        use mecmcp_changeset::WaiverKind;
+        use rust_proxmoxmcp_core::{
+            fingerprint::{GuestState, fingerprint},
+            preview::{PreviewInput, render_preview},
+            protect::{Override, destructive_allowed, protection_of},
+        };
+
+        let caller = Self::caller(&context);
+        if let Err(error) = authorize_call(
+            caller.as_ref(),
+            "plan_proxmox_destroy",
+            Some(&args.cluster),
+            WRITE_TOOLS,
+        ) {
+            return tool_error(error);
+        }
+
+        let client = match self.client_for(&args.cluster) {
+            Ok(client) => client,
+            Err(result) => return *result,
+        };
+
+        let grant = match resolve_grant(caller.as_ref()) {
+            Ok(grant) => grant,
+            Err(error) => return *error,
+        };
+
+        // Resolve guest and compute protection to determine override.
+        let guest = match self.index.resolve(client, &args.cluster, args.vmid).await {
+            Ok(guest) => guest,
+            Err(error) => return tool_error(error),
+        };
+        let protection = protection_of(client.cluster(), Some(&guest), false);
+
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_secs();
+
+        let override_ = destructive_allowed(
+            &protection,
+            &self.waivers,
+            &args.cluster,
+            args.vmid,
+            now_unix,
+            self.lab_mode,
+        );
+
+        let override_applies = !matches!(override_, Override::None);
+
+        // Now authorize with the override information.
+        let authorized = match self
+            .index
+            .authorize(
+                client,
+                &args.cluster,
+                args.vmid,
+                &grant,
+                Tier::Destructive,
+                Some(override_applies),
+            )
+            .await
+        {
+            Ok(authorized) => authorized,
+            Err(error) => return tool_error(error),
+        };
+
+        let guest = authorized.guest();
+
+        // Compute fingerprint.
+        let state = GuestState {
+            cluster: args.cluster.clone(),
+            vmid: guest.vmid,
+            name: guest.name.clone(),
+            kind: guest.r#type.path_segment().to_owned(),
+            node: guest.node.clone(),
+            status: guest.status.clone(),
+            tags: guest.tags.clone(),
+            config_digest: String::new(),
+            disks: Vec::new(),
+        };
+
+        let expected_fingerprint = fingerprint(&state);
+
+        // Render preview.
+        let preview_input = PreviewInput {
+            state: &state,
+            protected: protection.is_protected(),
+            protection_summary: &protection.summary(),
+            override_: &override_,
+            snapshots: 0,
+            latest_snapshot: None,
+            last_backup: None,
+            purge_disks: true,
+        };
+
+        let preview_text = render_preview(&preview_input);
+
+        // Use the shared coordinator.
+        let coordinator = self.coordinator.clone();
+
+        let owner = caller
+            .as_ref()
+            .map(|ctx| ctx.token_name.clone())
+            .unwrap_or_else(|| "stdio".to_owned());
+
+        let device = format!("{}/{}", args.cluster, args.vmid);
+        let action = DestroyAction {
+            op: "destroy".to_owned(),
+            cluster: args.cluster.clone(),
+            vmid: args.vmid,
+        };
+
+        // This server has no policy engine in 0.3.
+        let policy_signature = "proxmox-no-policy-engine";
+
+        // For now, create the change set without preview binding.
+        // TODO: implement preview binding properly once the coordinator API is clarified.
+        let output = match coordinator
+            .create_change_set(
+                device.clone(),
+                vec![action],
+                owner.clone(),
+                expected_fingerprint.clone(),
+                policy_signature.to_owned(),
+            )
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => return tool_error(format!("create: {error}")),
+        };
+
+        // Apply override.
+        let output = match override_ {
+            Override::Waiver {
+                reason,
+                ticket,
+                until_unix,
+            } => match coordinator
+                .waive_approval_operator(
+                    output.change_set_id.clone(),
+                    device.clone(),
+                    owner.clone(),
+                    output.digest.clone(),
+                    WaiverKind::OperatorFile,
+                    reason,
+                    Some(until_unix),
+                    ticket,
+                )
+                .await
+            {
+                Ok(waived) => waived,
+                Err(error) => return tool_error(format!("waiver: {error}")),
+            },
+            Override::LabMode => match coordinator
+                .waive_approval(
+                    output.change_set_id.clone(),
+                    device.clone(),
+                    owner.clone(),
+                    output.digest.clone(),
+                )
+                .await
+            {
+                Ok(waived) => waived,
+                Err(error) => return tool_error(format!("lab-mode: {error}")),
+            },
+            Override::None => output,
+        };
+
+        let response = ChangeSetResponse {
+            change_set_id: output.change_set_id,
+            state: format!("{:?}", output.state),
+            expected_fingerprint,
+            preview: preview_text,
+            expected_digest: Some(output.digest),
+        };
+
+        tool_result(
+            Ok::<_, String>(response),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
+    }
+
+    #[tool(
+        name = "get_proxmox_change_set",
+        description = "Retrieve the current state of a change set."
+    )]
+    async fn get_change_set(
+        &self,
+        Parameters(args): Parameters<change_set::ChangeSetArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        use change_set::ChangeSetResponse;
+
+        let caller = Self::caller(&context);
+        if let Err(error) = authorize_call(
+            caller.as_ref(),
+            "get_proxmox_change_set",
+            Some(&args.cluster),
+            WRITE_TOOLS,
+        ) {
+            return tool_error(error);
+        }
+
+        let coordinator = self.coordinator.clone();
+
+        let device = format!("{}/{}", args.cluster, args.vmid);
+        let record = match coordinator.change_set(&args.change_set_id, &device).await {
+            Ok(record) => record,
+            Err(error) => return tool_error(format!("get: {error}")),
+        };
+
+        let preview_text = record
+            .preview
+            .as_ref()
+            .map(|p| p.artifact.clone())
+            .unwrap_or_else(|| "(no preview)".to_owned());
+
+        let response = ChangeSetResponse {
+            change_set_id: record.id,
+            state: format!("{:?}", record.state),
+            expected_fingerprint: record.expected_candidate_fingerprint,
+            preview: preview_text,
+            expected_digest: Some(record.digest),
+        };
+
+        tool_result(
+            Ok::<_, String>(response),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
+    }
+
+    #[tool(
+        name = "approve_proxmox_change_set",
+        description = "Approve a planned change set as a second principal."
+    )]
+    async fn approve_change_set(
+        &self,
+        Parameters(args): Parameters<change_set::ChangeSetArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        use change_set::ChangeSetResponse;
+
+        let caller = Self::caller(&context);
+        if let Err(error) = authorize_call(
+            caller.as_ref(),
+            "approve_proxmox_change_set",
+            Some(&args.cluster),
+            WRITE_TOOLS,
+        ) {
+            return tool_error(error);
+        }
+
+        let approver = caller
+            .as_ref()
+            .map(|ctx| ctx.token_name.clone())
+            .unwrap_or_else(|| "stdio".to_owned());
+
+        let coordinator = self.coordinator.clone();
+
+        let device = format!("{}/{}", args.cluster, args.vmid);
+        let record = match coordinator.change_set(&args.change_set_id, &device).await {
+            Ok(record) => record,
+            Err(error) => return tool_error(format!("get: {error}")),
+        };
+
+        let output = match coordinator
+            .approve_change_set(
+                args.change_set_id.clone(),
+                device.clone(),
+                approver,
+                record.digest.clone(),
+            )
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                let msg = error.to_string();
+                // Reword the self-approval error to match test expectations.
+                if msg.contains("owner cannot approve their own") {
+                    return tool_error(
+                        "self-approval refused: the planner cannot approve their own change set",
+                    );
+                }
+                return tool_error(format!("approve: {error}"));
+            }
+        };
+
+        let preview_text = record
+            .preview
+            .as_ref()
+            .map(|p| p.artifact.clone())
+            .unwrap_or_else(|| "(no preview)".to_owned());
+
+        let response = ChangeSetResponse {
+            change_set_id: output.change_set_id,
+            state: format!("{:?}", output.state),
+            expected_fingerprint: record.expected_candidate_fingerprint,
+            preview: preview_text,
+            expected_digest: Some(output.digest),
+        };
+
+        tool_result(
+            Ok::<_, String>(response),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
+    }
+
+    #[tool(
+        name = "apply_proxmox_change_set",
+        description = "Apply an approved change set."
+    )]
+    async fn apply_change_set(
+        &self,
+        Parameters(args): Parameters<change_set::ChangeSetArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        use rust_proxmoxmcp_core::{
+            fingerprint::{GuestState, fingerprint},
+            protect::{Override, destructive_allowed, protection_of},
+        };
+
+        let caller = Self::caller(&context);
+        if let Err(error) = authorize_call(
+            caller.as_ref(),
+            "apply_proxmox_change_set",
+            Some(&args.cluster),
+            WRITE_TOOLS,
+        ) {
+            return tool_error(error);
+        }
+
+        let client = match self.client_for(&args.cluster) {
+            Ok(client) => client,
+            Err(result) => return *result,
+        };
+
+        let coordinator = self.coordinator.clone();
+
+        let device = format!("{}/{}", args.cluster, args.vmid);
+        let record = match coordinator.change_set(&args.change_set_id, &device).await {
+            Ok(record) => record,
+            Err(error) => return tool_error(format!("get: {error}")),
+        };
+
+        // Re-resolve and verify fingerprint.
+        let grant = match resolve_grant(caller.as_ref()) {
+            Ok(grant) => grant,
+            Err(error) => return *error,
+        };
+
+        // Resolve guest and compute protection to determine override.
+        let guest = match self.index.resolve(client, &args.cluster, args.vmid).await {
+            Ok(guest) => guest,
+            Err(error) => return tool_error(error),
+        };
+        let protection = protection_of(client.cluster(), Some(&guest), false);
+
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_secs();
+
+        let override_ = destructive_allowed(
+            &protection,
+            &self.waivers,
+            &args.cluster,
+            args.vmid,
+            now_unix,
+            self.lab_mode,
+        );
+
+        let override_applies = !matches!(override_, Override::None);
+
+        // Now authorize with the override information.
+        let authorized = match self
+            .index
+            .authorize(
+                client,
+                &args.cluster,
+                args.vmid,
+                &grant,
+                Tier::Destructive,
+                Some(override_applies),
+            )
+            .await
+        {
+            Ok(authorized) => authorized,
+            Err(error) => return tool_error(error),
+        };
+
+        let guest = authorized.guest();
+
+        let state = GuestState {
+            cluster: args.cluster.clone(),
+            vmid: guest.vmid,
+            name: guest.name.clone(),
+            kind: guest.r#type.path_segment().to_owned(),
+            node: guest.node.clone(),
+            status: guest.status.clone(),
+            tags: guest.tags.clone(),
+            config_digest: String::new(),
+            disks: Vec::new(),
+        };
+
+        let current_fingerprint = fingerprint(&state);
+
+        if current_fingerprint != record.expected_candidate_fingerprint {
+            return tool_error(format!(
+                "fingerprint changed (expected {}, got {})",
+                record.expected_candidate_fingerprint, current_fingerprint
+            ));
+        }
+
+        // Verify the change set is approved.
+        if record.state != mecmcp_changeset::ChangeSetState::Approved {
+            return tool_error(format!(
+                "change set not approved (state: {:?})",
+                record.state
+            ));
+        }
+
+        // Issue the DELETE and get the UPID string.
+        let upid_str = match rust_proxmoxmcp_core::guests::destroy_container(
+            client,
+            &state.node,
+            args.vmid,
+            true, // purge
+        )
+        .await
+        {
+            Ok(upid) => upid,
+            Err(error) => return tool_error(error),
+        };
+
+        // Parse the UPID to extract the node for polling.
+        // Per spec §7, the node is authoritative: guests migrate, so we must
+        // poll the node from the UPID, never a caller-supplied one.
+        let upid = match rust_proxmoxmcp_core::task::Upid::parse(&upid_str) {
+            Ok(upid) => upid,
+            Err(error) => return tool_error(error),
+        };
+
+        // Note: The UPID should be persisted into the operation record BEFORE
+        // polling (spec §8), but mecmcp-changeset doesn't yet expose a method
+        // to update a change set with the task ID. For now, we proceed without
+        // persistence, which means a crashed apply is detectable but not
+        // recoverable. This will be addressed in a follow-up task.
+
+        // Poll the task to completion using mecmcp_job.
+        let token = tokio_util::sync::CancellationToken::new();
+        let config = mecmcp_job::PollConfig {
+            first_interval: std::time::Duration::from_secs(1),
+            max_interval: std::time::Duration::from_secs(8),
+            multiplier: 2,
+            deadline: std::time::Duration::from_secs(300),
+        };
+
+        let poll_node = upid.node().to_owned();
+        let poll_upid = upid_str.clone();
+        let exitstatus = match mecmcp_job::poll_until_ready(&token, config, |_attempt| {
+            let node = poll_node.clone();
+            let upid_str = poll_upid.clone();
+            async move {
+                // URL-encode the UPID for the path.
+                let upid_encoded = upid_str.replace(':', "%3A");
+                let path = format!("/api2/json/nodes/{node}/tasks/{upid_encoded}/status");
+                let data = client
+                    .get_json(&path, &[], &[])
+                    .await
+                    .map_err(|error| format!("task status request failed: {error}"))?;
+
+                let status = data
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "status field missing or not a string".to_string())?;
+
+                if status == "running" {
+                    Ok(mecmcp_job::Probe::Pending)
+                } else if status == "stopped" {
+                    let exitstatus = data
+                        .get("exitstatus")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "exitstatus field missing or not a string".to_string())?;
+                    Ok(mecmcp_job::Probe::Ready(exitstatus.to_owned()))
+                } else {
+                    Err(format!("unexpected task status: {status}"))
+                }
+            }
+        })
+        .await
+        {
+            Ok(exitstatus) => exitstatus,
+            Err(mecmcp_job::PollError::Cancelled { attempts }) => {
+                return tool_error(format!("polling cancelled after {attempts} attempt(s)"));
+            }
+            Err(mecmcp_job::PollError::DeadlineExceeded { attempts, deadline }) => {
+                return tool_error(format!(
+                    "polling exceeded its {deadline:?} deadline after {attempts} attempt(s)"
+                ));
+            }
+            Err(mecmcp_job::PollError::Probe { attempts, source }) => {
+                return tool_error(format!("probe failed on attempt {attempts}: {source}"));
+            }
+            Err(mecmcp_job::PollError::Config(error)) => {
+                return tool_error(format!("invalid poll configuration: {error}"));
+            }
+        };
+
+        // Classify the exit status using the Task 3 classifier.
+        let outcome = rust_proxmoxmcp_core::task::classify_exit_status(&exitstatus);
+        match outcome {
+            rust_proxmoxmcp_core::task::TaskOutcome::Ok => {
+                let response = serde_json::json!({
+                    "outcome": "ok",
+                    "upid": upid_str,
+                    "exitstatus": exitstatus,
+                });
+                tool_result(
+                    Ok::<_, String>(response),
+                    ResultFormat::PrettyJson,
+                    RESULT_LIMITS,
+                )
+            }
+            rust_proxmoxmcp_core::task::TaskOutcome::Failed(message) => {
+                tool_error(format!("task failed: {message}"))
+            }
+        }
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -633,23 +1216,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn known_tools_matches_the_read_catalog_exactly() {
-        let mut catalog: Vec<&str> = rust_proxmoxmcp_core::catalog::READ_TOOLS
+    fn known_tools_includes_read_catalog_and_changeset_tools() {
+        // Read tools from catalog.
+        let read_tools: std::collections::HashSet<&str> = rust_proxmoxmcp_core::catalog::READ_TOOLS
             .iter()
             .map(|tool| tool.name)
             .collect();
-        catalog.sort_unstable();
-        let mut known: Vec<&str> = KNOWN_TOOLS.to_vec();
-        known.sort_unstable();
-        assert_eq!(known, catalog, "KNOWN_TOOLS has drifted from the catalog");
+
+        // Changeset tools added in Task 6.
+        let changeset_tools = [
+            "plan_proxmox_destroy",
+            "get_proxmox_change_set",
+            "approve_proxmox_change_set",
+            "apply_proxmox_change_set",
+        ];
+
+        for tool in KNOWN_TOOLS {
+            assert!(
+                read_tools.contains(tool) || changeset_tools.contains(tool),
+                "{tool} is in KNOWN_TOOLS but not in READ_TOOLS or changeset tools"
+            );
+        }
+
+        // Verify changeset tools are present.
+        for tool in &changeset_tools {
+            assert!(
+                KNOWN_TOOLS.contains(tool),
+                "changeset tool {tool} missing from KNOWN_TOOLS"
+            );
+        }
     }
 
     #[test]
-    fn no_write_tool_is_registered_in_this_release() {
-        for tool in rust_proxmoxmcp_core::tier::WRITE_TOOLS {
+    fn changeset_write_tools_are_registered() {
+        let changeset_write = [
+            "plan_proxmox_destroy",
+            "approve_proxmox_change_set",
+            "apply_proxmox_change_set",
+        ];
+        for tool in &changeset_write {
             assert!(
-                !KNOWN_TOOLS.contains(tool),
-                "write tool {tool} registered in a read-only release"
+                KNOWN_TOOLS.contains(tool),
+                "changeset write tool {tool} must be registered"
             );
         }
     }

@@ -20,6 +20,8 @@ clap             = { workspace = true }
 http             = { workspace = true }
 mecmcp-audit     = { workspace = true }
 mecmcp-auth      = { workspace = true }
+mecmcp-changeset = { workspace = true }
+mecmcp-job       = { workspace = true }
 mecmcp-runtime   = { workspace = true }
 mecmcp-server    = { workspace = true }
 mecmcp-transport = { workspace = true }
@@ -37,6 +39,7 @@ tracing          = { workspace = true }
 [dev-dependencies]
 mecmcp-auth      = { workspace = true }
 mecmcp-transport = { workspace = true }
+reqwest          = { version = "0.12", features = ["json"] }
 rust-proxmoxmcp-core = { workspace = true, features = ["testing"] }
 serde_json       = { workspace = true }
 tempfile         = "3"

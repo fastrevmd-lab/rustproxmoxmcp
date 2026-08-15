@@ -25,11 +25,11 @@ pub struct Route {
 #[derive(Clone, Debug)]
 pub struct RecordedRequest {
     /// HTTP method (GET, POST, etc.).
-    #[allow(dead_code)]
     pub method: String,
     /// Full request target including query string.
-    #[allow(dead_code)]
     pub target: String,
+    /// Path component of the target (without query string).
+    pub path: String,
     /// Value of the Authorization header, if present.
     #[allow(dead_code)]
     pub authorization: Option<String>,
@@ -40,6 +40,7 @@ pub struct TlsMockServer {
     uri: String,
     ca_pem_file: tempfile::NamedTempFile,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    routes: Arc<Mutex<Vec<Route>>>,
 }
 
 impl TlsMockServer {
@@ -59,12 +60,19 @@ impl TlsMockServer {
         ca_pem_file.flush().expect("failed to flush CA PEM");
 
         let requests = Arc::new(Mutex::new(Vec::new()));
-        Self::serve(listener, server_config, routes, Arc::clone(&requests));
+        let routes_arc = Arc::new(Mutex::new(routes));
+        Self::serve(
+            listener,
+            server_config,
+            Arc::clone(&routes_arc),
+            Arc::clone(&requests),
+        );
 
         Self {
             uri: format!("https://localhost:{port}"),
             ca_pem_file,
             requests,
+            routes: routes_arc,
         }
     }
 
@@ -90,6 +98,19 @@ impl TlsMockServer {
     #[allow(dead_code)]
     pub fn request_count(&self) -> usize {
         self.requests.lock().expect("lock requests").len()
+    }
+
+    /// Replace a route by path, or add it if no matching route exists.
+    ///
+    /// This allows tests to simulate state changes (e.g., a guest moving nodes)
+    /// by changing the mock's responses mid-test.
+    pub fn replace_route(&self, new_route: Route) {
+        let mut routes = self.routes.lock().expect("lock routes for update");
+        if let Some(existing) = routes.iter_mut().find(|r| r.path == new_route.path) {
+            *existing = new_route;
+        } else {
+            routes.push(new_route);
+        }
     }
 
     /// Generate a self-signed `localhost` certificate.
@@ -139,7 +160,7 @@ impl TlsMockServer {
     fn serve(
         listener: tokio::net::TcpListener,
         server_config: rustls::ServerConfig,
-        routes: Vec<Route>,
+        routes: Arc<Mutex<Vec<Route>>>,
         requests: Arc<Mutex<Vec<RecordedRequest>>>,
     ) {
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
@@ -149,7 +170,7 @@ impl TlsMockServer {
                     return;
                 };
                 let acceptor = acceptor.clone();
-                let routes = routes.clone();
+                let routes = Arc::clone(&routes);
                 let requests = Arc::clone(&requests);
                 tokio::spawn(async move {
                     let Ok(mut tls) = acceptor.accept(stream).await else {
@@ -164,7 +185,7 @@ impl TlsMockServer {
     /// Handle one HTTP request: parse, record, and respond.
     async fn handle_request<S>(
         stream: &mut S,
-        routes: &[Route],
+        routes: &Arc<Mutex<Vec<Route>>>,
         requests: &Arc<Mutex<Vec<RecordedRequest>>>,
     ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -211,24 +232,28 @@ impl TlsMockServer {
         }
 
         // Record the request.
+        let path = target.split('?').next().expect("split target").to_owned();
         requests
             .lock()
             .expect("lock requests")
             .push(RecordedRequest {
                 method,
                 target: target.clone(),
+                path,
                 authorization,
             });
 
         // Match a route by path (ignoring query string).
         let path = target.split('?').next().expect("split target");
-        let route = routes.iter().find(|r| r.path == path);
-
-        let (status, body) = if let Some(r) = route {
-            (r.status, r.body)
-        } else {
-            (404, b"Not Found" as &[u8])
-        };
+        let (status, body) = {
+            let routes_guard = routes.lock().expect("lock routes");
+            let route = routes_guard.iter().find(|r| r.path == path);
+            if let Some(r) = route {
+                (r.status, r.body)
+            } else {
+                (404, b"Not Found" as &[u8])
+            }
+        }; // Guard is dropped here, before any await
 
         // Write the response.
         let response = format!(
