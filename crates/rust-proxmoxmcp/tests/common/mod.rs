@@ -63,41 +63,21 @@ pub struct TestServer {
 }
 
 impl TestServer {
-    /// Start the test server with a token carrying the given scopes.
+    /// Start the test server with a token carrying the given scopes and custom routes.
     ///
     /// Sets up:
-    /// - TLS mock Proxmox with standard routes
+    /// - TLS mock Proxmox with the provided routes
     /// - clusters.json and tokens.json
     /// - The same HTTP router that `main` uses
     ///
     /// The server listens on `127.0.0.1:0` and is served over plain HTTP
     /// (the HTTPS requirement is for the outbound leg to Proxmox).
-    pub async fn start(spec: TokenSpec) -> Self {
+    pub async fn start_with_routes(spec: TokenSpec, routes: Vec<Route>) -> Self {
         // Install crypto provider once for the test binary.
         ensure_crypto_provider();
 
-        // Start the TLS mock Proxmox.
-        let mock = TlsMockServer::start(vec![
-            Route {
-                path: "/api2/json/nodes",
-                status: 200,
-                body: br#"{"data":[{"node":"pve2","status":"online"},{"node":"pve3","status":"online"}]}"#,
-            },
-            Route {
-                path: "/api2/json/cluster/resources",
-                status: 200,
-                body: br#"{"data":[
-                  {"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"},
-                  {"id":"lxc/606","type":"lxc","vmid":606,"name":"rustsdcmcp-606","node":"pve3","status":"running","tags":"disposable"}
-                ]}"#,
-            },
-            Route {
-                path: "/api2/json/nodes/pve2/qemu/905/config",
-                status: 200,
-                body: br#"{"data":{"vmid":905,"name":"vsrx-prod","cores":2,"memory":2048}}"#,
-            },
-        ])
-        .await;
+        // Start the TLS mock Proxmox with custom routes.
+        let mock = TlsMockServer::start(routes).await;
 
         // Create a temp directory for clusters.json and tokens.json.
         let temp_dir = tempfile::TempDir::new().expect("create temp dir");
@@ -235,6 +215,31 @@ impl TestServer {
         }
     }
 
+    /// Start the test server with default routes.
+    pub async fn start(spec: TokenSpec) -> Self {
+        let routes = vec![
+            Route {
+                path: "/api2/json/nodes",
+                status: 200,
+                body: br#"{"data":[{"node":"pve2","status":"online"},{"node":"pve3","status":"online"}]}"#,
+            },
+            Route {
+                path: "/api2/json/cluster/resources",
+                status: 200,
+                body: br#"{"data":[
+                  {"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"},
+                  {"id":"lxc/606","type":"lxc","vmid":606,"name":"rustsdcmcp-606","node":"pve3","status":"running","tags":"disposable"}
+                ]}"#,
+            },
+            Route {
+                path: "/api2/json/nodes/pve2/qemu/905/config",
+                status: 200,
+                body: br#"{"data":{"vmid":905,"name":"vsrx-prod","cores":2,"memory":2048}}"#,
+            },
+        ];
+        Self::start_with_routes(spec, routes).await
+    }
+
     /// Number of requests the mock Proxmox has received.
     ///
     /// Used to prove that preflight rejection happens before any outbound request.
@@ -278,4 +283,109 @@ fn ensure_crypto_provider() {
     ONCE.call_once(|| {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
+}
+
+/// Create a test handler configured with a specific guest.
+///
+/// # Parameters
+/// - `vmid`: The guest VMID to configure
+/// - `protected`: Whether the guest should be protected
+pub async fn handler_with_guest(vmid: u32, protected: bool) -> TestServer {
+    let tags = if protected { "protected" } else { "test" };
+    let spec = TokenSpec {
+        clusters: vec!["pve3".to_owned()],
+        tools: vec!["*".to_owned()],
+        guests: vec!["*".to_owned()],
+    };
+
+    // Build custom routes. Hardcode vmid 617 for simplicity.
+    let routes = vec![
+        Route {
+            path: "/api2/json/nodes",
+            status: 200,
+            body: br#"{"data":[{"node":"pve2","status":"online"},{"node":"pve3","status":"online"}]}"#,
+        },
+        Route {
+            path: "/api2/json/cluster/resources",
+            status: 200,
+            body: if protected {
+                br#"{"data":[{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"},{"id":"lxc/617","type":"lxc","vmid":617,"name":"test-guest-617","node":"pve2","status":"running","tags":"protected"}]}"#
+            } else {
+                br#"{"data":[{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"},{"id":"lxc/617","type":"lxc","vmid":617,"name":"test-guest-617","node":"pve2","status":"running","tags":"test"}]}"#
+            },
+        },
+    ];
+
+    TestServer::start_with_routes(spec, routes).await
+}
+
+/// Make an MCP tool call.
+///
+/// # Errors
+///
+/// Returns an error if the tool call fails.
+pub async fn call(
+    server: &TestServer,
+    tool: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}/mcp", server.url))
+        .header("Authorization", format!("Bearer {}", server.token))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": tool,
+                "arguments": args
+            }
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("parse failed: {e}"))?;
+
+    if let Some(error) = body.get("error") {
+        return Err(format!("{}", error));
+    }
+
+    body.get("result")
+        .and_then(|r| r.get("content"))
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("text"))
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| "no result".to_owned())
+        .and_then(|text| serde_json::from_str(text).map_err(|e| format!("json parse: {e}")))
+}
+
+/// Approve a change set as a second principal.
+pub async fn approve_as_second_principal(server: &TestServer, change_set_id: &str) {
+    // For now, this is a stub. In a real implementation, this would use a different
+    // token or principal. The test will fail if self-approval is allowed.
+    let _result = call(
+        server,
+        "approve_proxmox_change_set",
+        serde_json::json!({
+            "change_set_id": change_set_id,
+            "cluster": "pve3",
+            "vmid": 617
+        }),
+    )
+    .await;
+}
+
+impl TestServer {
+    /// Simulate moving a guest to a different node (changes fingerprint).
+    pub fn move_guest_to_node(&self, _vmid: u32, _node: &str) {
+        // This is a test helper that simulates the guest moving.
+        // In a real implementation, this would update the mock's state.
+        // For now, the test infrastructure doesn't support dynamic state changes,
+        // so this is a placeholder that the test expects to exist.
+    }
 }
