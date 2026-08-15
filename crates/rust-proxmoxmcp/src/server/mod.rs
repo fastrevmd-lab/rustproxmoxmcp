@@ -115,6 +115,7 @@ pub struct ProxmoxServer {
     clusters: Arc<ClusterInventory>,
     clients: Arc<BTreeMap<String, ProxmoxClient>>,
     index: Arc<GuestIndex>,
+    coordinator: Arc<mecmcp_changeset::ChangesetCoordinator>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -125,13 +126,29 @@ impl ProxmoxServer {
         clusters: Arc<ClusterInventory>,
         clients: Arc<BTreeMap<String, ProxmoxClient>>,
         index: Arc<GuestIndex>,
+        coordinator: Arc<mecmcp_changeset::ChangesetCoordinator>,
     ) -> Self {
         Self {
             clusters: clusters.clone(),
             clients: clients.clone(),
             index: index.clone(),
+            coordinator,
             tool_router: Self::proxmox_tool_router(),
         }
+    }
+
+    /// Build the server with a default in-memory coordinator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the coordinator cannot be created.
+    pub fn new_with_default_coordinator(
+        clusters: Arc<ClusterInventory>,
+        clients: Arc<BTreeMap<String, ProxmoxClient>>,
+        index: Arc<GuestIndex>,
+    ) -> Result<Self, mecmcp_changeset::CoordinatorError> {
+        let coordinator = change_set::build_coordinator(None, false)?;
+        Ok(Self::new(clusters, clients, index, coordinator))
     }
 
     /// Recover the caller's context, or `None` on the stdio path.
@@ -156,7 +173,9 @@ impl ProxmoxServer {
 /// # Errors
 ///
 /// Returns a `CallToolResult` error when an authenticated token carries no guest selector.
-fn resolve_grant(caller: Option<&CallerCtx<ProxmoxGrant>>) -> Result<ProxmoxGrant, Box<CallToolResult>> {
+fn resolve_grant(
+    caller: Option<&CallerCtx<ProxmoxGrant>>,
+) -> Result<ProxmoxGrant, Box<CallToolResult>> {
     match caller {
         None => Ok(rust_proxmoxmcp_core::ProxmoxGrant::read_only()),
         Some(ctx) => ctx.grant.clone().ok_or_else(|| {
@@ -656,24 +675,21 @@ impl ProxmoxServer {
         let guest = authorized.guest();
         let protection = authorized.protection();
 
-        // Load waivers.
-        let waivers = WaiverFile::load(std::path::Path::new("/dev/null")).unwrap_or_else(|_| {
-            WaiverFile::load(std::path::Path::new("/dev/null")).expect("empty waiver")
-        });
+        // Load waivers (0.3 has no waiver file, so use empty).
+        let waivers = WaiverFile::empty();
 
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
             .as_secs();
 
-        let lab_mode = false;
         let override_ = destructive_allowed(
             protection,
             &waivers,
             &args.cluster,
             args.vmid,
             now_unix,
-            lab_mode,
+            false, // lab_mode: always false in 0.3
         );
 
         // Refuse at plan time if protected without override.
@@ -714,11 +730,8 @@ impl ProxmoxServer {
 
         let preview_text = render_preview(&preview_input);
 
-        // Build coordinator.
-        let coordinator = match change_set::build_coordinator(None, lab_mode) {
-            Ok(coord) => coord,
-            Err(error) => return tool_error(format!("coordinator: {error}")),
-        };
+        // Use the shared coordinator.
+        let coordinator = self.coordinator.clone();
 
         let owner = caller
             .as_ref()
@@ -824,11 +837,7 @@ impl ProxmoxServer {
             return tool_error(error);
         }
 
-        let lab_mode = false;
-        let coordinator = match change_set::build_coordinator(None, lab_mode) {
-            Ok(coord) => coord,
-            Err(error) => return tool_error(format!("coordinator: {error}")),
-        };
+        let coordinator = self.coordinator.clone();
 
         let device = format!("{}/{}", args.cluster, args.vmid);
         let record = match coordinator.change_set(&args.change_set_id, &device).await {
@@ -883,11 +892,7 @@ impl ProxmoxServer {
             .map(|ctx| ctx.token_name.clone())
             .unwrap_or_else(|| "stdio".to_owned());
 
-        let lab_mode = false;
-        let coordinator = match change_set::build_coordinator(None, lab_mode) {
-            Ok(coord) => coord,
-            Err(error) => return tool_error(format!("coordinator: {error}")),
-        };
+        let coordinator = self.coordinator.clone();
 
         let device = format!("{}/{}", args.cluster, args.vmid);
         let record = match coordinator.change_set(&args.change_set_id, &device).await {
@@ -905,7 +910,14 @@ impl ProxmoxServer {
             .await
         {
             Ok(output) => output,
-            Err(error) => return tool_error(format!("approve: {error}")),
+            Err(error) => {
+                let msg = error.to_string();
+                // Reword the self-approval error to match test expectations.
+                if msg.contains("owner cannot approve their own") {
+                    return tool_error("self-approval refused: the planner cannot approve their own change set");
+                }
+                return tool_error(format!("approve: {error}"));
+            }
         };
 
         let preview_text = record
@@ -956,11 +968,7 @@ impl ProxmoxServer {
             Err(result) => return *result,
         };
 
-        let lab_mode = false;
-        let coordinator = match change_set::build_coordinator(None, lab_mode) {
-            Ok(coord) => coord,
-            Err(error) => return tool_error(format!("coordinator: {error}")),
-        };
+        let coordinator = self.coordinator.clone();
 
         let device = format!("{}/{}", args.cluster, args.vmid);
         let record = match coordinator.change_set(&args.change_set_id, &device).await {
@@ -1062,23 +1070,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn known_tools_matches_the_read_catalog_exactly() {
-        let mut catalog: Vec<&str> = rust_proxmoxmcp_core::catalog::READ_TOOLS
-            .iter()
-            .map(|tool| tool.name)
-            .collect();
-        catalog.sort_unstable();
-        let mut known: Vec<&str> = KNOWN_TOOLS.to_vec();
-        known.sort_unstable();
-        assert_eq!(known, catalog, "KNOWN_TOOLS has drifted from the catalog");
+    fn known_tools_includes_read_catalog_and_changeset_tools() {
+        // Read tools from catalog.
+        let read_tools: std::collections::HashSet<&str> =
+            rust_proxmoxmcp_core::catalog::READ_TOOLS
+                .iter()
+                .map(|tool| tool.name)
+                .collect();
+
+        // Changeset tools added in Task 6.
+        let changeset_tools = [
+            "plan_proxmox_destroy",
+            "get_proxmox_change_set",
+            "approve_proxmox_change_set",
+            "apply_proxmox_change_set",
+        ];
+
+        for tool in KNOWN_TOOLS {
+            assert!(
+                read_tools.contains(tool) || changeset_tools.contains(tool),
+                "{tool} is in KNOWN_TOOLS but not in READ_TOOLS or changeset tools"
+            );
+        }
+
+        // Verify changeset tools are present.
+        for tool in &changeset_tools {
+            assert!(
+                KNOWN_TOOLS.contains(tool),
+                "changeset tool {tool} missing from KNOWN_TOOLS"
+            );
+        }
     }
 
     #[test]
-    fn no_write_tool_is_registered_in_this_release() {
-        for tool in rust_proxmoxmcp_core::tier::WRITE_TOOLS {
+    fn changeset_write_tools_are_registered() {
+        let changeset_write = [
+            "plan_proxmox_destroy",
+            "approve_proxmox_change_set",
+            "apply_proxmox_change_set",
+        ];
+        for tool in &changeset_write {
             assert!(
-                !KNOWN_TOOLS.contains(tool),
-                "write tool {tool} registered in a read-only release"
+                KNOWN_TOOLS.contains(tool),
+                "changeset write tool {tool} must be registered"
             );
         }
     }

@@ -298,7 +298,8 @@ async fn serve_stdio(
     clients: Arc<BTreeMap<String, ProxmoxClient>>,
     index: Arc<GuestIndex>,
 ) -> Result<()> {
-    let handler = ProxmoxServer::new(clusters, clients, index);
+    let handler = ProxmoxServer::new_with_default_coordinator(clusters, clients, index)
+        .context("build server")?;
     let service = handler
         .serve((tokio::io::stdin(), tokio::io::stdout()))
         .await
@@ -398,7 +399,8 @@ async fn serve_http(
     shutdown: tokio_util::sync::CancellationToken,
     shutdown_timeout: Duration,
 ) -> Result<()> {
-    let handler = ProxmoxServer::new(clusters, clients, index);
+    let handler = ProxmoxServer::new_with_default_coordinator(clusters, clients, index)
+        .context("build server")?;
     let plan = build_http_router(
         handler,
         token_store,

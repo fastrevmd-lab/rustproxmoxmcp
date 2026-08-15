@@ -12,6 +12,7 @@
 
 use mecmcp_auth::{KnownNames, ScopeSet, TokenStoreFile};
 use mecmcp_transport::LimitsConfig;
+use mecmcp_transport::test_harness::serve_on_loopback;
 use rust_proxmoxmcp::http_transport::build_http_router;
 use rust_proxmoxmcp::server::ProxmoxServer;
 use rust_proxmoxmcp_core::testing::{Route, TlsMockServer};
@@ -25,11 +26,7 @@ use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
-
-/// Allocate unique test ports starting from a high range to avoid conflicts.
-static TEST_PORT_COUNTER: AtomicU16 = AtomicU16::new(35000);
 
 /// Token specification for test scenarios.
 pub struct TokenSpec {
@@ -181,7 +178,8 @@ impl TestServer {
         )));
 
         // Build the HTTP router using the same function `main` uses.
-        let handler = ProxmoxServer::new(clusters, clients, index);
+        let handler =
+            ProxmoxServer::new_with_default_coordinator(clusters, clients, index).expect("build server");
         let token_store_arc =
             Arc::new(TokenStoreFile::<ProxmoxGrant>::load(&tokens_path).expect("load tokens.json"));
         let shutdown = tokio_util::sync::CancellationToken::new();
@@ -197,24 +195,11 @@ impl TestServer {
         )
         .expect("build HTTP router");
 
-        // Allocate a unique port for this test server instance.
-        use std::net::SocketAddr;
-        let port = TEST_PORT_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let addr: SocketAddr = format!("127.0.0.1:{port}")
-            .parse()
-            .expect("parse test address");
-
-        tokio::spawn(async move {
-            mecmcp_transport::serve_router(plan, addr, None, Duration::from_secs(30))
-                .await
-                .expect("serve router");
-        });
-
-        // Give the server time to bind and start accepting connections.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Serve on an OS-assigned loopback port to avoid test collisions.
+        let served = serve_on_loopback(plan).await;
 
         Self {
-            url: format!("http://127.0.0.1:{port}"),
+            url: format!("http://{}", served.address),
             token: plaintext.expose_secret().to_owned(),
             mock,
             _temp_dir: temp_dir,
@@ -300,7 +285,12 @@ pub async fn handler_with_guest(_vmid: u32, protected: bool) -> TestServer {
     let _tags = if protected { "protected" } else { "test" };
     let spec = TokenSpec {
         clusters: vec!["pve3".to_owned()],
-        tools: vec!["*".to_owned()],
+        tools: vec![
+            "plan_proxmox_destroy".to_owned(),
+            "get_proxmox_change_set".to_owned(),
+            "approve_proxmox_change_set".to_owned(),
+            "apply_proxmox_change_set".to_owned(),
+        ],
         guests: vec!["*".to_owned()],
     };
 
@@ -361,6 +351,12 @@ pub async fn call(
             serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"))
         );
 
+        // Check if this is an error response
+        let is_error = result
+            .get("isError")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         // Extract the text content from the MCP response
         let text = result
             .get("content")
@@ -369,7 +365,11 @@ pub async fn call(
             .and_then(|t| t.as_str())
             .ok_or_else(|| format!("no result text, response: {result}"))?;
 
-        serde_json::from_str(text).map_err(|e| format!("json parse: {e}"))
+        if is_error {
+            Err(text.to_owned())
+        } else {
+            serde_json::from_str(text).map_err(|e| format!("json parse: {e}"))
+        }
     })
     .await
     .map_err(|e| format!("spawn_blocking: {e}"))?
