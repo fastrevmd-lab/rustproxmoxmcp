@@ -16,6 +16,7 @@ pub mod authorized;
 pub mod catalog;
 pub mod client;
 pub mod error;
+pub mod fingerprint;
 pub mod grant;
 pub mod inventory;
 pub mod protect;
