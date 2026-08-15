@@ -61,6 +61,8 @@ pub struct TestServer {
     pub second_token: String,
     /// The mock Proxmox server.
     mock: TlsMockServer,
+    /// Guest index for cache invalidation in tests.
+    index: Arc<GuestIndex>,
     /// Temp directory holding clusters.json and tokens.json.
     _temp_dir: tempfile::TempDir,
 }
@@ -217,7 +219,11 @@ impl TestServer {
 
         // Build the HTTP router using the same function `main` uses.
         let handler = ProxmoxServer::new_with_default_coordinator(
-            clusters, clients, index, waivers, lab_mode,
+            clusters,
+            clients,
+            Arc::clone(&index),
+            waivers,
+            lab_mode,
         )
         .expect("build server");
         let token_store_arc =
@@ -243,6 +249,7 @@ impl TestServer {
             token: plaintext.expose_secret().to_owned(),
             second_token: second_plaintext.expose_secret().to_owned(),
             mock,
+            index,
             _temp_dir: temp_dir,
         }
     }
@@ -458,10 +465,25 @@ pub async fn approve_as_second_principal_for(
 
 impl TestServer {
     /// Simulate moving a guest to a different node (changes fingerprint).
-    pub fn move_guest_to_node(&self, _vmid: u32, _node: &str) {
-        // This is a test helper that simulates the guest moving.
-        // In a real implementation, this would update the mock's state.
-        // For now, the test infrastructure doesn't support dynamic state changes,
-        // so this is a placeholder that the test expects to exist.
+    ///
+    /// Updates the mock Proxmox's `/api2/json/cluster/resources` response to
+    /// show the guest on a different node, which causes the fingerprint to change.
+    /// Also invalidates the guest index cache so the next resolve sees the change.
+    pub fn move_guest_to_node(&self, vmid: u32, new_node: &str) {
+        // Replace the cluster/resources route with updated guest data.
+        // The hardcoded guest 617 is moved to the specified node.
+        let body = format!(
+            r#"{{"data":[{{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"}},{{"id":"lxc/{}","type":"lxc","vmid":{},"name":"test-guest-{}","node":"{}","status":"running","tags":"test"}}]}}"#,
+            vmid, vmid, vmid, new_node
+        );
+
+        self.mock.replace_route(Route {
+            path: "/api2/json/cluster/resources",
+            status: 200,
+            body: Box::leak(body.into_boxed_str()).as_bytes(),
+        });
+
+        // Invalidate the cache so the next resolve fetches the updated data.
+        self.index.invalidate();
     }
 }
