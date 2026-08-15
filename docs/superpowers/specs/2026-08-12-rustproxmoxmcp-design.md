@@ -168,6 +168,34 @@ mandatory reason.
 Both paths produce a waiver record, so the audit event and the change-set record
 distinguish a waived approval from a genuine two-principal one by construction.
 
+**Updated 2026-08-15 — mecmcp now carries this vocabulary natively.** §12's
+blocker shipped as mecmcp#275 in 0.10.0, so the two paths map onto the library
+instead of a private record:
+
+| This design | mecmcp 0.10.0 |
+|---|---|
+| operator waiver from `waivers.json` | `WaiverKind::OperatorFile` |
+| `--lab-mode` waiver | `WaiverKind::LabMode` |
+| `until` | `WaiverRecord::expires_at_unix` |
+| `ticket` | `WaiverRecord::ticket` |
+| `reason` | `WaiverRecord::reason` |
+
+All four fields are digest-bound by `compute_waiver_digest_v3`, so an expiry or
+ticket edited after the fact invalidates the record rather than silently
+widening it. Use `waive_approval_operator` for the file path and
+`waive_approval` for lab mode; do **not** hand-build a `WaiverRecord` or its
+digest, or the record fails validation on the next state load.
+
+Two consequences worth stating, both learned from deploying #275:
+
+- **`waive_approval_operator` refuses an expiry already in the past**, so a
+  waiver that is dead on arrival is a configuration error at grant time rather
+  than a waiver that silently never applies. §4.2's apply-time evaluation still
+  stands — both checks exist.
+- mecmcp enforces expiry at **both** apply gates, before and after the device
+  guard is taken. A waiver that lapses while the apply waits on the guard is
+  refused with a distinct error naming which gate rejected it.
+
 `/etc/proxmoxmcp/` is read-only *to the service process* under
 `ProtectSystem=strict`. That is not a limitation to work around — it is what
 makes granting a waiver a root operation rather than a tool call. There is
@@ -504,14 +532,19 @@ across releases, so a snapshot restore is a complete revert.
 
 One candidate, and it does not block implementation.
 
-1. **`WaiverRecord` cannot express an operator waiver.** It carries only
-   `reason`, and the waived-approval digest binds the literal
-   `"lab-mode-waived"`. The production path here is a time-boxed operator waiver
-   file, which is not lab mode — recording it as lab-mode-waived would misreport
-   a controlled exception as a disabled control. Proposed: `WaiverRecord` gains
-   a digest-bound `kind` (`LabMode` | `Operator`) plus optional `expires_at` and
-   `ticket`. Until then, `core` keeps its own waiver record and sets the
-   change-set waiver only when `--lab-mode` is genuinely on. Belongs to 0.3.
+1. ~~**`WaiverRecord` cannot express an operator waiver.**~~ **SHIPPED** as
+   mecmcp#275 in **0.10.0** (2026-08-15). `WaiverRecord` gained a digest-bound
+   `kind` — `LabMode` | `OperatorFile` | `OperatorTool`, one variant more than
+   proposed, because a waiver granted by editing a root-owned file is a
+   different claim from one granted by a second principal calling a tool — plus
+   digest-bound `expires_at_unix` and `ticket`, a new
+   `waive_approval_operator`, schema v3, and expiry enforced at both apply
+   gates.
+
+   **The fallback in this section is withdrawn.** `core` does *not* keep its own
+   waiver record: hand-building a `WaiverRecord` or its digest produces evidence
+   that fails validation on the next state load. Call the library. See the
+   updated §4.2 for the field mapping.
 
 A second candidate — a numeric-range `TargetValueShape` for `vmid:600-699` — was
 withdrawn after reading the real API. `CallerScopes` exposes only opaque name
@@ -535,6 +568,28 @@ Each phase is independently shippable and independently useful.
 
 0.1 should be deployed to the lab and left running while 0.2 is built, rather
 than holding everything for cutover.
+
+**Status 2026-08-15.** 0.1 shipped as 0.1.2 and is deployed twice: LXC 616
+`test-twoperson-proxmox` and LXC 971 `prod-proxmoxmcp`, the latter over TLS as
+`prod-proxmoxmcp.mechub.org:30031`. Sixteen tools, all `read`. **0.2 is not
+built** — there is no mutation path, no UPID handling, and no `mecmcp-job`
+integration yet.
+
+LXC 617 `test-labmode-proxmox` exists at 192.168.1.237 with its service
+deliberately **disabled**, because `--lab-mode` is a 0.3 flag and a server whose
+name promises lab mode while running two-person control would be exactly the
+"flag that is present but ignored" this project refuses. It comes up when 0.3
+lands.
+
+**0.3's implementation plan absorbs 0.2's mutation spine as its opening tasks.**
+The phasing above still describes the right order of *capability*, but the
+`low` tier and the `destructive` tier share one substrate — issuing a write to
+Proxmox and following its UPID to completion — and building that substrate twice
+is worse than building it once under the harder requirement. The plan sequences
+it as: task/UPID spine → one `low` tool proving the spine end to end → change
+sets, fingerprint, preview → waiver file and `--lab-mode` → the remaining
+`destructive` tools. A reversible tool still proves the mutation path first;
+it simply does so inside 0.3's plan rather than a separate release.
 
 ---
 
