@@ -53,8 +53,10 @@ impl TokenSpec {
 pub struct TestServer {
     /// Base URL for the MCP server (e.g., `http://127.0.0.1:xxxxx`).
     pub url: String,
-    /// Plaintext bearer token for authentication.
+    /// Plaintext bearer token for authentication (first principal).
     pub token: String,
+    /// Second bearer token for two-principal workflows.
+    pub second_token: String,
     /// The mock Proxmox server.
     mock: TlsMockServer,
     /// Temp directory holding clusters.json and tokens.json.
@@ -144,7 +146,7 @@ impl TestServer {
             parse_scope(&spec.clusters),
             parse_scope(&spec.tools),
             None,
-            Some(grant),
+            Some(grant.clone()),
             None,
             None,
             None,
@@ -152,6 +154,22 @@ impl TestServer {
             &known,
         )
         .expect("mint token");
+
+        // Mint a second token for two-principal workflows.
+        let second_plaintext = TokenStoreFile::<ProxmoxGrant>::add_with_options(
+            &tokens_path,
+            "test-token-2",
+            parse_scope(&spec.clusters),
+            parse_scope(&spec.tools),
+            None,
+            Some(grant),
+            None,
+            None,
+            None,
+            None,
+            &known,
+        )
+        .expect("mint second token");
 
         #[cfg(unix)]
         {
@@ -178,8 +196,8 @@ impl TestServer {
         )));
 
         // Build the HTTP router using the same function `main` uses.
-        let handler =
-            ProxmoxServer::new_with_default_coordinator(clusters, clients, index).expect("build server");
+        let handler = ProxmoxServer::new_with_default_coordinator(clusters, clients, index)
+            .expect("build server");
         let token_store_arc =
             Arc::new(TokenStoreFile::<ProxmoxGrant>::load(&tokens_path).expect("load tokens.json"));
         let shutdown = tokio_util::sync::CancellationToken::new();
@@ -201,6 +219,7 @@ impl TestServer {
         Self {
             url: format!("http://{}", served.address),
             token: plaintext.expose_secret().to_owned(),
+            second_token: second_plaintext.expose_secret().to_owned(),
             mock,
             _temp_dir: temp_dir,
         }
@@ -329,10 +348,24 @@ pub async fn call(
     tool: &str,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    call_with_token(server, &server.token, tool, args).await
+}
+
+/// Make an MCP tool call with a specific token.
+///
+/// # Errors
+///
+/// Returns an error if the tool call fails.
+pub async fn call_with_token(
+    server: &TestServer,
+    token: &str,
+    tool: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     use mecmcp_transport::test_client::McpClient;
 
     let url = server.url.clone();
-    let token = server.token.clone();
+    let token = token.to_owned();
     let tool = tool.to_owned();
 
     tokio::task::spawn_blocking(move || {
@@ -377,10 +410,9 @@ pub async fn call(
 
 /// Approve a change set as a second principal.
 pub async fn approve_as_second_principal(server: &TestServer, change_set_id: &str) {
-    // For now, this is a stub. In a real implementation, this would use a different
-    // token or principal. The test will fail if self-approval is allowed.
-    let _result = call(
+    call_with_token(
         server,
+        &server.second_token,
         "approve_proxmox_change_set",
         serde_json::json!({
             "change_set_id": change_set_id,
@@ -388,7 +420,8 @@ pub async fn approve_as_second_principal(server: &TestServer, change_set_id: &st
             "vmid": 617
         }),
     )
-    .await;
+    .await
+    .expect("second principal approval should succeed");
 }
 
 impl TestServer {

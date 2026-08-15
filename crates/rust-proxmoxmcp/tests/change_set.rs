@@ -110,3 +110,18 @@ async fn a_fingerprint_that_moved_after_approval_refuses_the_apply() {
         "{err}"
     );
 }
+
+// TODO: These tests require waiver and lab-mode infrastructure in the server.
+// They are placeholders for when that infrastructure is implemented.
+//
+// #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// #[ignore = "requires waiver file support in server"]
+// async fn a_protected_guest_with_matching_waiver_can_be_applied() { ... }
+//
+// #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// #[ignore = "requires lab-mode support in server"]
+// async fn a_protected_guest_with_lab_mode_can_be_applied() { ... }
+//
+// #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// #[ignore = "requires waiver file support in server"]
+// async fn a_protected_guest_with_expired_waiver_is_refused() { ... }

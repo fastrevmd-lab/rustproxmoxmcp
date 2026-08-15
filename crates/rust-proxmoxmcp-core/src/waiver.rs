@@ -168,4 +168,36 @@ impl WaiverFile {
             entry.cluster == cluster && entry.vmid == vmid && now_unix < entry.until_unix
         })
     }
+
+    /// Create a waiver file with specific entries.
+    ///
+    /// This is primarily for testing, but is safe to use in production if
+    /// waivers are being sourced from something other than a file.
+    #[must_use]
+    pub fn with_entries(waivers: Vec<WaiverEntry>) -> Self {
+        Self { waivers }
+    }
+}
+
+impl WaiverEntry {
+    /// Create a waiver entry.
+    ///
+    /// This is primarily for testing, but is safe to use in production if
+    /// waivers are being constructed programmatically.
+    #[must_use]
+    pub fn new(
+        cluster: String,
+        vmid: u32,
+        until_unix: u64,
+        reason: String,
+        ticket: Option<String>,
+    ) -> Self {
+        Self {
+            cluster,
+            vmid,
+            until_unix,
+            reason,
+            ticket,
+        }
+    }
 }

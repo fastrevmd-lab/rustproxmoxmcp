@@ -237,7 +237,7 @@ impl ProxmoxServer {
             };
             let authorized = match self
                 .index
-                .authorize(client, cluster, vmid, &grant, Tier::Read)
+                .authorize(client, cluster, vmid, &grant, Tier::Read, None)
                 .await
             {
                 Ok(authorized) => authorized,
@@ -436,7 +436,7 @@ impl ProxmoxServer {
         };
         let authorized = match self
             .index
-            .authorize(client, &args.cluster, args.vmid, &grant, Tier::Read)
+            .authorize(client, &args.cluster, args.vmid, &grant, Tier::Read, None)
             .await
         {
             Ok(authorized) => authorized,
@@ -640,7 +640,7 @@ impl ProxmoxServer {
         use rust_proxmoxmcp_core::{
             fingerprint::{GuestState, fingerprint},
             preview::{PreviewInput, render_preview},
-            protect::{Override, destructive_allowed},
+            protect::{Override, destructive_allowed, protection_of},
             waiver::WaiverFile,
         };
 
@@ -663,17 +663,13 @@ impl ProxmoxServer {
             Ok(grant) => grant,
             Err(error) => return *error,
         };
-        let authorized = match self
-            .index
-            .authorize(client, &args.cluster, args.vmid, &grant, Tier::Destructive)
-            .await
-        {
-            Ok(authorized) => authorized,
+
+        // Resolve guest and compute protection to determine override.
+        let guest = match self.index.resolve(client, &args.cluster, args.vmid).await {
+            Ok(guest) => guest,
             Err(error) => return tool_error(error),
         };
-
-        let guest = authorized.guest();
-        let protection = authorized.protection();
+        let protection = protection_of(client.cluster(), Some(&guest), false);
 
         // Load waivers (0.3 has no waiver file, so use empty).
         let waivers = WaiverFile::empty();
@@ -684,7 +680,7 @@ impl ProxmoxServer {
             .as_secs();
 
         let override_ = destructive_allowed(
-            protection,
+            &protection,
             &waivers,
             &args.cluster,
             args.vmid,
@@ -692,14 +688,26 @@ impl ProxmoxServer {
             false, // lab_mode: always false in 0.3
         );
 
-        // Refuse at plan time if protected without override.
-        if protection.is_protected() && matches!(override_, Override::None) {
-            return tool_error(format!(
-                "guest {} is protected ({}), no waiver found",
+        let override_applies = !matches!(override_, Override::None);
+
+        // Now authorize with the override information.
+        let authorized = match self
+            .index
+            .authorize(
+                client,
+                &args.cluster,
                 args.vmid,
-                protection.summary()
-            ));
-        }
+                &grant,
+                Tier::Destructive,
+                Some(override_applies),
+            )
+            .await
+        {
+            Ok(authorized) => authorized,
+            Err(error) => return tool_error(error),
+        };
+
+        let guest = authorized.guest();
 
         // Compute fingerprint.
         let state = GuestState {
@@ -914,7 +922,9 @@ impl ProxmoxServer {
                 let msg = error.to_string();
                 // Reword the self-approval error to match test expectations.
                 if msg.contains("owner cannot approve their own") {
-                    return tool_error("self-approval refused: the planner cannot approve their own change set");
+                    return tool_error(
+                        "self-approval refused: the planner cannot approve their own change set",
+                    );
                 }
                 return tool_error(format!("approve: {error}"));
             }
@@ -951,7 +961,11 @@ impl ProxmoxServer {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         use change_set::ChangeSetResponse;
-        use rust_proxmoxmcp_core::fingerprint::{GuestState, fingerprint};
+        use rust_proxmoxmcp_core::{
+            fingerprint::{GuestState, fingerprint},
+            protect::{Override, destructive_allowed, protection_of},
+            waiver::WaiverFile,
+        };
 
         let caller = Self::caller(&context);
         if let Err(error) = authorize_call(
@@ -981,9 +995,44 @@ impl ProxmoxServer {
             Ok(grant) => grant,
             Err(error) => return *error,
         };
+
+        // Resolve guest and compute protection to determine override.
+        let guest = match self.index.resolve(client, &args.cluster, args.vmid).await {
+            Ok(guest) => guest,
+            Err(error) => return tool_error(error),
+        };
+        let protection = protection_of(client.cluster(), Some(&guest), false);
+
+        // Load waivers (0.3 has no waiver file, so use empty).
+        let waivers = WaiverFile::empty();
+
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_secs();
+
+        let override_ = destructive_allowed(
+            &protection,
+            &waivers,
+            &args.cluster,
+            args.vmid,
+            now_unix,
+            false, // lab_mode: always false in 0.3
+        );
+
+        let override_applies = !matches!(override_, Override::None);
+
+        // Now authorize with the override information.
         let authorized = match self
             .index
-            .authorize(client, &args.cluster, args.vmid, &grant, Tier::Destructive)
+            .authorize(
+                client,
+                &args.cluster,
+                args.vmid,
+                &grant,
+                Tier::Destructive,
+                Some(override_applies),
+            )
             .await
         {
             Ok(authorized) => authorized,
@@ -1072,11 +1121,10 @@ mod tests {
     #[test]
     fn known_tools_includes_read_catalog_and_changeset_tools() {
         // Read tools from catalog.
-        let read_tools: std::collections::HashSet<&str> =
-            rust_proxmoxmcp_core::catalog::READ_TOOLS
-                .iter()
-                .map(|tool| tool.name)
-                .collect();
+        let read_tools: std::collections::HashSet<&str> = rust_proxmoxmcp_core::catalog::READ_TOOLS
+            .iter()
+            .map(|tool| tool.name)
+            .collect();
 
         // Changeset tools added in Task 6.
         let changeset_tools = [
