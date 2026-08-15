@@ -19,6 +19,7 @@ pub mod error;
 pub mod fingerprint;
 pub mod grant;
 pub mod inventory;
+pub mod preview;
 pub mod protect;
 pub mod resolve;
 pub mod selector;
