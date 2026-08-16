@@ -205,6 +205,47 @@ The core crate has a non-default `testing` feature that pulls in `rcgen`, `rustl
 
 All three consume `mecmcp` — the shared Rust crate family underneath mechub's per-vendor MCP servers.
 
+## Audit forwarding to the event store
+
+The audit trail does not stay on this host. This server follows the family
+standard — [AUDIT-FORWARDING-STANDARD.md](https://github.com/fastrevmd-lab/mecmcp/blob/main/docs/AUDIT-FORWARDING-STANDARD.md).
+
+An audit record that only exists on the machine that produced it is not an audit
+trail: it is a log file on a box whose operator is the party the record is about.
+
+### Emission (in effect now)
+
+```
+--audit-format json \
+--audit-log-file /var/lib/proxmoxmcp/audit.jsonl
+```
+
+JSON is mandatory. The `text` format is for reading in a terminal and is not a
+parse target. The file is the operator-facing artifact and must be rotated — the
+server never truncates it.
+
+### Transport (specified, not yet implemented)
+
+Records are written directly into SSDF's `ssdf.audit` as **hash-chained** rows,
+per SSDF's merged evidence contract, so that deleting or editing a row is
+detectable. Tracked in [mecmcp#292](https://github.com/fastrevmd-lab/mecmcp/issues/292).
+
+A cheaper syslog path was designed and rejected: it works, but the records are
+unchained, and every other link here is tamper-evident by construction — plan
+digests bind approvals, approvals name a distinct principal, and
+`token_verified_fields` separates vouched-for provenance from asserted. An
+unchained final hop would discard that guarantee exactly where an auditor needs
+it. The reasoning is recorded in the standard.
+
+### Reading the result
+
+`token_verified_fields` names the provenance fields the **token** vouched for.
+The rest of that group — `client_name`, `model_id`, `session_id` — is
+client-asserted and authenticated by nothing. Do not read them as equivalent.
+
+`request_id` correlates the transport event, the handler event, and (on Junos)
+the device commit comment.
+
 ## License
 
 Licensed under [MIT](LICENSE).
