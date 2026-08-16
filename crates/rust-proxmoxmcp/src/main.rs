@@ -266,6 +266,7 @@ async fn main() -> Result<()> {
                 args.common.allowed_origin,
                 LimitsConfig::default(),
                 false,
+                args.common.allow_insecure_bind,
                 tls,
                 shutdown,
                 shutdown_timeout,
@@ -405,6 +406,7 @@ async fn serve_http(
     allowed_origins: Vec<String>,
     limits: LimitsConfig,
     enable_metrics: bool,
+    allow_insecure_bind: bool,
     tls: Option<Arc<rustls::ServerConfig>>,
     shutdown: tokio_util::sync::CancellationToken,
     shutdown_timeout: Duration,
@@ -421,6 +423,7 @@ async fn serve_http(
         allowed_origins,
         limits,
         enable_metrics,
+        allow_insecure_bind,
         shutdown,
     )
     .map_err(|error| anyhow::anyhow!("building HTTP router: {error}"))?;
