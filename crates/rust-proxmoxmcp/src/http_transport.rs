@@ -165,8 +165,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allow_insecure_bind_flag_is_threaded_into_config() {
+    async fn allow_insecure_bind_is_wired() {
         use crate::server::ProxmoxServer;
+        use mecmcp_transport::serve_router;
         use rust_proxmoxmcp_core::{
             client::ProxmoxClient, inventory::ClusterInventory, resolve::GuestIndex,
         };
@@ -180,20 +181,11 @@ mod tests {
             let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         });
 
-        // This test cannot bind a real non-loopback address because:
-        // 1. The address must exist on the test runner's network interface
-        // 2. Port binding requires privileges in CI environments
-        // 3. Parallel test runs would collide on fixed ports
-        //
-        // Instead, we verify that `build_http_router` accepts the flag and
-        // produces a ServePlan for both true and false values. The sabotage
-        // test (removing the `.with_insecure_bind(...)` call and confirming
-        // that a real deployment fails) is the definitive verification.
-
-        // Build a minimal inventory and token store.
+        // Build a minimal inventory.
         let temp_dir = tempfile::TempDir::new().expect("create temp dir");
         let clusters_path = temp_dir.path().join("clusters.json");
         let secret_path = temp_dir.path().join("secret.txt");
+        let tokens_path = temp_dir.path().join("tokens.json");
 
         // Write a secret file.
         std::fs::write(&secret_path, "test-secret").expect("write secret file");
@@ -236,6 +228,39 @@ mod tests {
                 .expect("set clusters.json permissions");
         }
 
+        // Write a token store (authenticated mode requires it).
+        use mecmcp_auth::{KnownNames, ScopeSet, TokenStoreFile};
+        let known_devices = ["test".to_owned()];
+        let known_tools = ["get_nodes"];
+        let known = KnownNames {
+            devices: Some(&known_devices),
+            tools: &known_tools,
+        };
+        let _secret = TokenStoreFile::<ProxmoxGrant>::add_with_options(
+            &tokens_path,
+            "test",
+            ScopeSet::Wildcard,
+            ScopeSet::Wildcard,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &known,
+        )
+        .expect("token add");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tokens_path, std::fs::Permissions::from_mode(0o600))
+                .expect("set tokens.json permissions");
+        }
+
+        let store =
+            Arc::new(TokenStoreFile::<ProxmoxGrant>::load(&tokens_path).expect("load token store"));
+
         // Load the inventory and build a minimal server.
         let clusters =
             Arc::new(ClusterInventory::load(&clusters_path).expect("load clusters.json"));
@@ -257,12 +282,12 @@ mod tests {
             ProxmoxServer::new_with_default_coordinator(clusters, clients, index, waivers, false)
                 .expect("build server");
 
+        // With the flag OFF, building the router with authenticated token store
+        // should succeed, but serving it on 0.0.0.0 without TLS should be refused.
         let shutdown = tokio_util::sync::CancellationToken::new();
-
-        // Test with allow_insecure_bind=false (should build successfully).
-        let _plan_without_flag = build_http_router(
+        let refused_plan = build_http_router(
             handler.clone(),
-            None,
+            Some(store.clone()),
             vec![],
             vec![],
             LimitsConfig::default(),
@@ -270,26 +295,76 @@ mod tests {
             false,
             shutdown.clone(),
         )
-        .expect("build_http_router must succeed with allow_insecure_bind=false");
+        .expect("build_http_router with flag off");
 
-        // Test with allow_insecure_bind=true (should build successfully).
-        let _plan_with_flag = build_http_router(
+        let non_loopback_addr = "0.0.0.0:0".parse().expect("address");
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            serve_router(
+                refused_plan,
+                non_loopback_addr,
+                None,
+                Duration::from_millis(50),
+            ),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(_)) => {
+                panic!("serving plaintext on 0.0.0.0 without --allow-insecure-bind must be refused")
+            }
+            Ok(Err(e)) => {
+                let error = format!("{e:?}");
+                assert!(
+                    error.contains("InsecureBindNotAcknowledged"),
+                    "expected InsecureBindNotAcknowledged refusal, got: {error}"
+                );
+            }
+            Err(_) => panic!("serve_router should fail immediately, not timeout"),
+        }
+
+        // With the flag ON, serving on 0.0.0.0 without TLS should succeed.
+        // Pass allowed host/origin to satisfy those checks (separate from insecure bind).
+        let allowed_plan = build_http_router(
             handler,
-            None,
-            vec![],
-            vec![],
+            Some(store),
+            vec!["0.0.0.0".to_owned()],
+            vec!["http://0.0.0.0".to_owned()],
             LimitsConfig::default(),
             false,
             true,
-            shutdown,
+            shutdown.clone(),
         )
-        .expect("build_http_router must succeed with allow_insecure_bind=true");
+        .expect("build_http_router with flag on");
 
-        // Both builds succeeded. The real verification is that a deployment
-        // attempt with allow_insecure_bind=false and a non-loopback bind
-        // address fails with InsecureBindNotAcknowledged, and succeeds with
-        // allow_insecure_bind=true. That verification is done by removing
-        // the `.with_insecure_bind(...)` call and confirming a real deploy
-        // fails (the sabotage test).
+        let allowed_addr = "0.0.0.0:0".parse().expect("address");
+        let serving = tokio::spawn(serve_router(
+            allowed_plan,
+            allowed_addr,
+            None,
+            Duration::from_millis(50),
+        ));
+
+        // Wait for the server to start (or fail).
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Cancel shutdown to let it exit gracefully.
+        shutdown.cancel();
+
+        // The server should have started and shut down cleanly.
+        match tokio::time::timeout(Duration::from_millis(200), serving).await {
+            Ok(Ok(Ok(_))) => {
+                // Server started and shut down cleanly.
+            }
+            Ok(Ok(Err(e))) => {
+                panic!("serve_router with --allow-insecure-bind should succeed, got: {e:?}");
+            }
+            Ok(Err(e)) => {
+                panic!("serve_router task panicked: {e:?}");
+            }
+            Err(_) => {
+                panic!("serve_router did not complete after shutdown signal");
+            }
+        }
     }
 }
