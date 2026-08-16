@@ -237,6 +237,7 @@ impl TestServer {
             vec![],
             LimitsConfig::default(),
             false,
+            false,
             shutdown.clone(),
         )
         .expect("build HTTP router");
