@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-08-19
+
+### Added
+
+- **`--lab-mode` now announces itself at startup.** The flag was applied
+  silently, so the only way to tell a lab-mode server from a two-person one was
+  to read its unit file or `/proc/<pid>/cmdline`. Every sibling server in the
+  family prints this banner; auditing the fleet at a glance depends on it.
+
+## [0.3.1] - 2026-08-18
+
+### Fixed
+
+- **`tools/list` now carries the cache descriptor** (`ttlMs`, `cacheScope`) a
+  2026-07-28 client validates. Because this server overrides `list_tools` to
+  filter by token scope, it did not inherit the fields rmcp's generated handler
+  supplies, and a client on the new protocol rejected the reply outright —
+  reported as "tools fetch failed" against a healthy server.
+- Took h2 0.4.17 for RUSTSEC-2026-0258.
+
+### Documentation
+
+- Documented audit forwarding and where the trail goes.
+
+## [0.3.0] - 2026-08-15
+
+### Added
+
+- **Destructive operations are under change-set control.** `delete_container`
+  and its siblings go through create/approve/apply rather than executing on
+  call, following the Proxmox UPID task to completion.
+- **`--lab-mode` and `--waivers-file`**, matching the rest of the family:
+  single-operator mode waives the distinct-approver rule, and waivers are
+  recorded rather than implied.
+
+### Fixed
+
+- **`--allow-insecure-bind` was parsed and never wired into the transport**, so
+  the server could not bind plaintext off-loopback at all. It hid because every
+  deployed server uses TLS. Now covered by a test that binds `0.0.0.0:0`.
+
+## [0.1.2] - 2026-08-14
+
+### Changed
+
+- Converged on mecmcp v0.9.1 (from v0.8.8).
+
+### Added
+
+- CI and security workflows: gitleaks with default rules loaded, `cargo-deny`
+  with a `[sources]` section, and fixtures marked exempt from secret scanning.
+
+### Fixed
+
+- Hardened the `testing` feature guard against fail-open.
+
 ## [0.1.1] - 2026-08-13
 
 ### Fixed
