@@ -311,6 +311,16 @@ async fn serve_stdio(
     let handler =
         ProxmoxServer::new_with_default_coordinator(clusters, clients, index, waivers, lab_mode)
             .context("build server")?;
+
+    if lab_mode {
+        tracing::warn!(
+            target: "audit",
+            "lab mode enabled: change sets for protected guests are approved on creation \
+             with no second principal. Records carry approval_waiver=lab-mode. \
+             Do not run this against production devices."
+        );
+    }
+
     let service = handler
         .serve((tokio::io::stdin(), tokio::io::stdout()))
         .await
@@ -416,6 +426,16 @@ async fn serve_http(
     let handler =
         ProxmoxServer::new_with_default_coordinator(clusters, clients, index, waivers, lab_mode)
             .context("build server")?;
+
+    if lab_mode {
+        tracing::warn!(
+            target: "audit",
+            "lab mode enabled: change sets for protected guests are approved on creation \
+             with no second principal. Records carry approval_waiver=lab-mode. \
+             Do not run this against production devices."
+        );
+    }
+
     let plan = build_http_router(
         handler,
         token_store,
