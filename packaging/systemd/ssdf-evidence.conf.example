@@ -1,0 +1,36 @@
+# Example drop-in for SSDF evidence pipeline configuration.
+#
+# Install to /etc/systemd/system/rust-proxmoxmcp.service.d/ssdf-evidence.conf
+# and customize the endpoint, server-id, and credential paths for your
+# deployment.
+#
+# This drop-in is NOT included in the default install. The flags below point at
+# site-specific infrastructure and credential files. A rebuild from the release
+# tarball will not restore them unless you install this drop-in explicitly.
+
+[Service]
+# Override ExecStart to add SSDF evidence flags. systemd requires clearing the
+# original ExecStart= before adding a new one when overriding in a drop-in.
+ExecStart=
+ExecStart=/usr/local/bin/rust-proxmoxmcp \
+    --clusters-file /etc/proxmoxmcp/clusters.json \
+    --tokens-file /var/lib/proxmoxmcp/tokens.json \
+    --transport streamable-http \
+    --host 0.0.0.0 --port 30031 \
+    --allowed-host proxmoxmcp.example.org \
+    --allowed-origin https://proxmoxmcp.example.org \
+    --tls-cert /etc/proxmoxmcp/tls/fullchain.pem \
+    --tls-key /etc/proxmoxmcp/tls/privkey.pem \
+    --audit-format json \
+    --audit-log-file /var/lib/proxmoxmcp/audit.jsonl \
+    --audit-journald \
+    --audit-redact devices=hmac \
+    --audit-hmac-key-file /etc/proxmoxmcp/audit-hmac.key \
+    --ssdf-audit-endpoint https://192.168.1.151:8443 \
+    --ssdf-audit-server-id prod-labmode-proxmox \
+    --ssdf-audit-password-file /etc/proxmoxmcp/ssdf-audit.pw \
+    --ssdf-audit-verify-password-file /etc/proxmoxmcp/ssdf-audit-verify.pw \
+    --ssdf-audit-ca-file /etc/proxmoxmcp/ssdf-ca.crt \
+    --ssdf-audit-outbox /var/lib/proxmoxmcp/evidence-outbox.ndjson \
+    --ssdf-audit-ledger /var/lib/proxmoxmcp/evidence-ledger.ndjson \
+    --ssdf-audit-interval-secs 30

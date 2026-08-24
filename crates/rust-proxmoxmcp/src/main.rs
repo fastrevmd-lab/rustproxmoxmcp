@@ -18,6 +18,45 @@ use rust_proxmoxmcp_core::{
 use server::ProxmoxServer;
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::Duration};
 
+/// Resolve the token file path, applying the legacy fallback ONLY when the
+/// configured path is the canonical /var/lib/proxmoxmcp/tokens.json.
+///
+/// Any other configured path is used verbatim and fails if absent — that is the
+/// honest outcome. This prevents a typo or deliberately deleted custom store from
+/// silently reactivating unrelated or revoked credentials at the legacy path.
+fn resolve_tokens(configured: &std::path::Path) -> Result<mecmcp_auth::ResolvedTokenPath> {
+    resolve_tokens_with(
+        configured,
+        std::path::Path::new("/var/lib/proxmoxmcp/tokens.json"),
+        std::path::Path::new("/etc/proxmoxmcp/tokens.json"),
+    )
+}
+
+/// The rule behind [`resolve_tokens`], with the two well-known paths injected so
+/// it can be exercised against real files in a test rather than against absolute
+/// paths that never exist there.
+fn resolve_tokens_with(
+    configured: &std::path::Path,
+    canonical: &std::path::Path,
+    legacy: &std::path::Path,
+) -> Result<mecmcp_auth::ResolvedTokenPath> {
+    // Byte-exact, not `Path` equality. `Path` comparison normalizes away trailing
+    // separators and `.` components, so `/var/lib/<svc>/tokens.json/` compares
+    // EQUAL to the canonical path — while `metadata()` on that spelling returns
+    // NotFound when the file is absent, indistinguishable from the plain form.
+    // A typo would therefore pass this gate and activate the legacy store, which
+    // is exactly the fail-closed behaviour this check exists to provide.
+    if configured.as_os_str() != canonical.as_os_str() {
+        return Ok(mecmcp_auth::ResolvedTokenPath {
+            path: configured.to_path_buf(),
+            used_fallback: false,
+            fallback_from: None,
+        });
+    }
+
+    mecmcp_auth::resolve_token_path(configured, legacy).context("resolving token file path")
+}
+
 /// Build a vendor grant from TokenCommand::Add fields.
 ///
 /// Returns `None` when no guest selectors are given, allowing cluster-scoped
@@ -243,6 +282,23 @@ async fn main() -> Result<()> {
         Transport::StreamableHttp => {
             let token_store = load_http_token_store(&args.common)?;
 
+            // Check for stale secrets (superseded token files, old TLS keys) in both
+            // /var/lib/proxmoxmcp and /etc/proxmoxmcp. Warn, never refuse.
+            let live_files = ["tokens.json"];
+            for dir in [
+                std::path::Path::new("/var/lib/proxmoxmcp"),
+                std::path::Path::new("/etc/proxmoxmcp"),
+            ] {
+                let stale = mecmcp_auth::find_stale_secrets(dir, &live_files);
+                for secret in stale {
+                    tracing::warn!(
+                        path = %secret.path.display(),
+                        reason = ?secret.reason,
+                        "Stale secret file detected. Consider removing after verifying it is no longer referenced."
+                    );
+                }
+            }
+
             // Install SIGHUP handler that reloads both inventory and token store.
             install_sighup_reload(
                 Arc::clone(&clusters),
@@ -385,11 +441,34 @@ fn load_http_token_store(
 ) -> Result<Option<Arc<TokenStoreFile<ProxmoxGrant>>>> {
     match (&args.tokens_file, args.allow_no_auth) {
         (Some(path), false) => {
+            // The CONFIGURED path is the primary; /etc is the legacy fallback, so an
+            // upgrade whose tokens have not been moved yet still starts.
+            //
+            // Apply the legacy /etc fallback ONLY when the configured path is the
+            // canonical /var/lib/proxmoxmcp/tokens.json. A typo or deliberately
+            // deleted custom store must fail, not silently reactivate credentials
+            // from /etc. The resolve_tokens wrapper enforces that restriction.
+            let resolved = resolve_tokens(path)?;
+
+            if let (true, Some(fallback_from)) = (resolved.used_fallback, &resolved.fallback_from) {
+                tracing::warn!(
+                    path = %resolved.path.display(),
+                    fallback_from = %fallback_from.display(),
+                    "Using fallback token file (primary does not exist). \
+                     Token operations (add, revoke, rotate) will fail under ProtectSystem=strict. \
+                     Move to /var/lib/proxmoxmcp/tokens.json to restore write capability."
+                );
+            }
+
             let store = Arc::new(
-                TokenStoreFile::<ProxmoxGrant>::load(path)
-                    .with_context(|| format!("loading {}", path.display()))?,
+                TokenStoreFile::<ProxmoxGrant>::load(&resolved.path)
+                    .with_context(|| format!("loading {}", resolved.path.display()))?,
             );
-            tracing::info!(tokens = store.store().len(), "token store loaded");
+            tracing::info!(
+                path = %resolved.path.display(),
+                tokens = store.store().len(),
+                "token store loaded"
+            );
             Ok(Some(store))
         }
         (None, true) => {
@@ -501,4 +580,79 @@ async fn serve_http(
     serve_router(plan, address, tls, shutdown_timeout)
         .await
         .map_err(anyhow::Error::from)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod token_path_tests {
+    use super::resolve_tokens_with;
+
+    /// The canonical path is absent and the legacy store exists: the fallback
+    /// must fire, so an upgrade that has not migrated yet still starts.
+    #[test]
+    fn canonical_path_falls_back_to_an_existing_legacy_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("var-lib-tokens.json");
+        let legacy = dir.path().join("etc-tokens.json");
+        std::fs::write(&legacy, "{}").unwrap();
+
+        let resolved = resolve_tokens_with(&canonical, &canonical, &legacy).unwrap();
+        assert_eq!(
+            resolved.path, legacy,
+            "the legacy store should have been used"
+        );
+        assert!(resolved.used_fallback);
+    }
+
+    /// The same legacy store exists, but the operator configured a DIFFERENT
+    /// path. Falling back here would silently reactivate credentials they did
+    /// not ask for — a typo or a deleted store must fail, not resurrect tokens.
+    #[test]
+    fn a_custom_path_never_falls_back_to_the_legacy_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("var-lib-tokens.json");
+        let legacy = dir.path().join("etc-tokens.json");
+        std::fs::write(&legacy, "{}").unwrap();
+        let custom = dir.path().join("operator-chosen.json");
+
+        let resolved = resolve_tokens_with(&custom, &canonical, &legacy).unwrap();
+        assert_eq!(
+            resolved.path, custom,
+            "an operator-supplied path must be used verbatim"
+        );
+        assert!(
+            !resolved.used_fallback,
+            "a custom path must never resolve to the legacy /etc store"
+        );
+    }
+
+    /// A malformed spelling of the canonical path must NOT reach the fallback.
+    ///
+    /// `Path` equality normalizes away a trailing separator, so
+    /// `.../tokens.json/` compares equal to the canonical path; and when the
+    /// file is absent `metadata()` returns NotFound for that spelling too,
+    /// indistinguishable from the plain form. A typo would therefore activate
+    /// the legacy store — the opposite of fail-closed. The comparison is
+    /// byte-exact for this reason.
+    #[test]
+    fn a_trailing_slash_spelling_does_not_reach_the_legacy_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("var-lib-tokens.json");
+        let legacy = dir.path().join("etc-tokens.json");
+        std::fs::write(&legacy, "{}").unwrap();
+
+        let mut malformed = canonical.clone().into_os_string();
+        malformed.push("/");
+        let malformed = std::path::PathBuf::from(malformed);
+
+        let resolved = resolve_tokens_with(&malformed, &canonical, &legacy).unwrap();
+        assert!(
+            !resolved.used_fallback,
+            "a trailing-slash spelling must not activate the legacy store"
+        );
+        assert_eq!(
+            resolved.path, malformed,
+            "the given path must be used verbatim"
+        );
+    }
 }

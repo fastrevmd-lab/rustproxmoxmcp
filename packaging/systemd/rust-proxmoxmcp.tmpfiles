@@ -1,0 +1,3 @@
+d /etc/proxmoxmcp 0750 root proxmoxmcp -
+d /etc/proxmoxmcp/secrets 0700 proxmoxmcp proxmoxmcp -
+d /var/lib/proxmoxmcp 0700 proxmoxmcp proxmoxmcp -

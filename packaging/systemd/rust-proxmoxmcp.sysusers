@@ -1,0 +1,1 @@
+u proxmoxmcp - "rust-proxmoxmcp service" /var/lib/proxmoxmcp /usr/sbin/nologin
