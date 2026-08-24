@@ -42,7 +42,7 @@ url         = "2"
 uuid        = { version = "1", features = ["v4"] }
 
 # Test-only
-rcgen        = "0.13"
+rcgen        = "0.14"
 tokio-rustls = "0.26"
 
 # Internal workspace crate. This version must be bumped alongside
