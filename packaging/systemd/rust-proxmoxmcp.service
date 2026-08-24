@@ -9,17 +9,21 @@ User=proxmoxmcp
 Group=proxmoxmcp
 ExecStart=/usr/local/bin/rust-proxmoxmcp \
     --clusters-file /etc/proxmoxmcp/clusters.json \
-    --tokens-file /etc/proxmoxmcp/tokens.json \
+    --tokens-file /var/lib/proxmoxmcp/tokens.json \
     --transport streamable-http \
-    --host 0.0.0.0 --port 30031 \
+    --host 127.0.0.1 --port 30031 \
     --allowed-host proxmoxmcp.example.org \
     --allowed-origin https://proxmoxmcp.example.org \
     --tls-cert /etc/proxmoxmcp/tls/fullchain.pem \
     --tls-key /etc/proxmoxmcp/tls/privkey.pem \
     --audit-format json \
-    --audit-log-file /var/lib/proxmoxmcp/audit.jsonl
+    --audit-log-file /var/lib/proxmoxmcp/audit.jsonl \
+    --audit-journald \
+    --audit-redact devices=hmac \
+    --audit-hmac-key-file /etc/proxmoxmcp/audit-hmac.key
 Restart=on-failure
 RestartSec=5
+UMask=0077
 EnvironmentFile=-/etc/proxmoxmcp/secrets.env
 
 # /etc/proxmoxmcp stays read-only to the service. This is deliberate: it is what
@@ -31,10 +35,44 @@ ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
 NoNewPrivileges=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+StateDirectory=proxmoxmcp
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/proxmoxmcp
+
+# Seccomp filter and syscall restrictions
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @obsolete @mount @swap @reboot @module
+SystemCallArchitectures=native
+
+# Drop all capabilities
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Additional hardening
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 MemoryDenyWriteExecute=yes
 LockPersonality=yes
-ReadWritePaths=/var/lib/proxmoxmcp
+
+# Network access control (allow all for Proxmox API + SSDF endpoint)
+IPAddressDeny=any
+IPAddressAllow=localhost
+IPAddressAllow=link-local
+IPAddressAllow=192.168.0.0/16
+IPAddressAllow=10.0.0.0/8
+IPAddressAllow=172.16.0.0/12
+
 TimeoutStopSec=45
 
 [Install]

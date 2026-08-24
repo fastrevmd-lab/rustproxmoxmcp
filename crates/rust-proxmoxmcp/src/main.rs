@@ -243,6 +243,23 @@ async fn main() -> Result<()> {
         Transport::StreamableHttp => {
             let token_store = load_http_token_store(&args.common)?;
 
+            // Check for stale secrets (superseded token files, old TLS keys) in both
+            // /var/lib/proxmoxmcp and /etc/proxmoxmcp. Warn, never refuse.
+            let live_files = ["tokens.json"];
+            for dir in [
+                std::path::Path::new("/var/lib/proxmoxmcp"),
+                std::path::Path::new("/etc/proxmoxmcp"),
+            ] {
+                let stale = mecmcp_auth::find_stale_secrets(dir, &live_files);
+                for secret in stale {
+                    tracing::warn!(
+                        path = %secret.path.display(),
+                        reason = ?secret.reason,
+                        "Stale secret file detected. Consider removing after verifying it is no longer referenced."
+                    );
+                }
+            }
+
             // Install SIGHUP handler that reloads both inventory and token store.
             install_sighup_reload(
                 Arc::clone(&clusters),
@@ -384,12 +401,35 @@ fn load_http_token_store(
     args: &mecmcp_runtime::cli::Cli,
 ) -> Result<Option<Arc<TokenStoreFile<ProxmoxGrant>>>> {
     match (&args.tokens_file, args.allow_no_auth) {
-        (Some(path), false) => {
+        (Some(_path), false) => {
+            // Resolve token path with fallback to /etc for upgrade compatibility.
+            // Primary: /var/lib/proxmoxmcp/tokens.json (writable under ProtectSystem=strict)
+            // Fallback: /etc/proxmoxmcp/tokens.json (read-only, deprecated)
+            use std::path::Path;
+            let primary = Path::new("/var/lib/proxmoxmcp/tokens.json");
+            let fallback = Path::new("/etc/proxmoxmcp/tokens.json");
+            let resolved = mecmcp_auth::resolve_token_path(primary, fallback)
+                .with_context(|| "resolving token file path")?;
+
+            if let (true, Some(fallback_from)) = (resolved.used_fallback, &resolved.fallback_from) {
+                tracing::warn!(
+                    path = %resolved.path.display(),
+                    fallback_from = %fallback_from.display(),
+                    "Using fallback token file (primary does not exist). \
+                     Token operations (add, revoke, rotate) will fail under ProtectSystem=strict. \
+                     Move to /var/lib/proxmoxmcp/tokens.json to restore write capability."
+                );
+            }
+
             let store = Arc::new(
-                TokenStoreFile::<ProxmoxGrant>::load(path)
-                    .with_context(|| format!("loading {}", path.display()))?,
+                TokenStoreFile::<ProxmoxGrant>::load(&resolved.path)
+                    .with_context(|| format!("loading {}", resolved.path.display()))?,
             );
-            tracing::info!(tokens = store.store().len(), "token store loaded");
+            tracing::info!(
+                path = %resolved.path.display(),
+                tokens = store.store().len(),
+                "token store loaded"
+            );
             Ok(Some(store))
         }
         (None, true) => {

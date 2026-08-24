@@ -24,20 +24,28 @@ fi
 
 echo "==> Installing rust-proxmoxmcp"
 
-# Create service user if absent
-if ! id proxmoxmcp >/dev/null 2>&1; then
-    echo "    Creating proxmoxmcp system user..."
-    useradd --system --home-dir /var/lib/proxmoxmcp --create-home --shell /usr/sbin/nologin proxmoxmcp
-else
-    echo "    User proxmoxmcp already exists"
+# Install runtime dependencies
+echo "    Installing runtime dependencies..."
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+
+# Create service user and directories via systemd
+if [ ! -f packaging/systemd/rust-proxmoxmcp.sysusers ]; then
+    echo "error: packaging/systemd/rust-proxmoxmcp.sysusers not found" >&2
+    exit 1
+fi
+if [ ! -f packaging/systemd/rust-proxmoxmcp.tmpfiles ]; then
+    echo "error: packaging/systemd/rust-proxmoxmcp.tmpfiles not found" >&2
+    exit 1
 fi
 
-# Ensure /var/lib/proxmoxmcp exists and has correct ownership
-if [ ! -d /var/lib/proxmoxmcp ]; then
-    mkdir -p /var/lib/proxmoxmcp
-fi
-chown proxmoxmcp:proxmoxmcp /var/lib/proxmoxmcp
-chmod 750 /var/lib/proxmoxmcp
+echo "    Creating proxmoxmcp system user..."
+systemd-sysusers packaging/systemd/rust-proxmoxmcp.sysusers
+
+echo "    Creating directories..."
+systemd-tmpfiles --create packaging/systemd/rust-proxmoxmcp.tmpfiles
 
 # Install the binary
 if [ ! -f rust-proxmoxmcp ]; then
@@ -47,16 +55,7 @@ fi
 echo "    Installing binary to /usr/local/bin/rust-proxmoxmcp..."
 install -m 0755 -o root -g root rust-proxmoxmcp /usr/local/bin/rust-proxmoxmcp
 
-# Create /etc/proxmoxmcp and secrets directory
-mkdir -p /etc/proxmoxmcp
-if [ ! -d /etc/proxmoxmcp/secrets ]; then
-    echo "    Creating /etc/proxmoxmcp/secrets/..."
-    mkdir -p /etc/proxmoxmcp/secrets
-    chown proxmoxmcp:proxmoxmcp /etc/proxmoxmcp/secrets
-    chmod 0700 /etc/proxmoxmcp/secrets
-else
-    echo "    /etc/proxmoxmcp/secrets/ exists"
-fi
+# /etc/proxmoxmcp and secrets directory already created by tmpfiles
 
 # Install example config files only if absent
 if [ ! -f /etc/proxmoxmcp/clusters.json ]; then
@@ -70,13 +69,25 @@ else
     echo "    /etc/proxmoxmcp/clusters.json exists; not overwriting"
 fi
 
-if [ ! -f /etc/proxmoxmcp/tokens.json ]; then
+if [ ! -f /var/lib/proxmoxmcp/tokens.json ]; then
     echo "    Creating empty tokens.json..."
-    printf '{"version":1,"tokens":[]}\n' > /etc/proxmoxmcp/tokens.json
-    chown proxmoxmcp:proxmoxmcp /etc/proxmoxmcp/tokens.json
-    chmod 0600 /etc/proxmoxmcp/tokens.json
+    printf '{"version":1,"tokens":[]}\n' > /var/lib/proxmoxmcp/tokens.json
+    chown proxmoxmcp:proxmoxmcp /var/lib/proxmoxmcp/tokens.json
+    chmod 0600 /var/lib/proxmoxmcp/tokens.json
 else
-    echo "    /etc/proxmoxmcp/tokens.json exists; not overwriting"
+    echo "    /var/lib/proxmoxmcp/tokens.json exists; not overwriting"
+fi
+
+# Generate audit HMAC key if absent. Never regenerate — a new key breaks
+# verification of every prior audit record.
+if [ ! -f /etc/proxmoxmcp/audit-hmac.key ]; then
+    echo "    Generating audit HMAC key..."
+    umask 077
+    head -c 32 /dev/urandom > /etc/proxmoxmcp/audit-hmac.key
+    chown proxmoxmcp:proxmoxmcp /etc/proxmoxmcp/audit-hmac.key
+    chmod 0600 /etc/proxmoxmcp/audit-hmac.key
+else
+    echo "    /etc/proxmoxmcp/audit-hmac.key exists; preserving (never regenerate)"
 fi
 
 # Install systemd unit
@@ -97,7 +108,7 @@ echo "  2. Write each cluster's API token secret to /etc/proxmoxmcp/secrets/<clu
 echo "     (mode 0600, owned by proxmoxmcp). Alternatively, use token_secret_env and"
 echo "     create /etc/proxmoxmcp/secrets.env with KEY=value lines."
 echo "  3. Mint a token, e.g.:"
-echo "       rust-proxmoxmcp token add --tokens-file /etc/proxmoxmcp/tokens.json \\"
+echo "       rust-proxmoxmcp token add --tokens-file /var/lib/proxmoxmcp/tokens.json \\"
 echo "           --name reader --devices '*' --tools '*' --guests '*' --actions read"
 echo "     Omit --guests only for a token that will call cluster-scoped tools alone;"
 echo "     without it the token cannot address individual guests."
