@@ -1164,6 +1164,7 @@ impl ProxmoxServer {
                             &apply_request_id,
                             &record.id,
                             &record.device,
+                            &apply_principal,
                             false,
                             &error.to_string(),
                         )
@@ -1269,6 +1270,7 @@ impl ProxmoxServer {
                 &apply_request_id,
                 &record.id,
                 &record.device,
+                &apply_principal,
                 succeeded,
                 if succeeded { "" } else { &exitstatus },
             ) {
