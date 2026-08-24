@@ -18,6 +18,39 @@ use rust_proxmoxmcp_core::{
 use server::ProxmoxServer;
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::Duration};
 
+/// Resolve the token file path, applying the legacy fallback ONLY when the
+/// configured path is the canonical /var/lib/proxmoxmcp/tokens.json.
+///
+/// Any other configured path is used verbatim and fails if absent — that is the
+/// honest outcome. This prevents a typo or deliberately deleted custom store from
+/// silently reactivating unrelated or revoked credentials at the legacy path.
+fn resolve_tokens(configured: &std::path::Path) -> Result<mecmcp_auth::ResolvedTokenPath> {
+    resolve_tokens_with(
+        configured,
+        std::path::Path::new("/var/lib/proxmoxmcp/tokens.json"),
+        std::path::Path::new("/etc/proxmoxmcp/tokens.json"),
+    )
+}
+
+/// The rule behind [`resolve_tokens`], with the two well-known paths injected so
+/// it can be exercised against real files in a test rather than against absolute
+/// paths that never exist there.
+fn resolve_tokens_with(
+    configured: &std::path::Path,
+    canonical: &std::path::Path,
+    legacy: &std::path::Path,
+) -> Result<mecmcp_auth::ResolvedTokenPath> {
+    if configured != canonical {
+        return Ok(mecmcp_auth::ResolvedTokenPath {
+            path: configured.to_path_buf(),
+            used_fallback: false,
+            fallback_from: None,
+        });
+    }
+
+    mecmcp_auth::resolve_token_path(configured, legacy).context("resolving token file path")
+}
+
 /// Build a vendor grant from TokenCommand::Add fields.
 ///
 /// Returns `None` when no guest selectors are given, allowing cluster-scoped
@@ -405,15 +438,11 @@ fn load_http_token_store(
             // The CONFIGURED path is the primary; /etc is the legacy fallback, so an
             // upgrade whose tokens have not been moved yet still starts.
             //
-            // Do NOT discard the CLI value and resolve between two hardcoded paths.
-            // An operator who passes `--tokens-file /some/other.json` would then be
-            // silently served a different file — a misconfiguration that looks like
-            // success, which is worse than refusing.
-            use std::path::Path;
-            const LEGACY_TOKENS: &str = "/etc/proxmoxmcp/tokens.json";
-            let fallback = Path::new(LEGACY_TOKENS);
-            let resolved = mecmcp_auth::resolve_token_path(path, fallback)
-                .with_context(|| "resolving token file path")?;
+            // Apply the legacy /etc fallback ONLY when the configured path is the
+            // canonical /var/lib/proxmoxmcp/tokens.json. A typo or deliberately
+            // deleted custom store must fail, not silently reactivate credentials
+            // from /etc. The resolve_tokens wrapper enforces that restriction.
+            let resolved = resolve_tokens(path)?;
 
             if let (true, Some(fallback_from)) = (resolved.used_fallback, &resolved.fallback_from) {
                 tracing::warn!(
@@ -545,4 +574,49 @@ async fn serve_http(
     serve_router(plan, address, tls, shutdown_timeout)
         .await
         .map_err(anyhow::Error::from)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod token_path_tests {
+    use super::resolve_tokens_with;
+
+    /// The canonical path is absent and the legacy store exists: the fallback
+    /// must fire, so an upgrade that has not migrated yet still starts.
+    #[test]
+    fn canonical_path_falls_back_to_an_existing_legacy_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("var-lib-tokens.json");
+        let legacy = dir.path().join("etc-tokens.json");
+        std::fs::write(&legacy, "{}").unwrap();
+
+        let resolved = resolve_tokens_with(&canonical, &canonical, &legacy).unwrap();
+        assert_eq!(
+            resolved.path, legacy,
+            "the legacy store should have been used"
+        );
+        assert!(resolved.used_fallback);
+    }
+
+    /// The same legacy store exists, but the operator configured a DIFFERENT
+    /// path. Falling back here would silently reactivate credentials they did
+    /// not ask for — a typo or a deleted store must fail, not resurrect tokens.
+    #[test]
+    fn a_custom_path_never_falls_back_to_the_legacy_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("var-lib-tokens.json");
+        let legacy = dir.path().join("etc-tokens.json");
+        std::fs::write(&legacy, "{}").unwrap();
+        let custom = dir.path().join("operator-chosen.json");
+
+        let resolved = resolve_tokens_with(&custom, &canonical, &legacy).unwrap();
+        assert_eq!(
+            resolved.path, custom,
+            "an operator-supplied path must be used verbatim"
+        );
+        assert!(
+            !resolved.used_fallback,
+            "a custom path must never resolve to the legacy /etc store"
+        );
+    }
 }
