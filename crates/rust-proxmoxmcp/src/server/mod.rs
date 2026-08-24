@@ -116,6 +116,14 @@ pub struct ProxmoxServer {
     clients: Arc<BTreeMap<String, ProxmoxClient>>,
     index: Arc<GuestIndex>,
     coordinator: Arc<mecmcp_changeset::ChangesetCoordinator>,
+    /// SSDF evidence recorder, when the pipeline is configured.
+    ///
+    /// Held here as well as on the coordinator because the apply path does not
+    /// go through `commit_operation` -- it issues the destroy directly -- and
+    /// that is the only coordinator call that emits `apply_intent` and
+    /// `result_receipt`. Proposal and approval come from the coordinator;
+    /// execution has to come from here.
+    evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
     waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
     lab_mode: bool,
     tool_router: ToolRouter<Self>,
@@ -123,6 +131,16 @@ pub struct ProxmoxServer {
 
 impl ProxmoxServer {
     /// Build the server over a loaded inventory and its per-cluster clients.
+    ///
+    /// **`coordinator` and `evidence` must share one recorder.** The
+    /// coordinator emits proposal and approval; this server emits apply intent
+    /// and the receipt, because the apply path issues the destroy directly and
+    /// never reaches `commit_operation`. A coordinator built without the
+    /// recorder produces execution records whose proposal context is missing,
+    /// and one built with a *different* recorder splits a single change across
+    /// two chains -- both verify as valid chains, so neither is reported.
+    /// [`new_with_default_coordinator`](Self::new_with_default_coordinator)
+    /// builds both from one recorder and is the safe entry point.
     #[must_use]
     pub fn new(
         clusters: Arc<ClusterInventory>,
@@ -131,12 +149,14 @@ impl ProxmoxServer {
         coordinator: Arc<mecmcp_changeset::ChangesetCoordinator>,
         waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
         lab_mode: bool,
+        evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
     ) -> Self {
         Self {
             clusters: clusters.clone(),
             clients: clients.clone(),
             index: index.clone(),
             coordinator,
+            evidence,
             waivers,
             lab_mode,
             tool_router: Self::proxmox_tool_router(),
@@ -154,8 +174,9 @@ impl ProxmoxServer {
         index: Arc<GuestIndex>,
         waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
         lab_mode: bool,
+        evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
     ) -> Result<Self, mecmcp_changeset::CoordinatorError> {
-        let coordinator = change_set::build_coordinator(None, lab_mode)?;
+        let coordinator = change_set::build_coordinator(None, lab_mode, evidence.clone())?;
         Ok(Self::new(
             clusters,
             clients,
@@ -163,6 +184,7 @@ impl ProxmoxServer {
             coordinator,
             waivers,
             lab_mode,
+            evidence,
         ))
     }
 
@@ -977,6 +999,18 @@ impl ProxmoxServer {
         };
 
         let caller = Self::caller(&context);
+        // The evidence records belong to *this* call, not to the change set.
+        // `request_id` is the join key transport audit uses, so putting the
+        // change-set id there makes two attempts indistinguishable and breaks
+        // correlation with the tool call that actually did it. The principal is
+        // the caller too: this handler lets a different scoped token apply a set
+        // someone else planned, and naming the planner as executor is false.
+        let apply_request_id = caller
+            .as_ref()
+            .map_or_else(|| "stdio".to_owned(), |ctx| ctx.request_id.to_string());
+        let apply_principal = caller
+            .as_ref()
+            .map_or_else(|| "stdio".to_owned(), |ctx| ctx.token_name.clone());
         if let Err(error) = authorize_call(
             caller.as_ref(),
             "apply_proxmox_change_set",
@@ -994,7 +1028,7 @@ impl ProxmoxServer {
         let coordinator = self.coordinator.clone();
 
         let device = format!("{}/{}", args.cluster, args.vmid);
-        let record = match coordinator.change_set(&args.change_set_id, &device).await {
+        let mut record = match coordinator.change_set(&args.change_set_id, &device).await {
             Ok(record) => record,
             Err(error) => return tool_error(format!("get: {error}")),
         };
@@ -1076,6 +1110,27 @@ impl ProxmoxServer {
             ));
         }
 
+        // A guest is about to be destroyed. This is written -- and, with a spool
+        // attached, persisted -- *before* the DELETE goes out, and refused if it
+        // cannot be. The apply path does not go through `commit_operation`, so
+        // nothing else emits it: without this, an approved destroy completes
+        // with proposal and approval on the record and no execution evidence at
+        // all. A guest destroyed with no record that anyone tried is the exact
+        // state this chain exists to rule out, and `purge` makes it permanent.
+        if let Some(recorder) = &self.evidence
+            && let Err(error) = recorder.apply_intent(
+                &apply_request_id,
+                &record.id,
+                &record.device,
+                &apply_principal,
+            )
+        {
+            return tool_error(format!(
+                "destroy refused: the apply-intent evidence record could not be persisted \
+                 ({error}); the change set is still approved and can be retried"
+            ));
+        }
+
         // Issue the DELETE and get the UPID string.
         let upid_str = match rust_proxmoxmcp_core::guests::destroy_container(
             client,
@@ -1086,7 +1141,47 @@ impl ProxmoxServer {
         .await
         {
             Ok(upid) => upid,
-            Err(error) => return tool_error(error),
+            Err(error) => {
+                // Proxmox answering "no" and the request vanishing are different
+                // facts, and the receipt must not conflate them. An `Api`,
+                // `Unauthorized`, `Denied` or `NotFound` means the server
+                // answered and refused: definitive, and the trail should say so
+                // rather than end at an intent with no outcome. A transport
+                // failure or an unparseable response means the DELETE may have
+                // been accepted -- recording that as a failure would state the
+                // guest still exists when it may not, so the chain is left at
+                // apply intent, which is what "go and look" looks like here.
+                let definitive = matches!(
+                    error,
+                    rust_proxmoxmcp_core::ProxmoxError::Api { .. }
+                        | rust_proxmoxmcp_core::ProxmoxError::Unauthorized
+                        | rust_proxmoxmcp_core::ProxmoxError::Denied(_)
+                        | rust_proxmoxmcp_core::ProxmoxError::NotFound { .. }
+                );
+                if definitive {
+                    if let Some(recorder) = &self.evidence
+                        && let Err(receipt_error) = recorder.result_receipt(
+                            &apply_request_id,
+                            &record.id,
+                            &record.device,
+                            &apply_principal,
+                            false,
+                            &error.to_string(),
+                        )
+                    {
+                        tracing::error!(%receipt_error, "failure receipt not persisted");
+                    }
+                    record.state = mecmcp_changeset::ChangeSetState::Failed;
+                    let _ = self.coordinator.update_change_set(record).await;
+                } else {
+                    tracing::error!(
+                        %error,
+                        "the destroy failed without a definitive answer; the outcome is \
+                         indeterminate and no result receipt is emitted"
+                    );
+                }
+                return tool_error(error);
+            }
         };
 
         // Parse the UPID to extract the node for polling.
@@ -1165,8 +1260,35 @@ impl ProxmoxServer {
 
         // Classify the exit status using the Task 3 classifier.
         let outcome = rust_proxmoxmcp_core::task::classify_exit_status(&exitstatus);
+
+        // Proxmox answered. A failure is recorded as fully as a success -- a
+        // trail that only shows what worked cannot answer the question anyone
+        // asks it. This cannot fail closed: the guest is already gone.
+        if let Some(recorder) = &self.evidence {
+            let succeeded = matches!(outcome, rust_proxmoxmcp_core::task::TaskOutcome::Ok);
+            if let Err(error) = recorder.result_receipt(
+                &apply_request_id,
+                &record.id,
+                &record.device,
+                &apply_principal,
+                succeeded,
+                if succeeded { "" } else { &exitstatus },
+            ) {
+                tracing::error!(
+                    %error,
+                    change_set_id = %record.id,
+                    "the destroy completed but its result receipt could not be persisted; \
+                     the evidence chain ends at apply intent"
+                );
+            }
+        }
+
         match outcome {
             rust_proxmoxmcp_core::task::TaskOutcome::Ok => {
+                record.state = mecmcp_changeset::ChangeSetState::Applied;
+                if let Err(error) = self.coordinator.update_change_set(record).await {
+                    tracing::error!(%error, "could not mark the change set applied");
+                }
                 let response = serde_json::json!({
                     "outcome": "ok",
                     "upid": upid_str,
@@ -1179,6 +1301,15 @@ impl ProxmoxServer {
                 )
             }
             rust_proxmoxmcp_core::task::TaskOutcome::Failed(message) => {
+                // Finalise the set. `result_receipt` is terminal -- it forgets
+                // the change's proposal context -- so leaving this `Approved`
+                // invites a retry whose intent and receipt would carry an empty
+                // digest and principal, which is worse than refusing the retry.
+                // A fresh plan is the correct path after a failed destroy.
+                record.state = mecmcp_changeset::ChangeSetState::Failed;
+                if let Err(error) = self.coordinator.update_change_set(record).await {
+                    tracing::error!(%error, "could not mark the change set failed");
+                }
                 tool_error(format!("task failed: {message}"))
             }
         }

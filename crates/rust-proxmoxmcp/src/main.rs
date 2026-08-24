@@ -200,11 +200,45 @@ async fn main() -> Result<()> {
             .with_context(|| format!("loading {}", args.waivers_file.display()))?,
     );
 
-    match args.common.transport {
+    // Built before serving because the coordinator takes the recorder, and
+    // started eagerly so a misconfiguration stops the server here rather than
+    // at the first change.
+    let evidence = match args.common.evidence.into_config() {
+        Ok(Some(config)) => {
+            tracing::info!(
+                server_id = %config.server_id,
+                run_id = %config.run_id,
+                "SSDF evidence pipeline enabled"
+            );
+            // aws-lc-rs, not ring: this server's rustls is built with that
+            // provider (workspace Cargo.toml), and the fleet is genuinely split.
+            // Taking the provider as a parameter rather than hardcoding one in
+            // mecmcp-audit is what lets both halves use the same transport.
+            let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+            let transport = Arc::new(
+                mecmcp_transport::evidence_transport::EvidenceHttpTransport::new(
+                    args.common.evidence.ca_file(),
+                    provider,
+                )
+                .context("building the SSDF evidence transport")?,
+            );
+            Some(
+                mecmcp_audit::EvidenceService::start_with_transport(config, transport)
+                    .context("starting the SSDF evidence pipeline")?,
+            )
+        }
+        Ok(None) => None,
+        Err(error) => anyhow::bail!("SSDF evidence configuration: {error}"),
+    };
+    let recorder = evidence
+        .as_ref()
+        .map(mecmcp_audit::EvidenceService::recorder);
+
+    let served = match args.common.transport {
         Transport::Stdio => {
             // SIGHUP reloads the inventory in place. Stdio has no token store.
             install_sighup_reload(Arc::clone(&clusters), Arc::clone(&index), None)?;
-            serve_stdio(clusters, clients, index, waivers, args.lab_mode).await
+            serve_stdio(clusters, clients, index, waivers, args.lab_mode, recorder).await
         }
         Transport::StreamableHttp => {
             let token_store = load_http_token_store(&args.common)?;
@@ -272,10 +306,22 @@ async fn main() -> Result<()> {
                 shutdown_timeout,
                 waivers,
                 args.lab_mode,
+                recorder,
             )
             .await
         }
+    };
+
+    // Deliver what is still spooled, whichever way serving ended. Bound rather
+    // than returned directly so the flush runs on the error path too -- which
+    // is exactly when an unshipped trail matters most.
+    if let Some(service) = evidence
+        && let Err(error) = service.shutdown()
+    {
+        tracing::error!(%error, "the SSDF evidence pipeline did not flush cleanly");
     }
+
+    served
 }
 
 fn init_audit(args: &mecmcp_runtime::cli::Cli) -> Result<()> {
@@ -307,10 +353,12 @@ async fn serve_stdio(
     index: Arc<GuestIndex>,
     waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
     lab_mode: bool,
+    evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
 ) -> Result<()> {
-    let handler =
-        ProxmoxServer::new_with_default_coordinator(clusters, clients, index, waivers, lab_mode)
-            .context("build server")?;
+    let handler = ProxmoxServer::new_with_default_coordinator(
+        clusters, clients, index, waivers, lab_mode, evidence,
+    )
+    .context("build server")?;
 
     if lab_mode {
         tracing::warn!(
@@ -422,10 +470,12 @@ async fn serve_http(
     shutdown_timeout: Duration,
     waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
     lab_mode: bool,
+    evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
 ) -> Result<()> {
-    let handler =
-        ProxmoxServer::new_with_default_coordinator(clusters, clients, index, waivers, lab_mode)
-            .context("build server")?;
+    let handler = ProxmoxServer::new_with_default_coordinator(
+        clusters, clients, index, waivers, lab_mode, evidence,
+    )
+    .context("build server")?;
 
     if lab_mode {
         tracing::warn!(

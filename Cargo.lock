@@ -697,7 +697,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1401,8 +1401,8 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mecmcp-audit"
-version = "0.11.0"
-source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.11.0#9a11c95d5be6195fbd37d2d792f9e89397aa32ba"
+version = "0.16.0"
+source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.16.0#a037bb39b2c617b5a41a1206a72a6f192de45de1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1431,8 +1431,8 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-auth"
-version = "0.11.0"
-source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.11.0#9a11c95d5be6195fbd37d2d792f9e89397aa32ba"
+version = "0.16.0"
+source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.16.0#a037bb39b2c617b5a41a1206a72a6f192de45de1"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -1450,8 +1450,8 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-changeset"
-version = "0.11.0"
-source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.11.0#9a11c95d5be6195fbd37d2d792f9e89397aa32ba"
+version = "0.16.0"
+source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.16.0#a037bb39b2c617b5a41a1206a72a6f192de45de1"
 dependencies = [
  "async-trait",
  "getrandom 0.4.3",
@@ -1465,13 +1465,14 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "tracing",
  "url",
 ]
 
 [[package]]
 name = "mecmcp-device"
-version = "0.11.0"
-source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.11.0#9a11c95d5be6195fbd37d2d792f9e89397aa32ba"
+version = "0.16.0"
+source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.16.0#a037bb39b2c617b5a41a1206a72a6f192de45de1"
 dependencies = [
  "async-trait",
  "rustix 1.1.4",
@@ -1486,8 +1487,8 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-http"
-version = "0.11.0"
-source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.11.0#9a11c95d5be6195fbd37d2d792f9e89397aa32ba"
+version = "0.16.0"
+source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.16.0#a037bb39b2c617b5a41a1206a72a6f192de45de1"
 dependencies = [
  "mecmcp-secret",
  "reqwest 0.13.4",
@@ -1501,8 +1502,8 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-inventory"
-version = "0.11.0"
-source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.11.0#9a11c95d5be6195fbd37d2d792f9e89397aa32ba"
+version = "0.16.0"
+source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.16.0#a037bb39b2c617b5a41a1206a72a6f192de45de1"
 dependencies = [
  "mecmcp-secret",
  "serde",
@@ -1515,8 +1516,8 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-job"
-version = "0.11.0"
-source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.11.0#9a11c95d5be6195fbd37d2d792f9e89397aa32ba"
+version = "0.16.0"
+source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.16.0#a037bb39b2c617b5a41a1206a72a6f192de45de1"
 dependencies = [
  "mecmcp-device",
  "thiserror",
@@ -1526,20 +1527,23 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-openapi"
-version = "0.11.0"
-source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.11.0#9a11c95d5be6195fbd37d2d792f9e89397aa32ba"
+version = "0.16.0"
+source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.16.0#a037bb39b2c617b5a41a1206a72a6f192de45de1"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "mecmcp-runtime"
-version = "0.11.0"
-source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.11.0#9a11c95d5be6195fbd37d2d792f9e89397aa32ba"
+version = "0.16.0"
+source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.16.0#a037bb39b2c617b5a41a1206a72a6f192de45de1"
 dependencies = [
  "anyhow",
  "clap",
+ "getrandom 0.4.3",
+ "mecmcp-audit",
  "mecmcp-auth",
+ "mecmcp-secret",
  "rustix 1.1.4",
  "thiserror",
  "tokio",
@@ -1549,8 +1553,8 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-secret"
-version = "0.11.0"
-source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.11.0#9a11c95d5be6195fbd37d2d792f9e89397aa32ba"
+version = "0.16.0"
+source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.16.0#a037bb39b2c617b5a41a1206a72a6f192de45de1"
 dependencies = [
  "rustix 1.1.4",
  "thiserror",
@@ -1559,8 +1563,8 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-server"
-version = "0.11.0"
-source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.11.0#9a11c95d5be6195fbd37d2d792f9e89397aa32ba"
+version = "0.16.0"
+source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.16.0#a037bb39b2c617b5a41a1206a72a6f192de45de1"
 dependencies = [
  "http",
  "mecmcp-audit",
@@ -1573,8 +1577,8 @@ dependencies = [
 
 [[package]]
 name = "mecmcp-transport"
-version = "0.11.0"
-source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.11.0#9a11c95d5be6195fbd37d2d792f9e89397aa32ba"
+version = "0.16.0"
+source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.16.0#a037bb39b2c617b5a41a1206a72a6f192de45de1"
 dependencies = [
  "axum",
  "axum-server",
@@ -1689,7 +1693,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2255,7 +2259,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2312,7 +2316,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2731,7 +2735,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3319,7 +3323,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
