@@ -39,7 +39,7 @@ tracing          = { workspace = true }
 [dev-dependencies]
 mecmcp-auth      = { workspace = true }
 mecmcp-transport = { workspace = true }
-reqwest          = { version = "0.12", features = ["json"] }
+reqwest          = { version = "0.13", features = ["json"] }
 rust-proxmoxmcp-core = { workspace = true, features = ["testing"] }
 serde_json       = { workspace = true }
 tempfile         = "3"
