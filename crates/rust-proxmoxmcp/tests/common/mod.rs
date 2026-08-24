@@ -224,6 +224,7 @@ impl TestServer {
             Arc::clone(&index),
             waivers,
             lab_mode,
+            None,
         )
         .expect("build server");
         let token_store_arc =

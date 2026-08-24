@@ -67,6 +67,7 @@ pub(crate) struct DestroyAction {
 pub(crate) fn build_coordinator(
     state_path: Option<&std::path::Path>,
     lab_mode: bool,
+    evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
 ) -> Result<Arc<ChangesetCoordinator>, CoordinatorError> {
     let limits = OperationLimits {
         max_operations: 100,
@@ -78,7 +79,10 @@ pub(crate) fn build_coordinator(
         max_preview_bytes: 256 * 1024,
     };
     let approval_ttl = Duration::from_secs(3600);
-    let coordinator = ChangesetCoordinator::load(state_path, limits, approval_ttl, lab_mode)?;
+    let mut coordinator = ChangesetCoordinator::load(state_path, limits, approval_ttl, lab_mode)?;
+    if let Some(recorder) = evidence {
+        coordinator = coordinator.with_evidence(recorder);
+    }
     Ok(Arc::new(coordinator))
 }
 

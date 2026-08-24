@@ -278,9 +278,10 @@ mod tests {
         )));
         let waivers = Arc::new(rust_proxmoxmcp_core::waiver::WaiverFile::empty());
 
-        let handler =
-            ProxmoxServer::new_with_default_coordinator(clusters, clients, index, waivers, false)
-                .expect("build server");
+        let handler = ProxmoxServer::new_with_default_coordinator(
+            clusters, clients, index, waivers, false, None,
+        )
+        .expect("build server");
 
         // With the flag OFF, building the router with authenticated token store
         // should succeed, but serving it on 0.0.0.0 without TLS should be refused.

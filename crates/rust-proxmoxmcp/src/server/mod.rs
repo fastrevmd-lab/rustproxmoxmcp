@@ -154,8 +154,9 @@ impl ProxmoxServer {
         index: Arc<GuestIndex>,
         waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
         lab_mode: bool,
+        evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
     ) -> Result<Self, mecmcp_changeset::CoordinatorError> {
-        let coordinator = change_set::build_coordinator(None, lab_mode)?;
+        let coordinator = change_set::build_coordinator(None, lab_mode, evidence)?;
         Ok(Self::new(
             clusters,
             clients,
