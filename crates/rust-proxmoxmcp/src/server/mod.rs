@@ -116,6 +116,14 @@ pub struct ProxmoxServer {
     clients: Arc<BTreeMap<String, ProxmoxClient>>,
     index: Arc<GuestIndex>,
     coordinator: Arc<mecmcp_changeset::ChangesetCoordinator>,
+    /// SSDF evidence recorder, when the pipeline is configured.
+    ///
+    /// Held here as well as on the coordinator because the apply path does not
+    /// go through `commit_operation` -- it issues the destroy directly -- and
+    /// that is the only coordinator call that emits `apply_intent` and
+    /// `result_receipt`. Proposal and approval come from the coordinator;
+    /// execution has to come from here.
+    evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
     waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
     lab_mode: bool,
     tool_router: ToolRouter<Self>,
@@ -131,12 +139,14 @@ impl ProxmoxServer {
         coordinator: Arc<mecmcp_changeset::ChangesetCoordinator>,
         waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
         lab_mode: bool,
+        evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
     ) -> Self {
         Self {
             clusters: clusters.clone(),
             clients: clients.clone(),
             index: index.clone(),
             coordinator,
+            evidence,
             waivers,
             lab_mode,
             tool_router: Self::proxmox_tool_router(),
@@ -156,7 +166,7 @@ impl ProxmoxServer {
         lab_mode: bool,
         evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
     ) -> Result<Self, mecmcp_changeset::CoordinatorError> {
-        let coordinator = change_set::build_coordinator(None, lab_mode, evidence)?;
+        let coordinator = change_set::build_coordinator(None, lab_mode, evidence.clone())?;
         Ok(Self::new(
             clusters,
             clients,
@@ -164,6 +174,7 @@ impl ProxmoxServer {
             coordinator,
             waivers,
             lab_mode,
+            evidence,
         ))
     }
 
@@ -1077,6 +1088,23 @@ impl ProxmoxServer {
             ));
         }
 
+        // A guest is about to be destroyed. This is written -- and, with a spool
+        // attached, persisted -- *before* the DELETE goes out, and refused if it
+        // cannot be. The apply path does not go through `commit_operation`, so
+        // nothing else emits it: without this, an approved destroy completes
+        // with proposal and approval on the record and no execution evidence at
+        // all. A guest destroyed with no record that anyone tried is the exact
+        // state this chain exists to rule out, and `purge` makes it permanent.
+        if let Some(recorder) = &self.evidence
+            && let Err(error) =
+                recorder.apply_intent(&record.id, &record.id, &record.device, &record.owner)
+        {
+            return tool_error(format!(
+                "destroy refused: the apply-intent evidence record could not be persisted \
+                 ({error}); the change set is still approved and can be retried"
+            ));
+        }
+
         // Issue the DELETE and get the UPID string.
         let upid_str = match rust_proxmoxmcp_core::guests::destroy_container(
             client,
@@ -1166,6 +1194,28 @@ impl ProxmoxServer {
 
         // Classify the exit status using the Task 3 classifier.
         let outcome = rust_proxmoxmcp_core::task::classify_exit_status(&exitstatus);
+
+        // Proxmox answered. A failure is recorded as fully as a success -- a
+        // trail that only shows what worked cannot answer the question anyone
+        // asks it. This cannot fail closed: the guest is already gone.
+        if let Some(recorder) = &self.evidence {
+            let succeeded = matches!(outcome, rust_proxmoxmcp_core::task::TaskOutcome::Ok);
+            if let Err(error) = recorder.result_receipt(
+                &record.id,
+                &record.id,
+                &record.device,
+                succeeded,
+                if succeeded { "" } else { &exitstatus },
+            ) {
+                tracing::error!(
+                    %error,
+                    change_set_id = %record.id,
+                    "the destroy completed but its result receipt could not be persisted; \
+                     the evidence chain ends at apply intent"
+                );
+            }
+        }
+
         match outcome {
             rust_proxmoxmcp_core::task::TaskOutcome::Ok => {
                 let response = serde_json::json!({
