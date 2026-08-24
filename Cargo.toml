@@ -61,3 +61,8 @@ mecmcp-runtime   = { version = "0.16.0", git = "https://github.com/fastrevmd-lab
 mecmcp-secret    = { version = "0.16.0", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.16.0" }
 mecmcp-server    = { version = "0.16.0", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.16.0" }
 mecmcp-transport = { version = "0.16.0", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.16.0" }
+
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+strip         = "symbols"
