@@ -69,11 +69,27 @@ else
     echo "    /etc/proxmoxmcp/clusters.json exists; not overwriting"
 fi
 
-if [ ! -f /var/lib/proxmoxmcp/tokens.json ]; then
-    echo "    Creating empty tokens.json..."
-    printf '{"version":1,"tokens":[]}\n' > /var/lib/proxmoxmcp/tokens.json
-    chown proxmoxmcp:proxmoxmcp /var/lib/proxmoxmcp/tokens.json
-    chmod 0600 /var/lib/proxmoxmcp/tokens.json
+# tokens.json moved from /etc/proxmoxmcp to /var/lib/proxmoxmcp (#22).
+#
+# Create an empty store ONLY when no legacy store exists. The runtime prefers an
+# existing primary, so writing an empty file here while the live tokens are still
+# at the legacy path would shadow them: the service starts and rejects every
+# existing bearer token. A silent auth wipe on upgrade is worse than a refusal.
+#
+# The file is never copied automatically — that would leave a duplicate secret
+# behind, which is what the stale-secret scan exists to flag.
+if [ ! -e /var/lib/proxmoxmcp/tokens.json ]; then
+    if [ -e /etc/proxmoxmcp/tokens.json ]; then
+        printf '%s\n' ">> Not creating /var/lib/proxmoxmcp/tokens.json: a token store already exists at"
+        printf '%s\n' ">> /etc/proxmoxmcp/tokens.json. The server reads it via the legacy fallback and warns."
+        printf '%s\n' ">> Migrate it deliberately, then remove the old copy:"
+        printf '%s\n' ">>   install -m 0600 -o proxmoxmcp -g proxmoxmcp /etc/proxmoxmcp/tokens.json /var/lib/proxmoxmcp/tokens.json"
+        printf '%s\n' ">>   rm /etc/proxmoxmcp/tokens.json"
+    else
+        printf '{"version":1,"tokens":[]}\n' > /var/lib/proxmoxmcp/tokens.json
+        chown proxmoxmcp:proxmoxmcp /var/lib/proxmoxmcp/tokens.json
+        chmod 0600 /var/lib/proxmoxmcp/tokens.json
+    fi
 else
     echo "    /var/lib/proxmoxmcp/tokens.json exists; not overwriting"
 fi

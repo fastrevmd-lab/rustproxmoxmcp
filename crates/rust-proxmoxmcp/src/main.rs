@@ -401,14 +401,18 @@ fn load_http_token_store(
     args: &mecmcp_runtime::cli::Cli,
 ) -> Result<Option<Arc<TokenStoreFile<ProxmoxGrant>>>> {
     match (&args.tokens_file, args.allow_no_auth) {
-        (Some(_path), false) => {
-            // Resolve token path with fallback to /etc for upgrade compatibility.
-            // Primary: /var/lib/proxmoxmcp/tokens.json (writable under ProtectSystem=strict)
-            // Fallback: /etc/proxmoxmcp/tokens.json (read-only, deprecated)
+        (Some(path), false) => {
+            // The CONFIGURED path is the primary; /etc is the legacy fallback, so an
+            // upgrade whose tokens have not been moved yet still starts.
+            //
+            // Do NOT discard the CLI value and resolve between two hardcoded paths.
+            // An operator who passes `--tokens-file /some/other.json` would then be
+            // silently served a different file — a misconfiguration that looks like
+            // success, which is worse than refusing.
             use std::path::Path;
-            let primary = Path::new("/var/lib/proxmoxmcp/tokens.json");
-            let fallback = Path::new("/etc/proxmoxmcp/tokens.json");
-            let resolved = mecmcp_auth::resolve_token_path(primary, fallback)
+            const LEGACY_TOKENS: &str = "/etc/proxmoxmcp/tokens.json";
+            let fallback = Path::new(LEGACY_TOKENS);
+            let resolved = mecmcp_auth::resolve_token_path(path, fallback)
                 .with_context(|| "resolving token file path")?;
 
             if let (true, Some(fallback_from)) = (resolved.used_fallback, &resolved.fallback_from) {
