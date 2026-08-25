@@ -18,8 +18,8 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use rust_proxmoxmcp_core::{
-    Intent, ProxmoxGrant, catalog::read_tool, client::ProxmoxClient, inventory::ClusterInventory,
-    resolve::GuestIndex, selector::GuestType, tier::WRITE_TOOLS,
+    Intent, ProxmoxGrant, catalog::read_tool, client::ProxmoxClient, guests::LifecycleVerb,
+    inventory::ClusterInventory, resolve::GuestIndex, selector::GuestType, tier::WRITE_TOOLS,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -37,6 +37,8 @@ const RESULT_LIMITS: ResultLimits = ResultLimits {
 pub const KNOWN_TOOLS: &[&str] = &[
     "apply_proxmox_change_set",
     "approve_proxmox_change_set",
+    "create_backup",
+    "create_snapshot",
     "get_cluster_status",
     "get_container_config",
     "get_container_ip",
@@ -55,6 +57,13 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "list_tasks",
     "list_templates",
     "plan_proxmox_destroy",
+    "reset_vm",
+    "restart_container",
+    "shutdown_vm",
+    "start_container",
+    "start_vm",
+    "stop_container",
+    "stop_vm",
 ];
 
 /// Arguments for a cluster-scoped read.
@@ -84,6 +93,46 @@ pub struct GuestArgs {
     pub cluster: String,
     /// Numeric guest id, unique within the cluster.
     pub vmid: u32,
+}
+
+/// Arguments for taking a snapshot of one guest.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SnapshotArgs {
+    /// Inventory name of the cluster.
+    pub cluster: String,
+    /// Numeric guest id, unique within the cluster.
+    pub vmid: u32,
+    /// Snapshot name, as it will appear in `list_snapshots`.
+    pub snapname: String,
+    /// Optional free-text description. An empty one is omitted.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// Arguments for backing up one guest.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BackupArgs {
+    /// Inventory name of the cluster.
+    pub cluster: String,
+    /// Numeric guest id, unique within the cluster.
+    pub vmid: u32,
+    /// Target storage, as reported by `get_storage`.
+    pub storage: String,
+    /// vzdump mode: `snapshot`, `suspend`, or `stop`.
+    ///
+    /// Defaults to `snapshot`, the only mode that does not interrupt the
+    /// guest — which is what keeps `create_backup` out of the interrupting
+    /// set and therefore usable on a protected guest.
+    #[serde(default = "default_backup_mode")]
+    pub mode: String,
+    /// Optional compression: `zstd`, `lzo`, `gzip`.
+    #[serde(default)]
+    pub compress: Option<String>,
+}
+
+/// vzdump's non-interrupting mode.
+fn default_backup_mode() -> String {
+    "snapshot".to_owned()
 }
 
 /// Arguments for a storage-scoped read.
@@ -442,6 +491,186 @@ impl ProxmoxServer {
         .await
     }
 
+    /// Stage 1 + stage 2 authorization for a low-tier guest call.
+    ///
+    /// Shared by the additive tools, which need the same gate as the
+    /// lifecycle verbs but no verb dispatch. Interruption is derived from the
+    /// tool name inside `Intent::low`, so an additive tool cannot accidentally
+    /// be treated as interrupting or vice versa.
+    async fn authorize_low(
+        &self,
+        tool: &'static str,
+        args: &GuestArgs,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<rust_proxmoxmcp_core::AuthorizedGuest, Box<CallToolResult>> {
+        use rust_proxmoxmcp_core::protect::{Override, destructive_allowed, protection_of};
+
+        let caller = Self::caller(context);
+        if let Err(error) = authorize_call(caller.as_ref(), tool, Some(&args.cluster), WRITE_TOOLS)
+        {
+            return Err(Box::new(tool_error(error)));
+        }
+
+        let client = self.client_for(&args.cluster)?;
+        let grant = resolve_grant(caller.as_ref())?;
+
+        let resolved = self
+            .index
+            .resolve(client, &args.cluster, args.vmid)
+            .await
+            .map_err(|error| Box::new(tool_error(error)))?;
+        let protection = protection_of(client.cluster(), Some(&resolved), false);
+
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_secs();
+        let override_ = destructive_allowed(
+            &protection,
+            &self.waivers,
+            &args.cluster,
+            args.vmid,
+            now_unix,
+            self.lab_mode,
+        );
+        let override_applies = !matches!(override_, Override::None);
+
+        self.index
+            .authorize(
+                client,
+                &args.cluster,
+                args.vmid,
+                &grant,
+                Intent::low_with_override(tool, override_applies),
+            )
+            .await
+            .map_err(|error| Box::new(tool_error(error)))
+    }
+
+    /// Serve one low-tier lifecycle verb.
+    ///
+    /// Shared by all seven lifecycle tools because the only differences are
+    /// the verb, the guest type the tool name implies, and the audit label.
+    /// Writing them out seven times would be seven chances to forget the
+    /// protection check.
+    async fn serve_lifecycle(
+        &self,
+        tool: &'static str,
+        verb: LifecycleVerb,
+        required_type: GuestType,
+        args: &GuestArgs,
+        context: &RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        use rust_proxmoxmcp_core::protect::{Override, destructive_allowed, protection_of};
+
+        let caller = Self::caller(context);
+        if let Err(error) = authorize_call(caller.as_ref(), tool, Some(&args.cluster), WRITE_TOOLS)
+        {
+            return tool_error(error);
+        }
+
+        let client = match self.client_for(&args.cluster) {
+            Ok(client) => client,
+            Err(result) => return *result,
+        };
+
+        let grant = match resolve_grant(caller.as_ref()) {
+            Ok(grant) => grant,
+            Err(error) => return *error,
+        };
+
+        // Resolve first so protection can be computed before authorization,
+        // exactly as the destroy path does: a waiver or lab mode has to be
+        // known before the gate runs, not after it has already refused.
+        let resolved = match self.index.resolve(client, &args.cluster, args.vmid).await {
+            Ok(guest) => guest,
+            Err(error) => return tool_error(error),
+        };
+        let protection = protection_of(client.cluster(), Some(&resolved), false);
+
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_secs();
+
+        // Reuses the destroy path's override rules. An interrupting call is not
+        // destructive, but the question a waiver answers is the same one:
+        // may this protected guest be disrupted right now?
+        let override_ = destructive_allowed(
+            &protection,
+            &self.waivers,
+            &args.cluster,
+            args.vmid,
+            now_unix,
+            self.lab_mode,
+        );
+        let override_applies = !matches!(override_, Override::None);
+
+        let authorized = match self
+            .index
+            .authorize(
+                client,
+                &args.cluster,
+                args.vmid,
+                &grant,
+                Intent::low_with_override(tool, override_applies),
+            )
+            .await
+        {
+            Ok(authorized) => authorized,
+            Err(error) => return tool_error(error),
+        };
+
+        let guest = authorized.guest();
+        if guest.r#type != required_type {
+            return tool_error(format!(
+                "{tool} requires {} guest {}, but it is {}",
+                required_type.path_segment(),
+                args.vmid,
+                guest.r#type.path_segment()
+            ));
+        }
+
+        let upid = match rust_proxmoxmcp_core::guests::lifecycle(
+            client,
+            &guest.node,
+            guest.r#type,
+            guest.vmid,
+            verb,
+        )
+        .await
+        {
+            Ok(upid) => upid,
+            Err(error) => return tool_error(error),
+        };
+
+        tracing::info!(
+            target: "audit",
+            tool,
+            cluster = args.cluster,
+            vmid = guest.vmid,
+            node = %guest.node,
+            guest_name = %guest.name,
+            tier = "low",
+            interrupts = rust_proxmoxmcp_core::tier::interrupts_service(tool),
+            protection = %authorized.protection().summary(),
+            override_applied = override_applies,
+            scope = scope_desc(caller.as_ref()),
+            upid = %upid,
+            "proxmox lifecycle call"
+        );
+
+        tool_result::<_, String>(
+            Ok(serde_json::json!({
+                "upid": upid,
+                "vmid": guest.vmid,
+                "node": guest.node,
+            })),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
+    }
+
     #[tool(
         name = "get_container_ip",
         description = "Network interfaces and addresses of one LXC guest."
@@ -661,6 +890,248 @@ impl ProxmoxServer {
             &context,
         )
         .await
+    }
+
+    #[tool(name = "start_vm", description = "Start a stopped QEMU guest.")]
+    async fn start_vm(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_lifecycle(
+            "start_vm",
+            LifecycleVerb::Start,
+            GuestType::Qemu,
+            &args,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "stop_vm",
+        description = "Stop a QEMU guest immediately, without asking the guest OS."
+    )]
+    async fn stop_vm(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_lifecycle(
+            "stop_vm",
+            LifecycleVerb::Stop,
+            GuestType::Qemu,
+            &args,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "shutdown_vm",
+        description = "Ask a QEMU guest's OS to shut down cleanly."
+    )]
+    async fn shutdown_vm(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_lifecycle(
+            "shutdown_vm",
+            LifecycleVerb::Shutdown,
+            GuestType::Qemu,
+            &args,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(name = "reset_vm", description = "Hard power-cycle a QEMU guest.")]
+    async fn reset_vm(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_lifecycle(
+            "reset_vm",
+            LifecycleVerb::Reset,
+            GuestType::Qemu,
+            &args,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(name = "start_container", description = "Start a stopped LXC guest.")]
+    async fn start_container(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_lifecycle(
+            "start_container",
+            LifecycleVerb::Start,
+            GuestType::Lxc,
+            &args,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "stop_container",
+        description = "Stop an LXC guest immediately."
+    )]
+    async fn stop_container(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_lifecycle(
+            "stop_container",
+            LifecycleVerb::Stop,
+            GuestType::Lxc,
+            &args,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(name = "restart_container", description = "Reboot an LXC guest.")]
+    async fn restart_container(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_lifecycle(
+            "restart_container",
+            LifecycleVerb::Reboot,
+            GuestType::Lxc,
+            &args,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "create_snapshot",
+        description = "Take a snapshot of one guest. Additive, so permitted on a protected guest."
+    )]
+    async fn create_snapshot(
+        &self,
+        Parameters(args): Parameters<SnapshotArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        let guest_args = GuestArgs {
+            cluster: args.cluster.clone(),
+            vmid: args.vmid,
+        };
+        let authorized = match self
+            .authorize_low("create_snapshot", &guest_args, &context)
+            .await
+        {
+            Ok(authorized) => authorized,
+            Err(result) => return *result,
+        };
+        let guest = authorized.guest();
+
+        let upid = match rust_proxmoxmcp_core::guests::create_snapshot(
+            match self.client_for(&args.cluster) {
+                Ok(client) => client,
+                Err(result) => return *result,
+            },
+            &guest.node,
+            guest.r#type,
+            guest.vmid,
+            &args.snapname,
+            args.description.as_deref(),
+        )
+        .await
+        {
+            Ok(upid) => upid,
+            Err(error) => return tool_error(error),
+        };
+
+        tracing::info!(
+            target: "audit",
+            tool = "create_snapshot",
+            cluster = args.cluster,
+            vmid = guest.vmid,
+            node = %guest.node,
+            tier = "low",
+            interrupts = false,
+            protection = %authorized.protection().summary(),
+            snapname = %args.snapname,
+            upid = %upid,
+            "proxmox snapshot created"
+        );
+
+        tool_result::<_, String>(
+            Ok(serde_json::json!({ "upid": upid, "vmid": guest.vmid, "node": guest.node })),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
+    }
+
+    #[tool(
+        name = "create_backup",
+        description = "Back up one guest with vzdump. Additive, so permitted on a protected guest."
+    )]
+    async fn create_backup(
+        &self,
+        Parameters(args): Parameters<BackupArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        let guest_args = GuestArgs {
+            cluster: args.cluster.clone(),
+            vmid: args.vmid,
+        };
+        let authorized = match self
+            .authorize_low("create_backup", &guest_args, &context)
+            .await
+        {
+            Ok(authorized) => authorized,
+            Err(result) => return *result,
+        };
+        let guest = authorized.guest();
+
+        let upid = match rust_proxmoxmcp_core::guests::create_backup(
+            match self.client_for(&args.cluster) {
+                Ok(client) => client,
+                Err(result) => return *result,
+            },
+            &guest.node,
+            guest.vmid,
+            &args.storage,
+            &args.mode,
+            args.compress.as_deref(),
+        )
+        .await
+        {
+            Ok(upid) => upid,
+            Err(error) => return tool_error(error),
+        };
+
+        tracing::info!(
+            target: "audit",
+            tool = "create_backup",
+            cluster = args.cluster,
+            vmid = guest.vmid,
+            node = %guest.node,
+            tier = "low",
+            interrupts = false,
+            protection = %authorized.protection().summary(),
+            storage = %args.storage,
+            mode = %args.mode,
+            upid = %upid,
+            "proxmox backup started"
+        );
+
+        tool_result::<_, String>(
+            Ok(serde_json::json!({ "upid": upid, "vmid": guest.vmid, "node": guest.node })),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
     }
 
     #[tool(
@@ -1399,10 +1870,41 @@ mod tests {
             "apply_proxmox_change_set",
         ];
 
+        // Low-tier tools added in 0.4. Listed rather than derived from
+        // WRITE_TOOLS, because that registry deliberately names tools no
+        // release has registered yet — deriving from it would let this test
+        // pass for a tool that does not exist.
+        let low_tools = [
+            "create_backup",
+            "create_snapshot",
+            "reset_vm",
+            "restart_container",
+            "shutdown_vm",
+            "start_container",
+            "start_vm",
+            "stop_container",
+            "stop_vm",
+        ];
+
         for tool in KNOWN_TOOLS {
             assert!(
-                read_tools.contains(tool) || changeset_tools.contains(tool),
-                "{tool} is in KNOWN_TOOLS but not in READ_TOOLS or changeset tools"
+                read_tools.contains(tool)
+                    || changeset_tools.contains(tool)
+                    || low_tools.contains(tool),
+                "{tool} is in KNOWN_TOOLS but not in READ_TOOLS, changeset, or low-tier tools"
+            );
+        }
+
+        // Every low-tier tool is registered, and every one is in WRITE_TOOLS so
+        // a wildcard token cannot reach it.
+        for tool in &low_tools {
+            assert!(
+                KNOWN_TOOLS.contains(tool),
+                "low-tier tool {tool} missing from KNOWN_TOOLS"
+            );
+            assert!(
+                rust_proxmoxmcp_core::tier::WRITE_TOOLS.contains(tool),
+                "low-tier tool {tool} is not in WRITE_TOOLS, so a wildcard token would reach it"
             );
         }
 

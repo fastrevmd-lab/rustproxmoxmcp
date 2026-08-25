@@ -150,3 +150,113 @@ async fn an_unknown_guest_is_not_found_and_never_yields_an_authorized_guest() {
         .expect_err("absent");
     assert!(matches!(error, ProxmoxError::NotFound { .. }));
 }
+
+/// A grant that reaches every guest and carries the low action tier.
+fn low_grant() -> ProxmoxGrant {
+    ProxmoxGrant {
+        guests: vec!["*".to_owned()],
+        actions: vec![ProxmoxAction::Read, ProxmoxAction::Low],
+    }
+}
+
+#[tokio::test]
+async fn a_protected_guest_refuses_an_interrupting_low_call() {
+    let (index, client, _server) = fixture().await;
+
+    // 905 carries tag "protected". A stop destroys nothing — it is Tier::Low —
+    // but taking a protected guest out of service is exactly what protection
+    // exists to prevent. Before 0.4 the gate keyed on Destructive alone and
+    // this call would have succeeded.
+    let error = index
+        .authorize(&client, "pve3", 905, &low_grant(), Intent::low("stop_vm"))
+        .await
+        .expect_err("a protected guest must refuse an interrupting call");
+
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("protected"),
+        "the refusal must name protection, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("interrupting"),
+        "the refusal must say why it was refused, got: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn a_protected_guest_still_allows_an_additive_low_call() {
+    let (index, client, _server) = fixture().await;
+
+    // The complement, and the reason protection is not simply "no mutation":
+    // snapshotting protected guests before an upgrade is the most common
+    // operation in this lab. All five guests upgraded on 2026-08-25 were
+    // tagged protected.
+    let authorized = index
+        .authorize(
+            &client,
+            "pve3",
+            905,
+            &low_grant(),
+            Intent::low("create_snapshot"),
+        )
+        .await
+        .expect("snapshotting a protected guest must remain possible");
+
+    assert!(
+        authorized.protection().is_protected(),
+        "the guest is still reported as protected; it is the call that is permitted"
+    );
+}
+
+#[tokio::test]
+async fn an_override_lets_an_interrupting_call_through() {
+    let (index, client, _server) = fixture().await;
+
+    // `--lab-mode` or a time-boxed waiver resolves to override_applies=true at
+    // the call site; this is the gate honouring it.
+    let authorized = index
+        .authorize(
+            &client,
+            "pve3",
+            905,
+            &low_grant(),
+            Intent::low_with_override("stop_vm", true),
+        )
+        .await
+        .expect("an override must permit the interrupting call");
+
+    assert!(authorized.protection().is_protected());
+}
+
+#[tokio::test]
+async fn an_unprotected_guest_takes_an_interrupting_call_without_an_override() {
+    let (index, client, _server) = fixture().await;
+
+    // 606 is tagged "disposable". Protection is what holds a call back, not
+    // the interrupting classification by itself.
+    index
+        .authorize(&client, "pve3", 606, &low_grant(), Intent::low("stop_vm"))
+        .await
+        .expect("an unprotected guest needs no override");
+}
+
+#[tokio::test]
+async fn a_read_only_grant_cannot_reach_a_low_tool() {
+    let (index, client, _server) = fixture().await;
+
+    // Protection and the action tier are independent gates. This one is the
+    // tier: the grant simply does not carry `low`.
+    let read_only = ProxmoxGrant {
+        guests: vec!["*".to_owned()],
+        actions: vec![ProxmoxAction::Read],
+    };
+    let error = index
+        .authorize(&client, "pve3", 606, &read_only, Intent::low("start_vm"))
+        .await
+        .expect_err("a read-only grant must not reach a low tool");
+
+    assert!(
+        error.to_string().contains("Low") || error.to_string().contains("low"),
+        "got: {error}"
+    );
+}
