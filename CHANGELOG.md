@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-08-25
+
+### Added
+
+- **SSDF evidence pipeline** (mecmcp#292). Mutating operations now emit
+  execution evidence, including around the destroy path, and the evidence is
+  flushed even when serving ends in an error. Receipts name the executor.
+
+### Security
+
+- **Tier-2 hardening.** `tokens.json` moves to `/var/lib`, the systemd unit is
+  sandboxed, the audit HMAC key is guarded, and stale secrets are scanned for.
+- **The legacy token store is no longer shadowed by an empty one.** An upgrade
+  that found an empty primary could previously mask a populated legacy store,
+  which reads as "every credential was rejected" rather than as a packaging
+  fault.
+- **Token paths compare byte-for-byte**, not by `Path` equality, and the legacy
+  fallback is restricted to the canonical path only.
+- Packaging now probes real egress enforcement rather than implying it.
+
+### Changed
+
+- `mecmcp` 0.17.0 -> 0.19.0, converging with the rest of the fleet.
+- `rmcp` 3.1.2 -> 3.1.4.
+- Pinned toolchain moved to 1.98.0, alongside the builder image, with a CI
+  toolchain-pin guard and a Docker build in CI.
+- Dependabot now watches the Dockerfile. `reqwest` 0.12 -> 0.13, `rcgen` 0.13 ->
+  0.14.
+
+### Note on the version
+
+Minor rather than patch: this release adds the evidence pipeline, which is a
+feature, not a fix.
+
 ## [0.3.2] - 2026-08-19
 
 ### Added
