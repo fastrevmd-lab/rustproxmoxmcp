@@ -450,12 +450,32 @@ async fn main() -> Result<()> {
 /// subscriber already installed is not an error worth refusing a token
 /// operation over.
 fn init_token_audit() {
-    let _ = mecmcp_audit::init_tracing(&mecmcp_audit::AuditConfig {
-        format: mecmcp_audit::AuditFormat::parse("text"),
-        audit_log_file: None,
-        redaction: None,
-        journald: false,
-    });
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    // `audit=info` is added on top of whatever RUST_LOG says, rather than
+    // relying on the default filter.
+    //
+    // `mecmcp_audit::init_tracing` builds its filter with
+    // `EnvFilter::try_from_default_env()`, so a target-specific RUST_LOG such
+    // as `rust_proxmoxmcp=debug` produces a filter that does not enable the
+    // `audit` target at all. Measured: with that value set, `set-scopes --yes`
+    // widened the token and printed nothing. A privilege escalation that an
+    // environment variable can silence is not audited.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        .add_directive(
+            "audit=info"
+                .parse()
+                .expect("a static directive always parses"),
+        );
+
+    // `try_init`, not `init`: a subscriber already installed is not a reason
+    // to refuse a token operation.
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .try_init();
 }
 
 fn init_audit(args: &mecmcp_runtime::cli::Cli) -> Result<()> {
