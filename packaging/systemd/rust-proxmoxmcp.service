@@ -66,6 +66,13 @@ MemoryDenyWriteExecute=yes
 LockPersonality=yes
 
 # Network access control (allow all for Proxmox API + SSDF endpoint)
+# NOTE: IPAddressAllow/IPAddressDeny are accepted by systemd and reported by
+# `systemctl show`, but are NOT enforced in an unprivileged LXC — systemd cannot
+# attach the cgroup BPF program there. Every guest in this fleet is one. The
+# directives stay because they do enforce on a normal host or privileged
+# container, but do not read them as active protection here. The installer
+# probes real enforcement and prints ENFORCED / NOT ENFORCED / NO POLICY /
+# UNKNOWN. See the operations doc, "Enforcing it where systemd cannot" (mecmcp#322).
 IPAddressDeny=any
 IPAddressAllow=localhost
 IPAddressAllow=link-local

@@ -2,6 +2,98 @@
 # POSIX shell installer for rust-proxmoxmcp on Debian 13 LXC.
 set -eu
 
+die() {
+    printf 'rust-proxmoxmcp installer: %s\n' "$*" >&2
+    exit 1
+}
+
+# Prove whether systemd's IPAddress* filters actually attach here, rather than
+# assuming the unit's declaration means anything. systemd implements them with
+# cgroup eBPF and FAILS OPEN when it cannot load the program -- typical in an
+# unprivileged LXC without host delegation -- so the unit can declare a full
+# egress policy while enforcing none of it. `systemd-analyze security` reads the
+# declaration and cannot tell the difference.
+#
+# Informational by default: a runtime that withholds BPF is a legitimate
+# deployment, and the operator needs to know rather than be blocked. Set
+# PROXMOXMCP_REQUIRE_EGRESS_FILTER=1 to make a non-enforcing host fatal.
+egress_probe_unknown() {
+    require=$1
+    reason=$2
+    printf '%s\n' "egress filter: UNKNOWN ($reason)" >&2
+    # Strict mode must not accept what it could not measure. An unmeasurable
+    # host is exactly as unguaranteed as a non-enforcing one.
+    if [ "$require" = 1 ]; then
+        die 'PROXMOXMCP_REQUIRE_EGRESS_FILTER=1 and egress enforcement could not be determined'
+    fi
+    return 0
+}
+
+report_egress_enforcement() {
+    require=${PROXMOXMCP_REQUIRE_EGRESS_FILTER:-0}
+    probe_unit="rust-proxmoxmcp-egress-probe-$$"
+    unit_path="/etc/systemd/system/rust-proxmoxmcp.service"
+
+    if ! command -v systemd-run >/dev/null; then
+        egress_probe_unknown "$require" 'systemd-run unavailable; cannot probe'
+        return $?
+    fi
+
+    # Two independent conditions have to hold, and conflating them is how the
+    # previous version overstated its result:
+    #   1. the host can attach the cgroup BPF program at all, and
+    #   2. the *installed* unit actually declares an egress policy.
+    # A transient probe only establishes (1). If the installer preserved a
+    # customized unit with no IPAddressDeny, (1) alone would still have printed
+    # ENFORCED and satisfied the strict flag over a service filtering nothing.
+    counters=''
+    if systemd-run --quiet --collect --unit="$probe_unit" \
+        --property=IPAccounting=yes --property=RemainAfterExit=yes \
+        /bin/true >/dev/null 2>&1
+    then
+        counters=$(systemctl show "$probe_unit.service" -p IPEgressBytes --value 2>/dev/null || printf '')
+        systemctl stop "$probe_unit.service" >/dev/null 2>&1 || true
+        systemctl reset-failed "$probe_unit.service" >/dev/null 2>&1 || true
+    else
+        egress_probe_unknown "$require" 'probe unit would not start; run as root to determine'
+        return $?
+    fi
+
+    if [ -z "$counters" ] || [ "$counters" = '[no data]' ]; then
+        printf '%s\n' \
+            'egress filter: NOT ENFORCED' \
+            '  systemd cannot attach its cgroup BPF program here, so the IPAddressAllow/' \
+            '  IPAddressDeny lines in rust-proxmoxmcp.service have no effect. This is normal in' \
+            '  an unprivileged LXC. The unit still applies every other sandbox directive.' \
+            '  Move the control outward to whatever layer sees this workload'"'"'s packets --' \
+            '  guest firewall, host nftables, NetworkPolicy, or cloud security group -- and' \
+            '  deny 169.254.0.0/16 plus the local subnet except your resolver, allow 443 out.' \
+            '  README.md, "Enforcing it where systemd cannot", has the per-runtime' \
+            '  mechanism and a verification command.' >&2
+        if [ "$require" = 1 ]; then
+            die 'PROXMOXMCP_REQUIRE_EGRESS_FILTER=1 and systemd IP filtering is not enforced here'
+        fi
+        return 0
+    fi
+
+    # (1) holds. Now (2): does the unit that was actually installed carry a
+    # policy for the kernel to enforce?
+    if ! grep -Eq '^[[:space:]]*IPAddressDeny[[:space:]]*=[[:space:]]*[^[:space:]]' "$unit_path"; then
+        printf '%s\n' \
+            'egress filter: NO POLICY' \
+            "  This host can enforce systemd IP filtering, but $unit_path declares no" \
+            '  IPAddressDeny. A preserved customized unit overrides the packaged policy;' \
+            '  re-install or add the directives by hand.' >&2
+        if [ "$require" = 1 ]; then
+            die 'PROXMOXMCP_REQUIRE_EGRESS_FILTER=1 and the installed unit declares no egress policy'
+        fi
+        return 0
+    fi
+
+    printf '%s\n' 'egress filter: ENFORCED'
+    return 0
+}
+
 # Refuse if not root
 if [ "$(id -u)" -ne 0 ]; then
     echo "error: this installer must run as root" >&2
@@ -111,6 +203,7 @@ if [ -f packaging/systemd/rust-proxmoxmcp.service ]; then
     echo "    Installing systemd unit..."
     install -m 0644 -o root -g root packaging/systemd/rust-proxmoxmcp.service /etc/systemd/system/rust-proxmoxmcp.service
     systemctl daemon-reload
+    report_egress_enforcement
 else
     echo "    warning: packaging/systemd/rust-proxmoxmcp.service not found; skipping unit install" >&2
 fi
