@@ -450,31 +450,40 @@ async fn main() -> Result<()> {
 /// subscriber already installed is not an error worth refusing a token
 /// operation over.
 fn init_token_audit() {
+    use tracing_subscriber::Layer as _;
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
+    use tracing_subscriber::{EnvFilter, filter::filter_fn, fmt};
 
-    // `audit=info` is added on top of whatever RUST_LOG says, rather than
-    // relying on the default filter.
+    // Two layers, each with its own filter, because the audit record must not
+    // be reachable by RUST_LOG at all.
     //
-    // `mecmcp_audit::init_tracing` builds its filter with
-    // `EnvFilter::try_from_default_env()`, so a target-specific RUST_LOG such
-    // as `rust_proxmoxmcp=debug` produces a filter that does not enable the
-    // `audit` target at all. Measured: with that value set, `set-scopes --yes`
-    // widened the token and printed nothing. A privilege escalation that an
-    // environment variable can silence is not audited.
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
-        .add_directive(
-            "audit=info"
-                .parse()
-                .expect("a static directive always parses"),
-        );
+    // Adding `audit=info` to the env filter is not enough: `EnvFilter` picks
+    // the most specific matching directive, so a field-specific value such as
+    // `audit[{tool}]=off` still wins over a target-only one. Measured — the
+    // widening applied and stderr stayed empty:
+    //
+    //     RUST_LOG=audit=off            audit lines: 1
+    //     RUST_LOG=audit[{tool}]=off    audit lines: 0   <- silent widening
+    //
+    // So the audit layer carries a plain predicate instead, which no
+    // environment variable participates in.
+    let audit_layer = fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(filter_fn(|metadata| metadata.target() == "audit"));
+
+    // Everything else follows RUST_LOG as usual, minus the audit target so a
+    // permissive filter cannot print the record twice.
+    let general_layer = fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_filter(filter_fn(|metadata| metadata.target() != "audit"));
 
     // `try_init`, not `init`: a subscriber already installed is not a reason
     // to refuse a token operation.
     let _ = tracing_subscriber::registry()
-        .with(filter)
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(audit_layer)
+        .with(general_layer)
         .try_init();
 }
 
