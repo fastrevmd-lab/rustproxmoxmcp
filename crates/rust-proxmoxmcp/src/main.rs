@@ -231,6 +231,19 @@ async fn main() -> Result<()> {
             .chain(args.iter().skip(2).cloned())
             .collect::<Vec<_>>();
         let token_cli = TokenCli::parse_from(token_args);
+
+        // Install a subscriber before dispatching. `run_with_grant` emits the
+        // scope change as a `target: "audit"` event, and this path returns
+        // long before the server's `init_audit`, so without one every token
+        // mutation — a mint, a revoke, a privilege widening — is written to
+        // disk having left no record that it happened.
+        //
+        // Deliberately minimal: the token CLI carries no audit flags, so there
+        // is no log file, journald sink, or redaction policy to honour. The
+        // operator running the command is the audience, and stderr is where
+        // they are looking.
+        init_token_audit();
+
         let (action, grant) = token_command_to_action(token_cli.command)?;
         return mecmcp_runtime::token_cmd::run_with_grant::<ProxmoxGrant>(
             action,
@@ -427,6 +440,22 @@ async fn main() -> Result<()> {
     }
 
     served
+}
+
+/// Install a stderr subscriber for the standalone token command path.
+///
+/// Separate from [`init_audit`] because the token CLI has no audit flags to
+/// read: there is no log file, journald sink, or redaction policy on this
+/// path, only an operator at a terminal. Failure is ignored because a
+/// subscriber already installed is not an error worth refusing a token
+/// operation over.
+fn init_token_audit() {
+    let _ = mecmcp_audit::init_tracing(&mecmcp_audit::AuditConfig {
+        format: mecmcp_audit::AuditFormat::parse("text"),
+        audit_log_file: None,
+        redaction: None,
+        journald: false,
+    });
 }
 
 fn init_audit(args: &mecmcp_runtime::cli::Cli) -> Result<()> {
