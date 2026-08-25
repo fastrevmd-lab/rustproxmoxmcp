@@ -100,6 +100,32 @@ fn build_token_grant_from_add(
     }))
 }
 
+/// Build a replacement vendor grant for `TokenCommand::SetScopes`.
+///
+/// Returns `None` when neither `--guests` nor `--actions` is given, which
+/// leaves the existing grant untouched. `--actions` alone is refused: a grant
+/// carries both halves, and inventing a guest selector to satisfy the other
+/// half would grant reach the operator never named.
+fn build_token_grant_from_set_scopes(
+    guests: Option<&Vec<String>>,
+    actions: Option<&Vec<String>>,
+) -> Result<Option<ProxmoxGrant>> {
+    match (guests, actions) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(anyhow::anyhow!(
+            "--actions requires --guests: a grant carries both, and this command \
+             replaces it wholesale rather than merging"
+        )),
+        (Some(guests), actions) => {
+            // Default to read when actions are omitted, matching `add`. An
+            // omitted action list must not silently preserve a destructive
+            // grant the operator is replacing.
+            let actions = actions.cloned().unwrap_or_else(|| vec!["read".to_owned()]);
+            build_token_grant_from_add(guests, &actions)
+        }
+    }
+}
+
 /// Convert `TokenCommand` to `TokenAction` and extract grant for Add.
 fn token_command_to_action(command: TokenCommand) -> Result<(TokenAction, Option<ProxmoxGrant>)> {
     match command {
@@ -143,6 +169,29 @@ fn token_command_to_action(command: TokenCommand) -> Result<(TokenAction, Option
             None,
         )),
         TokenCommand::List { tokens_file } => Ok((TokenAction::List { tokens_file }, None)),
+        TokenCommand::SetScopes {
+            tokens_file,
+            name,
+            devices,
+            tools,
+            guests,
+            actions,
+            yes,
+            server_pid,
+        } => {
+            let grant = build_token_grant_from_set_scopes(guests.as_ref(), actions.as_ref())?;
+            Ok((
+                TokenAction::SetScopes {
+                    tokens_file,
+                    name,
+                    devices,
+                    tools,
+                    yes,
+                    server_pid,
+                },
+                grant,
+            ))
+        }
         TokenCommand::Rotate {
             tokens_file,
             name,
@@ -182,6 +231,19 @@ async fn main() -> Result<()> {
             .chain(args.iter().skip(2).cloned())
             .collect::<Vec<_>>();
         let token_cli = TokenCli::parse_from(token_args);
+
+        // Install a subscriber before dispatching. `run_with_grant` emits the
+        // scope change as a `target: "audit"` event, and this path returns
+        // long before the server's `init_audit`, so without one every token
+        // mutation — a mint, a revoke, a privilege widening — is written to
+        // disk having left no record that it happened.
+        //
+        // Deliberately minimal: the token CLI carries no audit flags, so there
+        // is no log file, journald sink, or redaction policy to honour. The
+        // operator running the command is the audience, and stderr is where
+        // they are looking.
+        init_token_audit();
+
         let (action, grant) = token_command_to_action(token_cli.command)?;
         return mecmcp_runtime::token_cmd::run_with_grant::<ProxmoxGrant>(
             action,
@@ -378,6 +440,51 @@ async fn main() -> Result<()> {
     }
 
     served
+}
+
+/// Install a stderr subscriber for the standalone token command path.
+///
+/// Separate from [`init_audit`] because the token CLI has no audit flags to
+/// read: there is no log file, journald sink, or redaction policy on this
+/// path, only an operator at a terminal. Failure is ignored because a
+/// subscriber already installed is not an error worth refusing a token
+/// operation over.
+fn init_token_audit() {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    use tracing_subscriber::{EnvFilter, filter::filter_fn, fmt};
+
+    // Two layers, each with its own filter, because the audit record must not
+    // be reachable by RUST_LOG at all.
+    //
+    // Adding `audit=info` to the env filter is not enough: `EnvFilter` picks
+    // the most specific matching directive, so a field-specific value such as
+    // `audit[{tool}]=off` still wins over a target-only one. Measured — the
+    // widening applied and stderr stayed empty:
+    //
+    //     RUST_LOG=audit=off            audit lines: 1
+    //     RUST_LOG=audit[{tool}]=off    audit lines: 0   <- silent widening
+    //
+    // So the audit layer carries a plain predicate instead, which no
+    // environment variable participates in.
+    let audit_layer = fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(filter_fn(|metadata| metadata.target() == "audit"));
+
+    // Everything else follows RUST_LOG as usual, minus the audit target so a
+    // permissive filter cannot print the record twice.
+    let general_layer = fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_filter(filter_fn(|metadata| metadata.target() != "audit"));
+
+    // `try_init`, not `init`: a subscriber already installed is not a reason
+    // to refuse a token operation.
+    let _ = tracing_subscriber::registry()
+        .with(audit_layer)
+        .with(general_layer)
+        .try_init();
 }
 
 fn init_audit(args: &mecmcp_runtime::cli::Cli) -> Result<()> {
@@ -653,6 +760,82 @@ mod token_path_tests {
         assert_eq!(
             resolved.path, malformed,
             "the given path must be used verbatim"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod set_scopes_grant_tests {
+    use super::build_token_grant_from_set_scopes;
+    use rust_proxmoxmcp_core::ProxmoxAction;
+
+    /// Neither half given: the existing grant is left alone. `set-scopes` is
+    /// for changing what an operator names, not for clearing what they did not.
+    #[test]
+    fn neither_half_leaves_the_grant_unchanged() {
+        let grant = build_token_grant_from_set_scopes(None, None).unwrap();
+        assert!(grant.is_none(), "an untouched grant must be None");
+    }
+
+    /// A grant carries guests *and* actions. Accepting actions alone would
+    /// force this code to invent a guest selector, granting reach the operator
+    /// never named.
+    #[test]
+    fn actions_without_guests_is_refused() {
+        let error = build_token_grant_from_set_scopes(None, Some(&vec!["destructive".to_owned()]))
+            .expect_err("--actions alone must be refused");
+        assert!(
+            error.to_string().contains("--actions requires --guests"),
+            "the refusal must name the missing flag, got: {error}"
+        );
+    }
+
+    /// Omitting actions defaults to read, matching `add`. It must not preserve
+    /// whatever the token held before: the grant is replaced wholesale, so a
+    /// silent carry-over would keep a destructive action through a call the
+    /// operator believed was narrowing.
+    #[test]
+    fn guests_without_actions_defaults_to_read() {
+        let grant = build_token_grant_from_set_scopes(Some(&vec!["*".to_owned()]), None)
+            .unwrap()
+            .expect("naming guests builds a grant");
+        assert_eq!(grant.actions, vec![ProxmoxAction::Read]);
+        assert_eq!(grant.guests, vec!["*".to_owned()]);
+    }
+
+    /// An unparseable selector is caught at the CLI, not left to produce a
+    /// token that silently admits nothing.
+    #[test]
+    fn an_invalid_selector_is_refused() {
+        let error = build_token_grant_from_set_scopes(Some(&vec!["nonsense:zzz".to_owned()]), None)
+            .expect_err("an invalid selector must be refused");
+        assert!(
+            error.to_string().contains("invalid --guests selector"),
+            "got: {error}"
+        );
+    }
+
+    /// Every action name round-trips, including the one that matters most.
+    #[test]
+    fn destructive_is_accepted_when_named() {
+        let grant = build_token_grant_from_set_scopes(
+            Some(&vec!["*".to_owned()]),
+            Some(&vec![
+                "read".to_owned(),
+                "low".to_owned(),
+                "destructive".to_owned(),
+            ]),
+        )
+        .unwrap()
+        .expect("grant");
+        assert_eq!(
+            grant.actions,
+            vec![
+                ProxmoxAction::Read,
+                ProxmoxAction::Low,
+                ProxmoxAction::Destructive
+            ]
         );
     }
 }
