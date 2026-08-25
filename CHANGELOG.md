@@ -27,7 +27,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `mecmcp` 0.17.0 -> 0.19.0, converging with the rest of the fleet.
+- **`mecmcp` 0.11.0 -> 0.19.0.** That is the jump from the v0.3.2 baseline;
+  0.17.0 was an intermediate untagged step.
+
+### Upgrade note — rolling back needs the state file, not just the binary
+
+`mecmcp-changeset` state carries a schema version. v0.3.2 links 0.11.0, whose
+reader accepts **v1-v3 only**. 0.4.0 links 0.19.0, which accepts v1-v4 and
+**stamps v4 on any write to a store holding a real approval**.
+
+Once this release has written such a store, reinstalling the 0.3.2 binary alone
+will not start — it rejects the state file with `unsupported changeset state
+version 4`. **Roll back with the Proxmox snapshot**, which restores `/var/lib`
+along with the binary. A binary-only downgrade is not a rollback path.
 - `rmcp` 3.1.2 -> 3.1.4.
 - Pinned toolchain moved to 1.98.0, alongside the builder image, with a CI
   toolchain-pin guard and a Docker build in CI.
