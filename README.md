@@ -66,6 +66,31 @@ Release 0.3 delivers the `destructive` tier: plan → approve → apply, with a 
 
 Guest-addressed tools (`get_vm_config`, `get_container_config`, `get_container_ip`, `get_guest_status`, `list_snapshots`) take `(cluster, vmid)` only. The server resolves the guest's current node on every call — accepting a node from the caller is how a request addresses the wrong guest after a migration.
 
+## Changing a token's scopes
+
+`token set-scopes` changes a token's device, tool, guest, and action scopes
+**without reissuing its secret**, so no client is reconfigured:
+
+```
+rust-proxmoxmcp token set-scopes --tokens-file <PATH> --name <NAME> \
+  [--devices <CSV|*>] [--tools <CSV|*>] \
+  [--guests <SELECTORS|*>] [--actions read,low,destructive] [--yes]
+```
+
+An omitted `--devices`/`--tools` leaves that scope unchanged. `--guests` and
+`--actions` replace the grant **wholesale** rather than merging — a guest grant
+is a scope where "I meant to replace it" must not silently mean "I added to
+it" — and `--actions` alone is refused, because a grant carries both halves and
+inventing the other would grant reach nobody named.
+
+Widening is a privilege escalation and is confirmed interactively unless
+`--yes` is passed; narrowing is not, because reducing a scope cannot grant
+anything.
+
+**`--tools '*'` does not reach a mutating tool.** `WRITE_TOOLS` is deliberately
+excluded from the tool wildcard, so `start_vm` and its peers must be named
+explicitly or the preflight refuses with `403 insufficient_scope`.
+
 ## Authorization model
 
 ### Stage 1: Bearer token and scope
