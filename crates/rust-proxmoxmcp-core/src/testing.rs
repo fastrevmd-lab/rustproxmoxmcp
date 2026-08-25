@@ -33,6 +33,13 @@ pub struct RecordedRequest {
     /// Value of the Authorization header, if present.
     #[allow(dead_code)]
     pub authorization: Option<String>,
+    /// Request body, read according to Content-Length.
+    ///
+    /// Empty for a request that carries none. Recorded so a test can assert
+    /// how a mutating call encodes its parameters: Proxmox takes them as a
+    /// form body, and "the right parameters, wrongly encoded" is a failure
+    /// only the bytes reveal.
+    pub body: String,
 }
 
 /// An HTTPS server serving canned routes and recording requests.
@@ -220,16 +227,31 @@ impl TlsMockServer {
         let method = parts[0].to_owned();
         let target = parts[1].to_owned();
 
-        // Parse headers to extract Authorization (case-insensitive).
+        // Parse headers to extract Authorization and Content-Length
+        // (case-insensitive).
         let mut authorization = None;
+        let mut content_length: usize = 0;
         for line in &lines[1..] {
-            if let Some((name, value)) = line.split_once(':')
-                && name.trim().eq_ignore_ascii_case("authorization")
-            {
-                authorization = Some(value.trim().to_owned());
-                break;
+            if let Some((name, value)) = line.split_once(':') {
+                let name = name.trim();
+                if name.eq_ignore_ascii_case("authorization") {
+                    authorization = Some(value.trim().to_owned());
+                } else if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse().unwrap_or(0);
+                }
             }
         }
+
+        // Read exactly Content-Length bytes of body. The header loop above
+        // stopped at the blank line, so nothing of the body has been consumed.
+        let mut body_bytes = vec![0u8; content_length];
+        if content_length > 0 {
+            stream
+                .read_exact(&mut body_bytes)
+                .await
+                .expect("read request body");
+        }
+        let body = String::from_utf8_lossy(&body_bytes).to_string();
 
         // Record the request.
         let path = target.split('?').next().expect("split target").to_owned();
@@ -241,6 +263,7 @@ impl TlsMockServer {
                 target: target.clone(),
                 path,
                 authorization,
+                body,
             });
 
         // Match a route by path (ignoring query string).

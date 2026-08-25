@@ -214,3 +214,139 @@ async fn appends_query_parameters() {
         requests[0].target
     );
 }
+
+#[tokio::test]
+async fn post_form_sends_a_form_encoded_body_and_unwraps_the_upid() {
+    ensure_crypto_provider();
+
+    let server = TlsMockServer::start(vec![Route {
+        path: "/api2/json/nodes/pve2/qemu/905/status/start",
+        status: 200,
+        body: br#"{"data":"UPID:pve2:00001234:0000ABCD:66CB0000:qmstart:905:root@pam!mcp:"}"#,
+    }])
+    .await;
+
+    let secret_path = create_secret_file("not-a-real-secret-0123456789abcdef");
+    let mut cluster = cluster_for(server.uri(), server.ca_pem_path());
+    cluster.token_secret_file = Some(secret_path);
+    let client = ProxmoxClient::new(cluster).expect("client construction");
+
+    let data = client
+        .post_form(
+            "/api2/json/nodes/{node}/qemu/{vmid}/status/start",
+            &[("node", "pve2"), ("vmid", "905")],
+            &[("timeout", "60")],
+        )
+        .await
+        .expect("post succeeds");
+
+    assert_eq!(
+        data.as_str().expect("data is a string"),
+        "UPID:pve2:00001234:0000ABCD:66CB0000:qmstart:905:root@pam!mcp:"
+    );
+
+    let recorded = server.requests();
+    let request = recorded.last().expect("one request recorded");
+    assert_eq!(request.method, "POST", "Proxmox mutations are POST");
+    assert_eq!(
+        request.body, "timeout=60",
+        "parameters go in a form body, not the query string"
+    );
+    assert!(
+        !request.target.contains('?'),
+        "post_form must not smuggle parameters into the query string: {}",
+        request.target
+    );
+}
+
+#[tokio::test]
+async fn post_form_percent_encodes_body_values() {
+    ensure_crypto_provider();
+
+    let server = TlsMockServer::start(vec![Route {
+        path: "/api2/json/nodes/pve2/lxc/610/snapshot",
+        status: 200,
+        body: br#"{"data":"UPID:pve2:1:2:3:vzsnapshot:610:root@pam!mcp:"}"#,
+    }])
+    .await;
+
+    let secret_path = create_secret_file("not-a-real-secret-0123456789abcdef");
+    let mut cluster = cluster_for(server.uri(), server.ca_pem_path());
+    cluster.token_secret_file = Some(secret_path);
+    let client = ProxmoxClient::new(cluster).expect("client construction");
+
+    client
+        .post_form(
+            "/api2/json/nodes/{node}/lxc/{vmid}/snapshot",
+            &[("node", "pve2"), ("vmid", "610")],
+            &[
+                ("snapname", "pre-upgrade"),
+                ("description", "before the wave & after"),
+            ],
+        )
+        .await
+        .expect("post succeeds");
+
+    let recorded = server.requests();
+    let body = &recorded.last().expect("recorded").body;
+    assert!(
+        body.contains("description=before%20the%20wave%20%26%20after"),
+        "an unencoded & would split one parameter into two: {body}"
+    );
+}
+
+#[tokio::test]
+async fn post_form_reports_an_api_error_rather_than_a_upid() {
+    ensure_crypto_provider();
+
+    let server = TlsMockServer::start(vec![Route {
+        path: "/api2/json/nodes/pve2/qemu/905/status/start",
+        status: 500,
+        body: br#"{"errors":{"vmid":"no such VM"}}"#,
+    }])
+    .await;
+
+    let secret_path = create_secret_file("not-a-real-secret-0123456789abcdef");
+    let mut cluster = cluster_for(server.uri(), server.ca_pem_path());
+    cluster.token_secret_file = Some(secret_path);
+    let client = ProxmoxClient::new(cluster).expect("client construction");
+
+    let error = client
+        .post_form(
+            "/api2/json/nodes/{node}/qemu/{vmid}/status/start",
+            &[("node", "pve2"), ("vmid", "905")],
+            &[],
+        )
+        .await
+        .expect_err("a 500 must not be reported as success");
+
+    assert!(
+        matches!(error, ProxmoxError::Api { .. }),
+        "expected Api error, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn post_form_rejects_a_parameter_that_would_break_the_path() {
+    ensure_crypto_provider();
+
+    let server = TlsMockServer::start(vec![]).await;
+    let secret_path = create_secret_file("not-a-real-secret-0123456789abcdef");
+    let mut cluster = cluster_for(server.uri(), server.ca_pem_path());
+    cluster.token_secret_file = Some(secret_path);
+    let client = ProxmoxClient::new(cluster).expect("client construction");
+
+    let error = client
+        .post_form(
+            "/api2/json/nodes/{node}/qemu/{vmid}/status/start",
+            &[("node", "pve2/../../cluster"), ("vmid", "905")],
+            &[],
+        )
+        .await
+        .expect_err("a traversing parameter must be refused, not sanitised");
+
+    assert!(
+        matches!(error, ProxmoxError::Malformed(_)),
+        "expected Malformed, got {error:?}"
+    );
+}
