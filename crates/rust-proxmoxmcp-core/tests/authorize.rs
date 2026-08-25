@@ -2,6 +2,7 @@
 //! no I/O; everything that needs a resolved guest happens here, behind a type
 //! that cannot be constructed any other way.
 
+use rust_proxmoxmcp_core::Intent;
 use rust_proxmoxmcp_core::{
     client::ProxmoxClient,
     error::ProxmoxError,
@@ -80,7 +81,7 @@ fn band_grant() -> ProxmoxGrant {
 async fn authorizes_an_in_scope_guest_for_a_granted_tier() {
     let (index, client, _server) = fixture().await;
     let authorized = index
-        .authorize(&client, "pve3", 606, &band_grant(), Tier::Read, None)
+        .authorize(&client, "pve3", 606, &band_grant(), Intent::read())
         .await
         .expect("authorize");
     assert_eq!(authorized.guest().vmid, 606);
@@ -92,7 +93,7 @@ async fn authorizes_an_in_scope_guest_for_a_granted_tier() {
 async fn refuses_a_guest_outside_the_grant_selector() {
     let (index, client, _server) = fixture().await;
     let error = index
-        .authorize(&client, "pve3", 905, &band_grant(), Tier::Read, None)
+        .authorize(&client, "pve3", 905, &band_grant(), Intent::read())
         .await
         .expect_err("905 is outside 600-699");
     assert!(error.to_string().contains("905"));
@@ -103,7 +104,17 @@ async fn refuses_a_guest_outside_the_grant_selector() {
 async fn refuses_a_tier_the_grant_does_not_carry() {
     let (index, client, _server) = fixture().await;
     let error = index
-        .authorize(&client, "pve3", 606, &band_grant(), Tier::Destructive, None)
+        .authorize(
+            &client,
+            "pve3",
+            606,
+            &band_grant(),
+            Intent {
+                tier: Tier::Destructive,
+                interrupts: false,
+                override_applies: None,
+            },
+        )
         .await
         .expect_err("grant carries read only");
     assert!(error.to_string().contains("destructive") || error.to_string().contains("Destructive"));
@@ -116,7 +127,7 @@ async fn a_protected_guest_still_authorizes_for_read_and_reports_protection() {
     let (index, client, _server) = fixture().await;
     let grant = ProxmoxGrant::read_only();
     let authorized = index
-        .authorize(&client, "pve3", 905, &grant, Tier::Read, None)
+        .authorize(&client, "pve3", 905, &grant, Intent::read())
         .await
         .expect("read of a protected guest is allowed");
     assert!(authorized.protection().is_protected());
@@ -133,8 +144,7 @@ async fn an_unknown_guest_is_not_found_and_never_yields_an_authorized_guest() {
             "pve3",
             4242,
             &ProxmoxGrant::read_only(),
-            Tier::Read,
-            None,
+            Intent::read(),
         )
         .await
         .expect_err("absent");

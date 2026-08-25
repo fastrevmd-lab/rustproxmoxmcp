@@ -37,6 +37,7 @@ pub use error::ProxmoxError;
 pub use grant::{ProxmoxAction, ProxmoxGrant};
 pub use inventory::{Cluster, ClusterInventory, ClusterPolicy};
 pub use protect::{Protection, ProtectionReason};
+pub use resolve::Intent;
 pub use resolve::{GuestIndex, ResolvedGuest};
 pub use selector::{GuestType, Selector};
 pub use tier::Tier;

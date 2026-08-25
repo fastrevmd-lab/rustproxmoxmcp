@@ -18,7 +18,7 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use rust_proxmoxmcp_core::{
-    ProxmoxGrant, Tier, catalog::read_tool, client::ProxmoxClient, inventory::ClusterInventory,
+    Intent, ProxmoxGrant, catalog::read_tool, client::ProxmoxClient, inventory::ClusterInventory,
     resolve::GuestIndex, selector::GuestType, tier::WRITE_TOOLS,
 };
 use schemars::JsonSchema;
@@ -274,7 +274,7 @@ impl ProxmoxServer {
             };
             let authorized = match self
                 .index
-                .authorize(client, cluster, vmid, &grant, Tier::Read, None)
+                .authorize(client, cluster, vmid, &grant, Intent::read())
                 .await
             {
                 Ok(authorized) => authorized,
@@ -473,7 +473,7 @@ impl ProxmoxServer {
         };
         let authorized = match self
             .index
-            .authorize(client, &args.cluster, args.vmid, &grant, Tier::Read, None)
+            .authorize(client, &args.cluster, args.vmid, &grant, Intent::read())
             .await
         {
             Ok(authorized) => authorized,
@@ -731,8 +731,7 @@ impl ProxmoxServer {
                 &args.cluster,
                 args.vmid,
                 &grant,
-                Tier::Destructive,
-                Some(override_applies),
+                Intent::destructive(override_applies),
             )
             .await
         {
@@ -1070,8 +1069,7 @@ impl ProxmoxServer {
                 &args.cluster,
                 args.vmid,
                 &grant,
-                Tier::Destructive,
-                Some(override_applies),
+                Intent::destructive(override_applies),
             )
             .await
         {

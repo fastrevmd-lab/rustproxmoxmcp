@@ -12,6 +12,12 @@
 use crate::grant::ProxmoxAction;
 
 /// Action class of a tool.
+///
+/// The boundary is **data loss, not disruption**: a stop is `Low` because it
+/// destroys nothing, even though it takes a guest out of service. Whether a
+/// tool interrupts service is a separate question, answered by
+/// [`interrupts_service`], because the two drive different controls — the tier
+/// drives the grant action, interruption drives protection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     /// Observation only.
@@ -32,6 +38,39 @@ impl Tier {
             Self::Destructive => ProxmoxAction::Destructive,
         }
     }
+}
+
+/// Low-tier tools that take a running guest out of service.
+///
+/// Reversible, and `Low` by action — nothing is destroyed — but a protected
+/// guest must not be taken down by a routine call, so these respect protection
+/// exactly as a destructive call does and need the same waiver or `--lab-mode`.
+///
+/// This is deliberately *not* folded into [`Tier`]. The tier boundary is data
+/// loss; this is service interruption. Merging them would make `stop_vm` look
+/// like a different action class than it is, and an operator who granted `low`
+/// does expect to be able to stop an unprotected guest.
+///
+/// The complement matters as much as the list: `start_vm`, `create_snapshot`
+/// and `create_backup` *add* something and stay safe on a protected guest.
+/// Snapshotting protected guests before an upgrade is the most common
+/// operation in this lab, and refusing it would make the tool useless for the
+/// case it exists to serve.
+pub const INTERRUPTING_TOOLS: &[&str] = &[
+    "reset_vm",
+    "restart_container",
+    "shutdown_vm",
+    "stop_container",
+    "stop_vm",
+];
+
+/// Whether a tool takes a running guest out of service.
+///
+/// A destructive tool is not listed here — it is held back by its tier — so
+/// this answers only the low-tier question.
+#[must_use]
+pub fn interrupts_service(tool: &str) -> bool {
+    INTERRUPTING_TOOLS.contains(&tool)
 }
 
 /// Tools excluded from a wildcard tool scope. Complete as of spec §4.3.
@@ -151,5 +190,68 @@ mod tests {
     #[test]
     fn an_unknown_tool_is_unclassified_rather_than_defaulting_to_read() {
         assert_eq!(tier_of("wipe_everything"), None);
+    }
+}
+
+#[cfg(test)]
+mod interruption_tests {
+    use super::{Tier, interrupts_service, tier_of};
+
+    /// The five tools that take a running guest out of service.
+    #[test]
+    fn stopping_a_guest_interrupts_service() {
+        for tool in [
+            "stop_vm",
+            "shutdown_vm",
+            "reset_vm",
+            "stop_container",
+            "restart_container",
+        ] {
+            assert!(interrupts_service(tool), "{tool} takes a guest down");
+        }
+    }
+
+    /// The complement is the point. Snapshotting a protected guest before an
+    /// upgrade is the most common operation in this lab; if protection refused
+    /// it, the tool would be useless for the case it exists to serve.
+    #[test]
+    fn adding_something_does_not_interrupt_service() {
+        for tool in [
+            "start_vm",
+            "start_container",
+            "create_snapshot",
+            "create_backup",
+        ] {
+            assert!(
+                !interrupts_service(tool),
+                "{tool} adds rather than interrupts and must stay available on a protected guest"
+            );
+        }
+    }
+
+    /// Interruption is orthogonal to the tier. A stop is still `Low` — it
+    /// destroys nothing — which is what `stop_is_low_because_the_tier_boundary
+    /// _is_data_loss_not_disruption` pins. This asserts the two axes disagree
+    /// on purpose, so a later refactor cannot quietly merge them.
+    #[test]
+    fn interruption_is_not_the_tier_boundary() {
+        assert_eq!(tier_of("stop_vm"), Some(Tier::Low));
+        assert!(interrupts_service("stop_vm"));
+
+        assert_eq!(tier_of("create_snapshot"), Some(Tier::Low));
+        assert!(!interrupts_service("create_snapshot"));
+    }
+
+    /// A destructive tool is held back by its tier, not by this list, so it
+    /// must not appear here — otherwise the reason a call was refused becomes
+    /// ambiguous.
+    #[test]
+    fn destructive_tools_are_not_listed_as_interrupting() {
+        for tool in super::DESTRUCTIVE_TOOLS {
+            assert!(
+                !interrupts_service(tool),
+                "{tool} is destructive; its tier already refuses a protected guest"
+            );
+        }
     }
 }
