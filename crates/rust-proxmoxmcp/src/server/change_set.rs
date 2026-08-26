@@ -19,6 +19,30 @@ pub struct PlanDestroyArgs {
     pub cluster: String,
     /// Numeric guest id.
     pub vmid: u32,
+    /// Which destructive operation to plan.
+    ///
+    /// `destroy_guest` (the default, and what 0.3 planned),
+    /// `delete_snapshot`, `rollback_snapshot`, `delete_backup`, `delete_iso`,
+    /// or `restore_backup`.
+    ///
+    /// Defaults to `destroy_guest` so a caller written against 0.3 keeps
+    /// working: this argument did not exist, and every plan meant a destroy.
+    #[serde(default = "default_destructive_op")]
+    pub op: String,
+    /// Snapshot name, for `delete_snapshot` and `rollback_snapshot`.
+    #[serde(default)]
+    pub snapname: Option<String>,
+    /// Storage backend, for `delete_backup` and `delete_iso`.
+    #[serde(default)]
+    pub storage: Option<String>,
+    /// Volume id, for `delete_backup`, `delete_iso` and `restore_backup`.
+    #[serde(default)]
+    pub volid: Option<String>,
+}
+
+/// What a plan means when the caller does not say.
+fn default_destructive_op() -> String {
+    "destroy_guest".to_owned()
 }
 
 /// Arguments for retrieving or manipulating a change set.
@@ -48,7 +72,13 @@ pub struct ChangeSetResponse {
     pub expected_digest: Option<String>,
 }
 
-/// Action for a destroy operation.
+/// Action for a destructive operation.
+///
+/// `op` is the discriminant and the remaining fields are its parameters, absent
+/// when the operation does not take them. Serialised into the change set's
+/// `actions`, so the digest covers exactly what will be executed — an apply
+/// that dispatched on anything not in here could act on something the approver
+/// never saw.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DestroyAction {
     /// Operation type.
@@ -57,6 +87,15 @@ pub(crate) struct DestroyAction {
     pub cluster: String,
     /// Guest VMID.
     pub vmid: u32,
+    /// Snapshot name, for the snapshot operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapname: Option<String>,
+    /// Storage backend, for the volume operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<String>,
+    /// Volume id, for the volume operations and restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volid: Option<String>,
 }
 
 /// Build a coordinator for change-set lifecycle operations.

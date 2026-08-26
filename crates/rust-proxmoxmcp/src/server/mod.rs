@@ -26,6 +26,56 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// Build and validate the action a destructive plan will record.
+///
+/// Each operation names exactly the parameters it needs, and a missing one is
+/// refused here rather than defaulted at apply time. The action is what the
+/// change-set digest covers, so anything not decided now is something the
+/// approver cannot have reviewed.
+fn build_destroy_action(
+    args: &change_set::PlanDestroyArgs,
+) -> Result<change_set::DestroyAction, String> {
+    let require = |value: &Option<String>, name: &str| -> Result<String, String> {
+        value
+            .as_ref()
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .ok_or_else(|| format!("{} requires {name}", args.op))
+    };
+
+    let (snapname, storage, volid) = match args.op.as_str() {
+        // What 0.3 planned, and still the default.
+        "destroy_guest" => (None, None, None),
+        "delete_snapshot" | "rollback_snapshot" => {
+            (Some(require(&args.snapname, "snapname")?), None, None)
+        }
+        "delete_backup" | "delete_iso" => (
+            None,
+            Some(require(&args.storage, "storage")?),
+            Some(require(&args.volid, "volid")?),
+        ),
+        // No storage: the archive volid names its own storage, and accepting a
+        // second one invites the two to disagree.
+        "restore_backup" => (None, None, Some(require(&args.volid, "volid")?)),
+        other => {
+            return Err(format!(
+                "unknown destructive operation '{other}'; expected one of \
+                 destroy_guest, delete_snapshot, rollback_snapshot, delete_backup, \
+                 delete_iso, restore_backup"
+            ));
+        }
+    };
+
+    Ok(change_set::DestroyAction {
+        op: args.op.clone(),
+        cluster: args.cluster.clone(),
+        vmid: args.vmid,
+        snapname,
+        storage,
+        volid,
+    })
+}
+
 /// Principal recorded on a receipt written by startup recovery.
 ///
 /// The executor of an apply is the token that called
@@ -694,6 +744,74 @@ impl ProxmoxServer {
         }
     }
 
+    /// Run one recorded destructive action and return its task handle.
+    ///
+    /// Dispatches on the action the change set carries, so the work performed
+    /// is exactly the work the digest covered.
+    ///
+    /// `delete_backup` and `delete_iso` share `delete_volume` — Proxmox exposes
+    /// both through the same content endpoint — and answer synchronously on
+    /// some storage types, so they may have no task handle at all. An empty
+    /// handle is returned as `None` rather than as `Some("")`, which would
+    /// leave the change set looking recoverable against a task that never
+    /// existed.
+    async fn execute_destructive(
+        &self,
+        client: &ProxmoxClient,
+        action: &change_set::DestroyAction,
+        kind: GuestType,
+        node: &str,
+        vmid: u32,
+    ) -> Result<String, rust_proxmoxmcp_core::ProxmoxError> {
+        use rust_proxmoxmcp_core::guests;
+
+        let missing = |name: &str| {
+            rust_proxmoxmcp_core::ProxmoxError::Malformed(format!(
+                "{} action is missing {name}",
+                action.op
+            ))
+        };
+
+        match action.op.as_str() {
+            // 0.3 wrote `op: "destroy"`; a change set planned then and applied
+            // now must still work, so both spellings dispatch here.
+            "destroy_guest" | "destroy" => match kind {
+                GuestType::Lxc => guests::destroy_container(client, node, vmid, true).await,
+                GuestType::Qemu => guests::destroy_vm(client, node, vmid, true).await,
+            },
+            "delete_snapshot" => {
+                let snapname = action
+                    .snapname
+                    .as_deref()
+                    .ok_or_else(|| missing("snapname"))?;
+                guests::delete_snapshot(client, node, kind, vmid, snapname).await
+            }
+            "rollback_snapshot" => {
+                let snapname = action
+                    .snapname
+                    .as_deref()
+                    .ok_or_else(|| missing("snapname"))?;
+                guests::rollback_snapshot(client, node, kind, vmid, snapname).await
+            }
+            "delete_backup" | "delete_iso" => {
+                let storage = action
+                    .storage
+                    .as_deref()
+                    .ok_or_else(|| missing("storage"))?;
+                let volid = action.volid.as_deref().ok_or_else(|| missing("volid"))?;
+                let data = guests::delete_volume(client, node, storage, volid).await?;
+                Ok(data.as_str().unwrap_or_default().to_owned())
+            }
+            "restore_backup" => {
+                let volid = action.volid.as_deref().ok_or_else(|| missing("volid"))?;
+                guests::restore_backup(client, node, kind, vmid, volid, true).await
+            }
+            other => Err(rust_proxmoxmcp_core::ProxmoxError::Malformed(format!(
+                "unknown destructive operation '{other}'"
+            ))),
+        }
+    }
+
     /// Stage 1 + stage 2 authorization for a low-tier guest call.
     ///
     /// Shared by the additive tools, which need the same gate as the
@@ -1346,7 +1464,7 @@ impl ProxmoxServer {
         Parameters(args): Parameters<change_set::PlanDestroyArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        use change_set::{ChangeSetResponse, DestroyAction};
+        use change_set::ChangeSetResponse;
         use mecmcp_changeset::WaiverKind;
         use rust_proxmoxmcp_core::{
             fingerprint::{GuestState, fingerprint},
@@ -1453,10 +1571,14 @@ impl ProxmoxServer {
             .unwrap_or_else(|| "stdio".to_owned());
 
         let device = format!("{}/{}", args.cluster, args.vmid);
-        let action = DestroyAction {
-            op: "destroy".to_owned(),
-            cluster: args.cluster.clone(),
-            vmid: args.vmid,
+        // Validate the operation and its parameters before anything is
+        // recorded. A change set whose action names an operation the apply
+        // cannot dispatch is a change set an approver may sign and nobody can
+        // execute — worse, one whose parameters are missing would dispatch
+        // with defaults the approver never saw.
+        let action = match build_destroy_action(&args) {
+            Ok(action) => action,
+            Err(error) => return tool_error(error),
         };
 
         // This server has no policy engine in 0.3.
@@ -1803,14 +1925,27 @@ impl ProxmoxServer {
             ));
         }
 
-        // Issue the DELETE and get the UPID string.
-        let upid_str = match rust_proxmoxmcp_core::guests::destroy_container(
-            client,
-            &state.node,
-            args.vmid,
-            true, // purge
-        )
-        .await
+        // Dispatch on the action the change set recorded, not on the tool
+        // name. The digest covers `actions`, so this is the only description of
+        // the work that the approver actually signed; reading the operation
+        // from anywhere else would let an apply do something the approval did
+        // not cover.
+        let action: change_set::DestroyAction = match record.actions.first() {
+            Some(value) => match serde_json::from_value(value.clone()) {
+                Ok(action) => action,
+                Err(error) => {
+                    return tool_error(format!(
+                        "the change set's action could not be read ({error}); \
+                         it cannot be applied"
+                    ));
+                }
+            },
+            None => return tool_error("the change set records no action".to_owned()),
+        };
+
+        let upid_str = match self
+            .execute_destructive(client, &action, guest.r#type, &state.node, args.vmid)
+            .await
         {
             Ok(upid) => upid,
             Err(error) => {
@@ -2281,5 +2416,89 @@ mod tools_list_cache_tests {
         let listed = listed_tools(Vec::new(), false);
         assert_eq!(listed.ttl_ms, None);
         assert_eq!(listed.cache_scope, None);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod destructive_action_tests {
+    use super::build_destroy_action;
+    use crate::server::change_set::PlanDestroyArgs;
+
+    fn args(op: &str) -> PlanDestroyArgs {
+        PlanDestroyArgs {
+            cluster: "pve3".to_owned(),
+            vmid: 617,
+            op: op.to_owned(),
+            snapname: None,
+            storage: None,
+            volid: None,
+        }
+    }
+
+    /// A caller written against 0.3 passed no `op` and meant a destroy. Serde
+    /// fills the default, so that plan must still build the same action.
+    #[test]
+    fn the_default_operation_is_a_guest_destroy() {
+        let action = build_destroy_action(&args("destroy_guest")).unwrap();
+        assert_eq!(action.op, "destroy_guest");
+        assert_eq!(action.vmid, 617);
+        assert!(action.snapname.is_none());
+    }
+
+    /// Each operation names exactly what it needs, refused at plan time rather
+    /// than defaulted at apply time — the action is what the digest covers, so
+    /// anything undecided now is something the approver cannot review.
+    #[test]
+    fn a_missing_parameter_is_refused_at_plan_time() {
+        for (op, missing) in [
+            ("delete_snapshot", "snapname"),
+            ("rollback_snapshot", "snapname"),
+            ("delete_backup", "storage"),
+            ("restore_backup", "volid"),
+        ] {
+            let error = build_destroy_action(&args(op)).expect_err("must be refused");
+            assert!(
+                error.contains(missing),
+                "{op}: the refusal must name the missing parameter, got: {error}"
+            );
+        }
+    }
+
+    /// An empty string is not a parameter.
+    #[test]
+    fn an_empty_parameter_counts_as_missing() {
+        let mut a = args("delete_snapshot");
+        a.snapname = Some(String::new());
+        assert!(build_destroy_action(&a).is_err());
+    }
+
+    /// A typo must not become a change set nobody can execute.
+    #[test]
+    fn an_unknown_operation_is_refused_with_the_valid_set() {
+        let error = build_destroy_action(&args("delete_everything")).expect_err("refused");
+        assert!(error.contains("unknown destructive operation"), "{error}");
+        assert!(
+            error.contains("rollback_snapshot"),
+            "the refusal should list what is valid, got: {error}"
+        );
+    }
+
+    /// `restore_backup` takes no storage: the archive volid names its own, and
+    /// accepting a second one invites the two to disagree.
+    #[test]
+    fn restore_takes_the_volid_alone() {
+        let mut a = args("restore_backup");
+        a.volid = Some("local:backup/vzdump-lxc-617.tar.zst".to_owned());
+        a.storage = Some("ignored".to_owned());
+        let action = build_destroy_action(&a).unwrap();
+        assert!(
+            action.storage.is_none(),
+            "a storage passed to restore must not reach the action"
+        );
+        assert_eq!(
+            action.volid.as_deref(),
+            Some("local:backup/vzdump-lxc-617.tar.zst")
+        );
     }
 }
