@@ -2316,7 +2316,13 @@ impl ProxmoxServer {
         // The existing test only caught a move because its harness invalidates
         // the cache itself; production never did. One extra fetch on a
         // destructive apply is not a cost worth trading this for.
-        self.index.invalidate();
+        //
+        // Scoped to this cluster: a global drop would evict still-valid
+        // snapshots for every other cluster, and their next operation would
+        // pay a fetch that can fail if that cluster is momentarily
+        // unreachable. The generation bump inside is what stops a fetch that
+        // started before this point from re-publishing pre-change state.
+        self.index.invalidate_cluster(&args.cluster);
 
         // Resolve guest and compute protection to determine override.
         let guest = match self.index.resolve(client, &args.cluster, args.vmid).await {

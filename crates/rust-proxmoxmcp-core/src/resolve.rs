@@ -17,6 +17,7 @@ use crate::selector::{GuestFacts, GuestType};
 use crate::tier::Tier;
 use std::collections::BTreeMap;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// A guest as the cluster currently reports it.
@@ -64,6 +65,14 @@ struct Snapshot {
 pub struct GuestIndex {
     ttl: Duration,
     snapshots: RwLock<BTreeMap<String, Snapshot>>,
+    /// Bumped by every invalidation.
+    ///
+    /// A fetch that began before an invalidation must not insert its result
+    /// afterwards. Without this, `resolve`'s last-insert-wins behaviour lets a
+    /// pre-change snapshot land back in the cache *after* a caller deliberately
+    /// dropped it -- which is how a destructive apply could re-read the state
+    /// its own invalidation was meant to discard.
+    generation: AtomicU64,
 }
 
 impl GuestIndex {
@@ -73,6 +82,7 @@ impl GuestIndex {
         Self {
             ttl,
             snapshots: RwLock::new(BTreeMap::new()),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -97,9 +107,19 @@ impl GuestIndex {
         if let Some(guest) = self.lookup_fresh(cluster, vmid) {
             return Ok(guest);
         }
+        // Read the generation *before* fetching, so an invalidation that
+        // happens while this request is in flight can be detected below.
+        let generation_before = self.generation.load(Ordering::Acquire);
         let guests = fetch_guests(client, cluster).await?;
         let found = guests.get(&vmid).cloned();
-        if let Ok(mut snapshots) = self.snapshots.write() {
+        if self.generation.load(Ordering::Acquire) == generation_before
+            && let Ok(mut snapshots) = self.snapshots.write()
+        {
+            // Only cache when nothing invalidated underneath this fetch. The
+            // value is still returned either way -- it came from this fetch and
+            // is as fresh as the request that asked for it. What is refused is
+            // publishing it to later callers who asked for post-invalidation
+            // state.
             snapshots.insert(
                 cluster.to_owned(),
                 Snapshot {
@@ -114,9 +134,28 @@ impl GuestIndex {
     }
 
     /// Drop every cached snapshot, e.g. after a mutation.
+    ///
+    /// Prefer [`Self::invalidate_cluster`] when only one cluster changed: this
+    /// evicts snapshots for every other cluster too, and their next operation
+    /// pays a fetch that can fail if that cluster is momentarily unreachable.
     pub fn invalidate(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
         if let Ok(mut snapshots) = self.snapshots.write() {
             snapshots.clear();
+        }
+    }
+
+    /// Drop one cluster's cached snapshot.
+    ///
+    /// The generation bump is global even though the eviction is not. It has to
+    /// be: a concurrent fetch records only the cluster it asked for, and making
+    /// the check per-cluster would mean tracking a generation per in-flight
+    /// request for no practical gain. The cost of the coarse bump is that a
+    /// fetch for an unrelated cluster may decline to cache and be repeated.
+    pub fn invalidate_cluster(&self, cluster: &str) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        if let Ok(mut snapshots) = self.snapshots.write() {
+            snapshots.remove(cluster);
         }
     }
 

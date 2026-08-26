@@ -36,6 +36,23 @@ function, which by strict semver would be a minor bump.
   itself. A second test now moves the guest **without** invalidating -- what
   Proxmox actually does -- and it fails against the old handler.
 
+- **A fetch that began before an invalidation can no longer republish stale
+  state.** `GuestIndex::resolve` inserted last-write-wins, so an in-flight
+  `/cluster/resources` request that started before the change could land after
+  the invalidation and put the pre-change snapshot back. Apply resolves twice
+  -- once for protection, once inside `authorize` where the fingerprint is
+  computed -- so the second read could consume that reinserted snapshot and
+  match, defeating the invalidation above. A generation counter now refuses an
+  insert from any fetch that started before the last invalidation.
+
+  Covered by a test that parks a request mid-flight against the mock server
+  and invalidates around it, rather than hoping for the interleaving.
+
+- **Invalidation is cluster-scoped.** `invalidate()` cleared every cluster's
+  snapshot, so applying to one cluster evicted still-valid state for all the
+  others and made their next operation pay a fetch that could fail if that
+  cluster was briefly unreachable. Apply now uses `invalidate_cluster`.
+
 ### Added
 
 - `guests::guest_exec` -- run a command inside a QEMU guest through the guest
