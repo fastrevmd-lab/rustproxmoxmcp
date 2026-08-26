@@ -112,21 +112,31 @@ impl GuestIndex {
         let generation_before = self.generation.load(Ordering::Acquire);
         let guests = fetch_guests(client, cluster).await?;
         let found = guests.get(&vmid).cloned();
-        if self.generation.load(Ordering::Acquire) == generation_before
-            && let Ok(mut snapshots) = self.snapshots.write()
-        {
-            // Only cache when nothing invalidated underneath this fetch. The
-            // value is still returned either way -- it came from this fetch and
-            // is as fresh as the request that asked for it. What is refused is
-            // publishing it to later callers who asked for post-invalidation
+        if let Ok(mut snapshots) = self.snapshots.write() {
+            // Compare *inside* the critical section. Checking before taking the
+            // lock is a time-of-check/time-of-use hole: an invalidation could
+            // bump the generation and clear the map in the gap, and this insert
+            // would then republish pre-change state on the strength of a
+            // comparison that was already stale.
+            //
+            // This is correct only because invalidation bumps the generation
+            // *before* it takes this lock. Either it bumps first and this check
+            // sees the new value and declines, or this insert lands first and
+            // the invalidation that follows removes it.
+            //
+            // The value is still returned either way -- it came from this fetch
+            // and is as fresh as the request that asked for it. What is refused
+            // is publishing it to later callers who asked for post-invalidation
             // state.
-            snapshots.insert(
-                cluster.to_owned(),
-                Snapshot {
-                    taken: Instant::now(),
-                    guests,
-                },
-            );
+            if self.generation.load(Ordering::Acquire) == generation_before {
+                snapshots.insert(
+                    cluster.to_owned(),
+                    Snapshot {
+                        taken: Instant::now(),
+                        guests,
+                    },
+                );
+            }
         }
         found.ok_or_else(|| ProxmoxError::NotFound {
             what: format!("guest {vmid} in cluster {cluster}"),

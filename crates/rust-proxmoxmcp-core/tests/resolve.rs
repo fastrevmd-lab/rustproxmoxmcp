@@ -129,15 +129,21 @@ async fn a_fetch_started_before_an_invalidation_does_not_repopulate_the_cache() 
         tokio::spawn(async move { index.resolve(&client, "pve3", 905).await.map(|g| g.node) })
     };
 
-    // Wait until the server has actually received it, so the fetch is in
-    // flight rather than merely spawned.
-    for _ in 0..200 {
-        if server.request_count() >= 1 {
+    // Wait until the server has *chosen its body*, not merely recorded the
+    // request. `request_count` rises before route selection, so synchronising
+    // on it lets the route swap below win the race and hand the parked request
+    // the post-change body -- which would make this test pass without any
+    // stale data existing to republish.
+    for _ in 0..300 {
+        if server.captured_count() >= 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(server.request_count() >= 1, "the fetch must be in flight");
+    assert!(
+        server.captured_count() >= 1,
+        "the parked fetch must already hold the pre-change body"
+    );
 
     // The world changes, and the cache is invalidated -- both while that
     // earlier fetch is still parked holding pre-change data.
@@ -148,9 +154,18 @@ async fn a_fetch_started_before_an_invalidation_does_not_repopulate_the_cache() 
     });
     index.invalidate_cluster("pve3");
 
-    // Let the parked fetch complete. Its body is the pre-change one.
+    // Let the parked fetch complete. Its body is the pre-change one, and it
+    // must actually have succeeded: an error would mean nothing stale was ever
+    // offered to the cache, and the assertion below would pass vacuously.
     drop(hold);
-    let _ = stale_fetch.await.expect("join");
+    let stale_node = stale_fetch
+        .await
+        .expect("join")
+        .expect("the parked fetch must succeed");
+    assert_eq!(
+        stale_node, "pve2",
+        "the parked fetch must have carried the pre-change node"
+    );
 
     // The next reader must not be served that reinserted pre-change snapshot.
     let after = index.resolve(&client, "pve3", 905).await.expect("resolve");

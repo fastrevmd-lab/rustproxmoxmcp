@@ -45,8 +45,19 @@ function, which by strict semver would be a minor bump.
   match, defeating the invalidation above. A generation counter now refuses an
   insert from any fetch that started before the last invalidation.
 
+  The comparison happens **inside** the write-locked critical section. Doing
+  it before taking the lock left a time-of-check/time-of-use gap in which an
+  invalidation could bump the generation and clear the map, after which the
+  insert would republish pre-change state on the strength of an already-stale
+  comparison. It is correct only because invalidation bumps the generation
+  before it takes that lock.
+
   Covered by a test that parks a request mid-flight against the mock server
-  and invalidates around it, rather than hoping for the interleaving.
+  and invalidates around it, rather than hoping for the interleaving. The mock
+  gained a `captured_count` signal for this: `request_count` rises when a
+  request is *recorded*, which is before its route is read, so a test
+  synchronising on it can swap the route first and hand the parked request the
+  post-change body -- passing for the wrong reason.
 
 - **Invalidation is cluster-scoped.** `invalidate()` cleared every cluster's
   snapshot, so applying to one cluster evicted still-valid state for all the
