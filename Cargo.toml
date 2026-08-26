@@ -3,7 +3,7 @@ members  = ["crates/rust-proxmoxmcp-core", "crates/rust-proxmoxmcp"]
 resolver = "2"
 
 [workspace.package]
-version      = "0.4.0"
+version      = "0.5.0"
 edition      = "2024"
 rust-version = "1.88"
 license      = "MIT"
@@ -48,7 +48,7 @@ tokio-rustls = "0.26"
 
 # Internal workspace crate. This version must be bumped alongside
 # [workspace.package] version on each release.
-rust-proxmoxmcp-core = { path = "crates/rust-proxmoxmcp-core", version = "0.4.0" }
+rust-proxmoxmcp-core = { path = "crates/rust-proxmoxmcp-core", version = "0.5.0" }
 
 # mecmcp is consumed read-only at an exact pinned version. Do not relax the tag.
 mecmcp-audit     = { version = "0.20.0", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.20.0" }
