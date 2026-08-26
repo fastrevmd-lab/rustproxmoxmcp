@@ -43,6 +43,18 @@ through the same plan -> approve -> apply path rather than beside it.
   types delete without a task and return no handle; parsing that as a UPID
   reported failure for a volume already gone, wrote no receipt, and left the
   record retryable against something that no longer existed.
+- **A change set with no stored preview is refused.** The preview is written to
+  the store *after* the record is created, so a failed second write left a
+  record that both approve and apply accepted. Approve did worse than accept
+  it: it substituted the literal string `"(no preview)"` and recorded an
+  approval over text no operator could have read. Approve and apply now both
+  refuse a previewless record, and a plan that cannot persist its preview
+  fails rather than returning a change-set id.
+- **The operation scopes are grantable.** The per-operation authorisation above
+  demanded tool names the token CLI rejected as unknown, so no token could be
+  minted that could plan or apply **any** destructive operation. The seven
+  operation names are now accepted as authorisation-only scopes, and a test
+  asserts every operation scope can be granted through the supported CLI.
 
 ### What the approval actually binds
 
