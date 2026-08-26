@@ -170,7 +170,7 @@ async fn config_keys_that_run_on_the_host_are_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_image_downloads_with_a_verified_checksum() {
+async fn an_image_download_requests_checksum_verification() {
     let h = common::TestServer::start_with_routes(
         spec_with(&["download_iso"], &["*"]),
         provisioning_routes(),
@@ -189,7 +189,9 @@ async fn an_image_downloads_with_a_verified_checksum() {
     .await
     .expect("download");
 
-    assert_eq!(out["checksum_verified"], true);
+    // Requested, not observed: Proxmox verifies inside the download task, so a
+    // mismatch surfaces as a failed task after this call has returned.
+    assert_eq!(out["checksum_verification_requested"], true);
 }
 
 /// Proxmox ignores one half without the other, so a caller supplying only one
@@ -248,4 +250,118 @@ async fn a_narrowed_token_may_not_write_to_storage() {
         .filter(|r| r.path.ends_with("/download-url"))
         .count();
     assert_eq!(downloads, 0, "nothing may be downloaded");
+}
+
+/// Proxmox restores a backup by POSTing to the *same* endpoint a create uses,
+/// with `archive`, `restore` and `force` added. Without the existence check a
+/// `create_vm` grant would overwrite a live guest, skipping the destructive
+/// tier, the protection check and change-set approval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn creating_over_an_existing_guest_is_refused() {
+    let h = common::TestServer::start_with_routes(
+        spec_with(&["create_vm"], &["*"]),
+        provisioning_routes(),
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "create_vm",
+        json!({"cluster":"pve3","node":"pve2","vmid":617,"config":{"name":"hijack"}}),
+    )
+    .await
+    .expect_err("617 already exists");
+    assert!(err.contains("already exists"), "{err}");
+
+    let created = h
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST" && (r.path.ends_with("/qemu") || r.path.ends_with("/lxc")))
+        .count();
+    assert_eq!(created, 0, "nothing may be posted");
+}
+
+/// The restore controls are refused by name as well, so a caller is told what
+/// was wrong rather than only that the vmid was taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_controls_are_refused_in_a_create() {
+    let h = common::TestServer::start_with_routes(
+        spec_with(&["create_vm"], &["*"]),
+        provisioning_routes(),
+    )
+    .await;
+
+    for key in ["archive", "restore", "force"] {
+        let err = common::call(
+            &h,
+            "create_vm",
+            json!({"cluster":"pve3","node":"pve2","vmid":650,"config":{key:"x"}}),
+        )
+        .await
+        .expect_err("a restore control must be refused");
+        assert!(err.contains(key), "{key}: {err}");
+    }
+}
+
+/// `mp0=/,mp=/host` with a privileged container mounts host root inside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_mounts_and_device_passthrough_are_refused() {
+    let h = common::TestServer::start_with_routes(
+        spec_with(&["create_container", "create_vm"], &["*"]),
+        provisioning_routes(),
+    )
+    .await;
+
+    for (key, value) in [
+        ("mp0", "/,mp=/host"),
+        ("hostpci0", "0000:01:00"),
+        ("usb0", "host=1234:5678"),
+        ("unprivileged", "0"),
+        ("lxc.cgroup.devices.allow", "a"),
+    ] {
+        let err = common::call(
+            &h,
+            "create_container",
+            json!({"cluster":"pve3","node":"pve2","vmid":651,"config":{key:value}}),
+        )
+        .await
+        .expect_err("a host-reaching config key must be refused");
+        assert!(err.contains(key), "the refusal must name {key}: {err}");
+    }
+
+    let created = h
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST" && r.path.ends_with("/lxc"))
+        .count();
+    assert_eq!(created, 0, "nothing may be created");
+}
+
+/// An ordinary key can still carry a host path in its value: `scsi0` must stay
+/// allowed for `local-lvm:32` and refused for `/dev/sdb`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_path_in_any_value_is_refused() {
+    let h = common::TestServer::start_with_routes(
+        spec_with(&["create_vm"], &["*"]),
+        provisioning_routes(),
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "create_vm",
+        json!({"cluster":"pve3","node":"pve2","vmid":650,"config":{"scsi0":"/dev/sdb"}}),
+    )
+    .await
+    .expect_err("a host device path must be refused");
+    assert!(err.to_lowercase().contains("host path"), "{err}");
+
+    // The same key with a storage reference is fine.
+    common::call(
+        &h,
+        "create_vm",
+        json!({"cluster":"pve3","node":"pve2","vmid":650,"config":{"scsi0":"local-lvm:32"}}),
+    )
+    .await
+    .expect("a storage-backed disk must still be allowed");
 }

@@ -307,20 +307,75 @@ pub struct CloneArgs {
     pub full: bool,
 }
 
-/// Config keys that reach the hypervisor host rather than the guest.
+/// A download URL with its credentials removed, for the audit record.
+///
+/// A presigned or private URL carries its authorisation in the userinfo or the
+/// query string. The audit log is durable and may be shipped onward, so the
+/// full URL must not go into it -- the origin and path are what an auditor
+/// needs to know what was fetched.
+fn redact_download_url(url: &str) -> String {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let rest = rest.split('#').next().unwrap_or(rest);
+    let (authority_and_path, query) = match rest.split_once('?') {
+        Some((head, _)) => (head, true),
+        None => (rest, false),
+    };
+    // Anything before an '@' in the authority is userinfo.
+    let authority_and_path = match authority_and_path.split_once('/') {
+        Some((authority, path)) => {
+            let authority = authority.rsplit('@').next().unwrap_or(authority);
+            format!("{authority}/{path}")
+        }
+        None => authority_and_path
+            .rsplit('@')
+            .next()
+            .unwrap_or(authority_and_path)
+            .to_owned(),
+    };
+    let suffix = if query { "?<redacted>" } else { "" };
+    if scheme.is_empty() {
+        format!("{authority_and_path}{suffix}")
+    } else {
+        format!("{scheme}://{authority_and_path}{suffix}")
+    }
+}
+
+/// Config keys `create_vm` and `create_container` refuse.
 ///
 /// `create_guest` forwards arbitrary key/value pairs to Proxmox, which is what
-/// makes it usable for both QEMU and LXC without modelling either. Two of those
-/// keys escape the guest entirely:
+/// lets one function serve both QEMU and LXC without modelling either. That
+/// passthrough is only safe if the keys that leave the guest are refused, and
+/// there are more of them than they first appear:
 ///
-/// - `hookscript` names a script Proxmox executes **on the node** at guest
-///   lifecycle events.
-/// - `args` is appended to the `kvm` command line on the node.
+/// - `archive`, `restore` and `force` turn a create into a **restore**.
+///   `guests::restore_backup` posts to the *same* endpoint with the same body
+///   shape; the only difference is these three fields. Without this, a token
+///   holding only `create_vm` could overwrite an existing guest, skipping the
+///   destructive tier, the protection check and change-set approval entirely.
+/// - `hookscript` names a script Proxmox runs **on the node**, and `args` is
+///   appended to the `kvm` command line on the node.
+/// - `mpN` mounts a host path into a container. With `unprivileged=0` that is
+///   host root inside a privileged container.
+/// - `hostpciN`, `usbN`, `devN`, `serialN` and `parallelN` pass host devices
+///   through.
+/// - `lxc.*` is raw LXC configuration, which can express all of the above.
+/// - `cicustom` runs cloud-init snippets from storage.
 ///
-/// Either turns "may create a guest" into "may run code on the hypervisor",
-/// which is not a privilege the `low` tier grants. They are refused rather than
-/// filtered out, so a caller is told their config was not applied as written.
-const HOST_ESCAPING_CONFIG_KEYS: &[&str] = &["hookscript", "args"];
+/// Refused rather than dropped, so a caller is told their config was not
+/// applied as written.
+const REFUSED_CONFIG_KEYS: &[&str] = &[
+    "archive",
+    "restore",
+    "force",
+    "hookscript",
+    "args",
+    "unprivileged",
+    "cicustom",
+];
+
+/// Key prefixes refused for the same reasons, where Proxmox numbers the key.
+const REFUSED_CONFIG_PREFIXES: &[&str] =
+    &["mp", "hostpci", "usb", "dev", "serial", "parallel", "lxc."];
 
 /// Arguments for creating a guest from scratch.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1090,7 +1145,7 @@ impl ProxmoxServer {
     /// Returns the client on success.
     ///
     /// [`creation_allowed`]: rust_proxmoxmcp_core::protect::creation_allowed
-    fn authorize_creation(
+    async fn authorize_creation(
         &self,
         tool: &'static str,
         cluster: &str,
@@ -1130,28 +1185,95 @@ impl ProxmoxServer {
             ))));
         }
 
+        // The guest must not already exist. This is what makes "create" mean
+        // create, and it is load-bearing rather than tidy: Proxmox restores a
+        // backup by POSTing to the *same* endpoint this uses, with `archive`,
+        // `restore` and `force` added. Refusing those keys stops the obvious
+        // spelling; refusing an existing VMID stops the whole class, including
+        // whatever the next spelling turns out to be.
+        //
+        // A protected guest is caught here too, before its tags are ever
+        // consulted, because it exists.
+        match self.index.resolve(client, cluster, vmid).await {
+            Ok(existing) => {
+                return Err(Box::new(tool_error(format!(
+                    "vmid {vmid} already exists on cluster {cluster} as '{}' -- creating cannot \
+                     overwrite it. Destroy it through plan_proxmox_destroy first, or choose a free \
+                     vmid.",
+                    existing.name
+                ))));
+            }
+            Err(rust_proxmoxmcp_core::ProxmoxError::NotFound { .. }) => {}
+            Err(error) => {
+                // Anything other than a clean "absent" leaves the question
+                // unanswered, and a create that cannot prove the VMID is free
+                // must not proceed.
+                return Err(Box::new(tool_error(format!(
+                    "could not establish whether vmid {vmid} is free on cluster {cluster}: {error}"
+                ))));
+            }
+        }
+
         Ok(client)
     }
 
-    /// Refuse config keys that execute on the node rather than in the guest.
-    fn reject_host_escaping_config(
+    /// Refuse config a `low` create must not be able to express.
+    ///
+    /// Two checks, because a key list alone is not enough. A key can be
+    /// perfectly ordinary and still carry a host path in its value --
+    /// `scsi0=/dev/sdb` passes a host disk through under a key that must stay
+    /// allowed for `scsi0=local-lvm:32`.
+    fn reject_unsafe_config(
         config: &std::collections::BTreeMap<String, String>,
     ) -> Option<CallToolResult> {
-        let offending: Vec<&str> = HOST_ESCAPING_CONFIG_KEYS
-            .iter()
-            .copied()
-            .filter(|key| config.contains_key(*key))
-            .collect();
-        if offending.is_empty() {
-            return None;
+        let mut offending: Vec<String> = Vec::new();
+
+        for key in config.keys() {
+            let lower = key.to_ascii_lowercase();
+            let numbered = REFUSED_CONFIG_PREFIXES.iter().any(|prefix| {
+                lower.strip_prefix(prefix).is_some_and(|rest| {
+                    // `lxc.` is a namespace; the rest are `mp0`, `usb1`, ...
+                    prefix.ends_with('.')
+                        || (!rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+                })
+            });
+            if REFUSED_CONFIG_KEYS.contains(&lower.as_str()) || numbered {
+                offending.push(key.clone());
+            }
         }
-        Some(tool_error(format!(
-            "config key(s) {} run on the hypervisor node rather than inside the guest, so this \
-             server will not set them: creating a guest is a 'low' operation and must not become \
-             code execution on the host. Remove them and create the guest, then set them from the \
-             Proxmox UI if you genuinely need them.",
-            offending.join(", ")
-        )))
+
+        if !offending.is_empty() {
+            return Some(tool_error(format!(
+                "config key(s) {} are refused: they express a restore, host code execution, a host \
+                 mount or device passthrough, none of which a 'low' create may do. Create the guest \
+                 without them and set them from the Proxmox UI if you genuinely need them.",
+                offending.join(", ")
+            )));
+        }
+
+        // A host path in any value, under any key. Proxmox storage references
+        // are `storage:spec`; an absolute path is the host's filesystem.
+        let host_pathed: Vec<String> = config
+            .iter()
+            .filter(|(_, value)| {
+                value.split(',').any(|field| {
+                    let candidate = field.split_once('=').map_or(field, |(_, v)| v);
+                    candidate.starts_with('/')
+                })
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        if !host_pathed.is_empty() {
+            return Some(tool_error(format!(
+                "config key(s) {} carry an absolute host path. A guest disk is named \
+                 'storage:spec'; a path names the hypervisor's own filesystem, which a 'low' \
+                 create must not reach.",
+                host_pathed.join(", ")
+            )));
+        }
+
+        None
     }
 
     async fn authorize_low(
@@ -1897,11 +2019,14 @@ impl ProxmoxServer {
         args: CreateGuestArgs,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        if let Some(refusal) = Self::reject_host_escaping_config(&args.config) {
+        if let Some(refusal) = Self::reject_unsafe_config(&args.config) {
             return refusal;
         }
 
-        let client = match self.authorize_creation(tool, &args.cluster, args.vmid, &context) {
+        let client = match self
+            .authorize_creation(tool, &args.cluster, args.vmid, &context)
+            .await
+        {
             Ok(client) => client,
             Err(result) => return *result,
         };
@@ -1921,10 +2046,12 @@ impl ProxmoxServer {
             Err(error) => return tool_error(error),
         };
 
-        // The new guest is not in the cached `/cluster/resources` snapshot, and
-        // a caller that creates then immediately reads would be told it does
-        // not exist for as long as the TTL holds.
-        self.index.invalidate_cluster(&args.cluster);
+        // Deliberately no cache invalidation. The POST returns when the
+        // create *task* starts, not when the guest appears in
+        // `/cluster/resources`, so a refresh raced against it would fetch a
+        // snapshot that still lacks the guest and cache that absence for a full
+        // TTL -- turning a short wait into a longer one. The response says to
+        // follow the task instead.
 
         tracing::info!(
             target: "audit",
@@ -2061,8 +2188,8 @@ impl ProxmoxServer {
             node = %args.node,
             storage = %args.storage,
             filename = %args.filename,
-            url = %args.url,
-            checksum_verified = checksum.is_some(),
+            url = %redact_download_url(&args.url),
+            checksum_verification_requested = checksum.is_some(),
             tier = "low",
             interrupts = false,
             upid = %upid,
@@ -2075,7 +2202,12 @@ impl ProxmoxServer {
                 "node": args.node,
                 "storage": args.storage,
                 "filename": args.filename,
-                "checksum_verified": checksum.is_some(),
+                // Requested, not observed. The POST returns when the download
+                // task starts; Proxmox verifies the checksum inside that task,
+                // so a mismatch surfaces as a failed task afterwards. Reporting
+                // "verified" here would assert something this call cannot know.
+                "checksum_verification_requested": checksum.is_some(),
+                "note": "follow the upid with get_task_status; a checksum mismatch fails the task",
             })),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
