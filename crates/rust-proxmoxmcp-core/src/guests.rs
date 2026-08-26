@@ -454,7 +454,9 @@ fn names_a_positive_amount(value: &str) -> bool {
         return false;
     }
 
-    digits.bytes().any(|byte| byte.is_ascii_digit() && byte != b'0')
+    digits
+        .bytes()
+        .any(|byte| byte.is_ascii_digit() && byte != b'0')
 }
 
 /// Clone a guest into a new VMID and return the UPID.
