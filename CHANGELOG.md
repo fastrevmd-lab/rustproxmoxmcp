@@ -5,6 +5,87 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-08-25
+
+The daily driver. **`KNOWN_TOOLS` goes 20 -> 29**, and change-set state is
+persisted for the first time.
+
+Issue #46 calls this milestone "0.4"; the crate was already at 0.4.0 when that
+issue was written, so it ships as 0.5.0. The milestone numbering in #47-#49
+is one behind the version for the same reason.
+
+### Added
+
+- **Seven lifecycle tools** — `start_vm`, `stop_vm`, `shutdown_vm`,
+  `reset_vm`, `start_container`, `stop_container`, `restart_container`.
+- **`create_snapshot` and `create_backup`.** `create_backup` defaults to
+  vzdump `mode=snapshot`, the only mode that does not interrupt the guest.
+- **`--state-file`**, the spelling `mecmcp/docs/PACKAGING.md` standardises.
+  The packaged unit passes `${STATE_DIRECTORY}/changeset-state.json`.
+- **Startup recovery.** An apply that was in flight when the process stopped
+  is re-probed before serving, closing the "detectable but not recoverable"
+  limitation 0.3 documented.
+- **`token set-scopes`** changes a token's device, tool, guest and action
+  scopes **without reissuing its secret**, so no client is reconfigured. The
+  alternatives all mint a new one: `rotate` preserves scopes and changes the
+  secret, `revoke`+`add` does the same, and hand-editing `tokens.json` skips
+  every validation.
+
+  Widening is a privilege escalation and is confirmed interactively unless
+  `--yes` is passed; narrowing is not, because reducing a scope cannot grant
+  anything. Every change is written to the audit trail through a sink that
+  `RUST_LOG` cannot silence — a target-specific filter previously suppressed
+  it while the widening still applied.
+
+  Note that `--tools '*'` does **not** reach a mutating tool: `WRITE_TOOLS` is
+  excluded from the wildcard, so the nine tools above must be named explicitly
+  in a token scope.
+
+### Fixed
+
+- **Change-set state is persisted at all.** `new_with_default_coordinator`
+  passed `None` as the state path, so the coordinator kept everything in
+  memory: every approval, preview and operation record was lost on restart,
+  and had been since 0.1. `StateDirectory=proxmoxmcp` had been provisioning a
+  0700 directory all along with nothing writing to it.
+
+### Changed — protection now covers interrupting calls
+
+The protection gate keyed on `tier == Destructive`, which was
+indistinguishable from "everything disruptive" while destructive tools were
+the only mutating tools. Adding `stop_vm` made the difference real: a
+protected guest would have been stoppable by a routine low-tier call.
+
+The axis is **service interruption, not mutation**, and it is deliberately
+orthogonal to `Tier` — the tier answers "does this destroy data", interruption
+answers "does this take the guest down".
+
+| on a protected guest | |
+|---|---|
+| `stop_vm` `shutdown_vm` `reset_vm` `stop_container` `restart_container` | **refused** without a waiver or `--lab-mode` |
+| `start_vm` `start_container` `create_snapshot` `create_backup` | allowed |
+
+The second row is the point: all five guests upgraded on 2026-08-25 are
+`protected`, and snapshotting them beforehand is the most common operation in
+this lab.
+
+### Upgrade note
+
+`mecmcp` 0.19.0 -> 0.20.0.
+
+**Rolling back during an apply needs the state file restored alongside the
+binary** — the Proxmox snapshot path the fleet already uses.
+
+The reason is the field, not the envelope version. `ChangeSetRecord` is
+`deny_unknown_fields`, so a binary predating 0.20.0 rejects the **whole state
+file** — not the one record — the moment any change set carries `task_id`.
+`task_id` raises the file's minimum to version 2, but an in-flight apply is by
+definition an approved change set, and a real approval already forces version 4
+(or 3 with a waiver), so the file such a rollback meets is normally well past
+version 2 anyway.
+
+A deployment that never applies keeps writing files the older binary reads.
+
 ## [0.4.0] - 2026-08-25
 
 ### Added
