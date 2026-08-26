@@ -374,6 +374,11 @@ pub async fn handler_with_guest(_vmid: u32, protected: bool) -> TestServer {
             "get_proxmox_change_set".to_owned(),
             "approve_proxmox_change_set".to_owned(),
             "apply_proxmox_change_set".to_owned(),
+            // The operation's own tool, not just the generic handlers. These
+            // tests planned a guest destroy while holding no `delete_vm`
+            // scope, which the per-operation check now refuses — correctly:
+            // that was the bypass it exists to close.
+            "delete_vm".to_owned(),
         ],
         guests: vec!["*".to_owned()],
     };

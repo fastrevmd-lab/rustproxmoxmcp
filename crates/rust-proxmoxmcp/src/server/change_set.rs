@@ -38,6 +38,13 @@ pub struct PlanDestroyArgs {
     /// Volume id, for `delete_backup`, `delete_iso` and `restore_backup`.
     #[serde(default)]
     pub volid: Option<String>,
+    /// Node whose storage holds the volume, for `delete_backup` and
+    /// `delete_iso`.
+    ///
+    /// Required for those, because `local` is node-local: the same volid on
+    /// two nodes names two different volumes.
+    #[serde(default)]
+    pub storage_node: Option<String>,
 }
 
 /// What a plan means when the caller does not say.
@@ -96,6 +103,15 @@ pub(crate) struct DestroyAction {
     /// Volume id, for the volume operations and restore.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volid: Option<String>,
+    /// Node the storage lives on, for the volume operations.
+    ///
+    /// Recorded rather than derived from the guest at apply. `local` is
+    /// node-local storage, so `local:backup/x` on pve2 and on pve3 are
+    /// different volumes that happen to share a name. Deriving the node from
+    /// whichever guest the vmid names could delete the same-named volume on
+    /// the wrong host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_node: Option<String>,
 }
 
 /// Build a coordinator for change-set lifecycle operations.

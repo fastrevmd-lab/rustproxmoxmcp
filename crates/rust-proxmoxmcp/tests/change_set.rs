@@ -132,6 +132,9 @@ async fn a_protected_guest_with_matching_waiver_can_be_applied() {
         clusters: vec!["pve3".to_owned()],
         tools: vec![
             "plan_proxmox_destroy".to_owned(),
+            // The operation's own tool: the per-operation scope check refuses
+            // a plan whose token holds only the generic handler.
+            "delete_vm".to_owned(),
             "approve_proxmox_change_set".to_owned(),
             "apply_proxmox_change_set".to_owned(),
         ],
@@ -205,6 +208,9 @@ async fn a_protected_guest_with_lab_mode_can_be_applied() {
         clusters: vec!["pve3".to_owned()],
         tools: vec![
             "plan_proxmox_destroy".to_owned(),
+            // The operation's own tool: the per-operation scope check refuses
+            // a plan whose token holds only the generic handler.
+            "delete_vm".to_owned(),
             "approve_proxmox_change_set".to_owned(),
             "apply_proxmox_change_set".to_owned(),
         ],
