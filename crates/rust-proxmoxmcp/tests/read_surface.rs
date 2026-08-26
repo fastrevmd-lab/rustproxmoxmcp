@@ -193,3 +193,61 @@ async fn a_missing_token_is_refused() {
 
     assert!(outcome.is_err(), "bad token should be refused");
 }
+
+/// `get_vm_config` and `get_container_config` name the guest type in their path
+/// rather than templating it, so supplying `kind` made `expand_path` refuse the
+/// call. Both failed on every invocation, and neither had a test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn type_specific_config_reads_reach_proxmox() {
+    let harness = common::TestServer::start_with_routes(
+        common::TokenSpec {
+            clusters: vec!["pve3".to_owned()],
+            tools: vec!["get_container_config".to_owned()],
+            guests: vec!["*".to_owned()],
+        },
+        common::default_guest_routes(617, false),
+    )
+    .await;
+
+    let config = common::call(
+        &harness,
+        "get_container_config",
+        serde_json::json!({"cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect("a container config read must reach Proxmox");
+
+    assert_eq!(config["hostname"], "test-guest-617");
+}
+
+/// A path that names one guest type may only serve that type. Not sending
+/// `kind` any more would otherwise let `get_vm_config` run against a container
+/// and address `/nodes/pve2/qemu/617/config`, which cannot exist — an opaque
+/// Proxmox error where a plain mismatch belongs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_type_specific_read_refuses_the_other_guest_type() {
+    let harness = common::TestServer::start_with_routes(
+        common::TokenSpec {
+            clusters: vec!["pve3".to_owned()],
+            tools: vec!["get_vm_config".to_owned()],
+            guests: vec!["*".to_owned()],
+        },
+        common::default_guest_routes(617, false),
+    )
+    .await;
+
+    // 617 is an LXC.
+    let err = common::call(
+        &harness,
+        "get_vm_config",
+        serde_json::json!({"cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect_err("a QEMU-only read must refuse a container");
+
+    assert!(
+        err.contains("lxc"),
+        "the refusal must name the actual type: {err}"
+    );
+    assert!(err.contains("qemu"), "and the type the tool serves: {err}");
+}

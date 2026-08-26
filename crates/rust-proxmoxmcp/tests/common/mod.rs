@@ -388,10 +388,49 @@ fn ensure_crypto_provider() {
     });
 }
 
+/// The routes `handler_with_guest` serves, exposed so a test can reuse them
+/// with a different token scope.
+///
+/// # Parameters
+/// - `_vmid`: kept for symmetry with `handler_with_guest`; the fixture guest is 617
+/// - `protected`: whether the fixture guest carries the `protected` tag
+#[must_use]
+pub fn default_guest_routes(_vmid: u32, protected: bool) -> Vec<Route> {
+    vec![
+        Route {
+            path: "/api2/json/nodes",
+            status: 200,
+            body:
+                br#"{"data":[{"node":"pve2","status":"online"},{"node":"pve3","status":"online"}]}"#,
+        },
+        Route {
+            path: "/api2/json/cluster/resources",
+            status: 200,
+            body: if protected {
+                br#"{"data":[{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"},{"id":"lxc/617","type":"lxc","vmid":617,"name":"test-guest-617","node":"pve2","status":"stopped","tags":"protected"}]}"#
+            } else {
+                br#"{"data":[{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"},{"id":"lxc/617","type":"lxc","vmid":617,"name":"test-guest-617","node":"pve2","status":"stopped","tags":"test"}]}"#
+            },
+        },
+        // A read that resolves through GuestIndex, so a test can deliberately
+        // warm the snapshot the plan path reads.
+        Route {
+            path: "/api2/json/nodes/pve2/lxc/617/config",
+            status: 200,
+            body: br#"{"data":{"hostname":"test-guest-617","cores":1,"memory":512}}"#,
+        },
+        Route {
+            path: "/api2/json/nodes/pve2/lxc/617",
+            status: 200,
+            body: br#"{"data":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:617:root@pam:"}"#,
+        },
+    ]
+}
+
 /// Create a test handler configured with a specific guest.
 ///
 /// # Parameters
-/// - `vmid`: The guest VMID to configure
+/// - `_vmid`: The guest VMID to configure
 /// - `protected`: Whether the guest should be protected
 pub async fn handler_with_guest(_vmid: u32, protected: bool) -> TestServer {
     let _tags = if protected { "protected" } else { "test" };
@@ -414,29 +453,7 @@ pub async fn handler_with_guest(_vmid: u32, protected: bool) -> TestServer {
         guests: vec!["*".to_owned()],
     };
 
-    // Build custom routes. Hardcode vmid 617 for simplicity.
-    let routes = vec![
-        Route {
-            path: "/api2/json/nodes",
-            status: 200,
-            body:
-                br#"{"data":[{"node":"pve2","status":"online"},{"node":"pve3","status":"online"}]}"#,
-        },
-        Route {
-            path: "/api2/json/cluster/resources",
-            status: 200,
-            body: if protected {
-                br#"{"data":[{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"},{"id":"lxc/617","type":"lxc","vmid":617,"name":"test-guest-617","node":"pve2","status":"running","tags":"protected"}]}"#
-            } else {
-                br#"{"data":[{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"},{"id":"lxc/617","type":"lxc","vmid":617,"name":"test-guest-617","node":"pve2","status":"running","tags":"test"}]}"#
-            },
-        },
-        Route {
-            path: "/api2/json/nodes/pve2/lxc/617",
-            status: 200,
-            body: br#"{"data":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:617:root@pam:"}"#,
-        },
-    ];
+    let routes = default_guest_routes(_vmid, protected);
 
     TestServer::start_with_routes(spec, routes).await
 }
@@ -550,7 +567,7 @@ impl TestServer {
         // Replace the cluster/resources route with updated guest data.
         // The hardcoded guest 617 is moved to the specified node.
         let body = format!(
-            r#"{{"data":[{{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"}},{{"id":"lxc/{}","type":"lxc","vmid":{},"name":"test-guest-{}","node":"{}","status":"running","tags":"test"}}]}}"#,
+            r#"{{"data":[{{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"}},{{"id":"lxc/{}","type":"lxc","vmid":{},"name":"test-guest-{}","node":"{}","status":"stopped","tags":"test"}}]}}"#,
             vmid, vmid, vmid, new_node
         );
 
@@ -572,7 +589,7 @@ impl TestServer {
     /// guarantee resting on a re-resolve has to drop the cache itself.
     pub fn move_guest_to_node_leaving_cache_stale(&self, vmid: u32, new_node: &str) {
         let body = format!(
-            r#"{{"data":[{{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"}},{{"id":"lxc/{}","type":"lxc","vmid":{},"name":"test-guest-{}","node":"{}","status":"running","tags":"test"}}]}}"#,
+            r#"{{"data":[{{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"}},{{"id":"lxc/{}","type":"lxc","vmid":{},"name":"test-guest-{}","node":"{}","status":"stopped","tags":"test"}}]}}"#,
             vmid, vmid, vmid, new_node
         );
 
