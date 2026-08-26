@@ -128,6 +128,20 @@ wrong thing successfully.
    anything that would interrupt or destroy it without a waiver — including
    `stop_vm`. Snapshots and backups still work, which is deliberate.
 
+## Arguments the new tools take differently
+
+These four are the ones a shim gets wrong. Unknown fields are **refused** as of
+0.8.0 rather than dropped, so an old-shaped call fails loudly instead of
+succeeding with almost none of itself applied -- but the mapping still has to
+be done.
+
+| third-party call | what changes |
+|---|---|
+| `create_vm(node, vmid, name, cpus, memory, ...)` | the guest settings move **inside `config`**: `{"cluster","node","vmid","config":{"name":"web","cores":"2","memory":"2048"}}`. At the top level they were ignored, which produced a default, diskless VM. |
+| `create_container(..., ostemplate, ...)` | same move. `ostemplate` inside `config`, or the container is created with no template. |
+| `update_container_resources(memory, swap, disk_gb)` | `memory_mb` and `swap_mb`, and **there is no disk field** -- grow a disk with `resize_disk`. A mixed call naming `cores` and `memory` used to apply only the cores and report success. |
+| `download_iso(checksum)` | `checksum_algorithm` has **no default** here. 970 assumed `sha256`; this server refuses a checksum without its algorithm rather than skipping verification silently. |
+
 ## Options the same-named tool no longer takes
 
 A tool with the same name is not always the same call. These options exist on

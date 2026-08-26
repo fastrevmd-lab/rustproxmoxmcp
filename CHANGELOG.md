@@ -7,9 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.8.0] - 2026-08-26
 
-Five tools, closing all but one of the gaps against the third-party server.
+Five tools. **Two gaps against the third-party server remain** -- see below;
+the opening of an earlier draft of this entry said one, which was wrong.
+
 **Re-mint or widen your tokens**: `KNOWN_TOOLS` grows by five, and a token
 minted against 0.7.1 carries none of the new scopes.
+
+**Arguments are not the same shape as 970's**, and unknown fields are now
+refused rather than ignored. A call written for the old server would otherwise
+have succeeded having applied almost none of it.
 
 **Two gaps remain, not one.**
 

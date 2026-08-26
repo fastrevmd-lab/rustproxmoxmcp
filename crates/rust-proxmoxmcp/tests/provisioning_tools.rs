@@ -422,3 +422,33 @@ async fn unprivileged_one_is_allowed_and_zero_is_not() {
     .expect_err("a privileged container must be refused");
     assert!(err.contains("privileged"), "{err}");
 }
+
+/// The third-party server takes these arguments in a different shape:
+/// `create_vm(node, vmid, name, cpus, memory)` with the settings at the top
+/// level rather than inside `config`. Serde would drop what it does not
+/// recognise, so such a call would have created a default, diskless VM and
+/// reported success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_old_shaped_create_is_refused_rather_than_half_applied() {
+    let h = common::TestServer::start_with_routes(
+        spec_with(&["create_vm"], &["*"]),
+        provisioning_routes(),
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "create_vm",
+        json!({"cluster":"pve3","node":"pve2","vmid":650,"name":"web","cpus":2,"memory":2048}),
+    )
+    .await
+    .expect_err("top-level settings belong in config and must not be silently dropped");
+    assert!(!err.is_empty());
+
+    let created = h
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST" && r.path.ends_with("/qemu"))
+        .count();
+    assert_eq!(created, 0, "a half-understood create must not be sent");
+}
