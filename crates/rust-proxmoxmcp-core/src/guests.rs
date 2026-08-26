@@ -420,7 +420,41 @@ pub fn resize_shrinks(size: &str) -> bool {
     // A leading `+` is Proxmox's delta form and is the only unambiguous grow.
     // Everything else — an absolute value, a negative delta, an empty or
     // malformed string — is treated as a shrink.
-    !trimmed.starts_with('+') || trimmed.len() < 2
+    let Some(delta) = trimmed.strip_prefix('+') else {
+        return true;
+    };
+    // The `+` alone does not make it a grow. `+banana`, `++8G` and `+-8G` all
+    // start with one and none of them names an amount to add; a length check
+    // admitted every one of them to the low tier, which is the opposite of
+    // what the contract above promises.
+    !names_a_positive_amount(delta)
+}
+
+/// Whether `value` is a positive Proxmox size: digits, an optional decimal
+/// fraction, and an optional `K`/`M`/`G`/`T` unit in either case.
+///
+/// Zero is not a positive amount. `+0G` adds nothing, so admitting it to the
+/// low tier would spend an authorisation on a call that cannot grow anything.
+fn names_a_positive_amount(value: &str) -> bool {
+    let digits = match value.chars().last() {
+        Some(unit) if matches!(unit, 'K' | 'M' | 'G' | 'T' | 'k' | 'm' | 'g' | 't') => {
+            &value[..value.len() - unit.len_utf8()]
+        }
+        _ => value,
+    };
+
+    let mut parts = digits.splitn(2, '.');
+    let whole = parts.next().unwrap_or_default();
+    if whole.is_empty() || !whole.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    if let Some(fraction) = parts.next()
+        && (fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return false;
+    }
+
+    digits.bytes().any(|byte| byte.is_ascii_digit() && byte != b'0')
 }
 
 /// Clone a guest into a new VMID and return the UPID.

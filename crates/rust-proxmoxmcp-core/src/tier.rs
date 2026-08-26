@@ -282,6 +282,37 @@ mod resize_tests {
         }
     }
 
+    /// A `+` prefix is not by itself a grow. Each of these starts with one and
+    /// names no amount to add; the previous length check admitted every one of
+    /// them to the low tier.
+    #[test]
+    fn a_malformed_delta_is_treated_as_shrinking() {
+        for size in [
+            "+banana", "++8G", "+-8G", "+", "+G", "+.", "+8X", "+8.G", "+.5G", "+8..0G",
+        ] {
+            assert!(
+                resize_shrinks(size),
+                "{size} does not name an amount to add"
+            );
+        }
+    }
+
+    /// Zero adds nothing, so it is not a grow either.
+    #[test]
+    fn a_zero_delta_is_not_a_grow() {
+        for size in ["+0", "+0G", "+0.0G", "+00M"] {
+            assert!(resize_shrinks(size), "{size} adds no capacity");
+        }
+    }
+
+    /// The forms Proxmox actually accepts must still classify as growing.
+    #[test]
+    fn well_formed_deltas_grow() {
+        for size in ["+8G", "+1024M", "+1T", "+8g", "+0.5G", "+512", "+1.25T"] {
+            assert!(!resize_shrinks(size), "{size} adds capacity");
+        }
+    }
+
     /// A negative delta is unambiguously a shrink.
     #[test]
     fn a_negative_delta_shrinks() {

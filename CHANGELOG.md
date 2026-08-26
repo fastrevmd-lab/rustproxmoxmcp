@@ -56,6 +56,12 @@ and the guards a create needs that a guest-addressed operation never did.
   the wrong name with nobody told.
 - A download checksum is verified only when algorithm and value are both
   present; one alone is ignored. They now travel together or not at all.
+- **A `+` prefix is no longer enough to classify a resize as growing.** The
+  check was `starts_with('+') && len >= 2`, so `+banana`, `++8G` and `+-8G`
+  all entered the low tier on the strength of being two bytes long -- the
+  opposite of the documented fail-closed behaviour for unclassifiable input.
+  The whole delta is now read as a positive size. `+0G` is not a grow either,
+  since it adds nothing.
 
 ## [0.6.0] - 2026-08-26
 
