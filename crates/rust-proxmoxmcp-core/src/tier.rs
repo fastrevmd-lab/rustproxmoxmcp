@@ -255,3 +255,54 @@ mod interruption_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod resize_tests {
+    use crate::guests::resize_shrinks;
+
+    /// The delta form is the only unambiguous grow.
+    #[test]
+    fn a_positive_delta_grows() {
+        for size in ["+8G", "+1024M", "+1T"] {
+            assert!(!resize_shrinks(size), "{size} adds capacity");
+        }
+    }
+
+    /// An absolute value may be smaller than the current disk, and this
+    /// function cannot know the current size. Treating it as a shrink routes it
+    /// through the change-set flow, which costs an approval; treating it as a
+    /// grow would let a shrink past the gate entirely.
+    #[test]
+    fn an_absolute_size_is_treated_as_shrinking() {
+        for size in ["32G", "8G", "1024M"] {
+            assert!(
+                resize_shrinks(size),
+                "{size} could be smaller than the current disk"
+            );
+        }
+    }
+
+    /// A negative delta is unambiguously a shrink.
+    #[test]
+    fn a_negative_delta_shrinks() {
+        assert!(resize_shrinks("-8G"));
+    }
+
+    /// Unclassifiable input errs toward the safer answer.
+    #[test]
+    fn a_malformed_size_is_treated_as_shrinking() {
+        for size in ["", "+", "  ", "banana", "8"] {
+            assert!(
+                resize_shrinks(size),
+                "{size:?} cannot be shown to grow, so it must not be treated as low tier"
+            );
+        }
+    }
+
+    /// Whitespace must not change the answer.
+    #[test]
+    fn surrounding_whitespace_does_not_flip_the_classification() {
+        assert!(!resize_shrinks("  +8G  "));
+        assert!(resize_shrinks("  32G  "));
+    }
+}

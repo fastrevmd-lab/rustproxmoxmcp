@@ -398,3 +398,25 @@ pub async fn restore_backup(
     let data = client.post_form(path_template, params, form).await?;
     upid_from(data)
 }
+
+/// Whether a disk resize destroys data.
+///
+/// Proxmox takes the size as a delta (`+8G`) or an absolute value (`32G`).
+/// A grow adds capacity; a **shrink discards whatever lived beyond the new
+/// end**, which is data loss and therefore destructive rather than low tier.
+///
+/// `tier::tier_of` reports `resize_disk` as `Low` because a tool's tier cannot
+/// depend on an argument. The re-classification happens here, at the one place
+/// that has the argument to look at.
+///
+/// A value this cannot classify is treated as **shrinking**. Guessing "grow"
+/// on an unparseable size would route a possible shrink around the change-set
+/// flow; guessing "shrink" only costs an approval.
+#[must_use]
+pub fn resize_shrinks(size: &str) -> bool {
+    let trimmed = size.trim();
+    // A leading `+` is Proxmox's delta form and is the only unambiguous grow.
+    // Everything else — an absolute value, a negative delta, an empty or
+    // malformed string — is treated as a shrink.
+    !trimmed.starts_with('+') || trimmed.len() < 2
+}

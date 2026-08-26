@@ -282,3 +282,61 @@ mod tests {
         assert_eq!(reasons.len(), 2, "reasons were {reasons:?}");
     }
 }
+
+/// Whether a VMID that does not yet exist may be created.
+///
+/// The protection union is evaluated against a *resolved* guest, so it has
+/// nothing to match when the guest is the one being created — the VMID is free
+/// by definition. That leaves `protected_vmids` unenforced at exactly the
+/// moment it is cheapest to enforce.
+///
+/// A pinned VMID is pinned because something important is expected to live
+/// there. Letting a create claim it means the next `delete_vm` against that
+/// number is refused for protecting a guest nobody intended to protect, and
+/// the real one has nowhere to go. So a create into a pinned VMID is refused.
+///
+/// Tags cannot participate: a guest that does not exist carries none. Only the
+/// inventory pin is checkable here, and saying so is better than implying the
+/// tag half was consulted.
+#[must_use]
+pub fn creation_allowed(cluster: &Cluster, vmid: u32) -> bool {
+    !cluster.protected_vmids.contains(&vmid)
+}
+
+#[cfg(test)]
+mod creation_tests {
+    use super::creation_allowed;
+    use crate::inventory::Cluster;
+
+    fn cluster_with(protected: Vec<u32>) -> Cluster {
+        Cluster {
+            endpoint: "https://pve.example.org:8006".to_owned(),
+            token_id: "root@pam!mcp".to_owned(),
+            token_secret_env: None,
+            token_secret_file: None,
+            ca_pem_path: None,
+            protected_vmids: protected,
+            protected_tags: vec!["protected".to_owned()],
+        }
+    }
+
+    /// The case the guard exists for. `protected_vmids` is evaluated against a
+    /// resolved guest everywhere else, so a create — where nothing resolves —
+    /// would otherwise claim a pinned number unchallenged.
+    #[test]
+    fn a_pinned_vmid_cannot_be_claimed_by_a_create() {
+        assert!(!creation_allowed(&cluster_with(vec![950, 960]), 950));
+    }
+
+    #[test]
+    fn an_unpinned_vmid_is_free() {
+        assert!(creation_allowed(&cluster_with(vec![950]), 617));
+    }
+
+    /// An empty pin list protects nothing, which is what an unconfigured
+    /// cluster means — not "protect everything".
+    #[test]
+    fn no_pins_means_no_refusals() {
+        assert!(creation_allowed(&cluster_with(Vec::new()), 950));
+    }
+}
