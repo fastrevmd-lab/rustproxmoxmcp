@@ -14,17 +14,54 @@
 
 ---
 
-## Status: 0.3 — destructive tier under change-set control
+## Status: 0.8.0 — the tool surface is complete but for two gaps
 
-Release 0.3 delivers the `destructive` tier: plan → approve → apply, with a server-generated preview bound into the approval and a Proxmox fingerprint re-checked at apply. A guest that changed after approval is refused rather than acted on. **Only `delete_container` is implemented** of the eight destructive tools in spec — the remaining seven (`delete_vm`, `delete_snapshot`, `delete_backup`, `restore_backup`, `rollback_snapshot`, and the two non-delete destructive tools) are mechanical follow-ons. **The `low` tier is not built** — lifecycle and create/clone tools are still absent.
+**36 callable tools**: 17 read, 18 `low`, and `apply_proxmox_change_set` as the
+single `destructive` entry point. Seven further names --- `delete_vm`,
+`delete_container`, `delete_snapshot`, `delete_backup`, `delete_iso`,
+`restore_backup`, `rollback_snapshot` --- are **authorization scopes, not
+tools**: a token grants them by name and reaches them through
+`plan_proxmox_destroy`. `KNOWN_TOOLS` therefore holds 43 entries.
 
-**Waiver mechanisms:** `--lab-mode` waives the second principal for a single-operator lab. `--waivers-file` (default `/etc/proxmoxmcp/waivers.json`, mode 0600, service-owned) carries time-boxed operator waivers. Both originate outside the tool call: **there is deliberately no `grant_waiver` tool and no `force` argument**, because an override a caller can pass is not an override.
+### What is still missing
 
-**Known limitation:** Indeterminate recovery across restart is deferred to 0.4. The UPID is followed to completion within a call, but a crashed apply is not yet re-probed after restart.
+- **`execute_vm_command`.** Deliberate. The design spec makes it conditional on
+  `mecmcp-policy` compiling an allow/deny rule set over the command subject, and
+  that is not wired. Arbitrary command execution inside every guest is remote
+  code execution as a tool call; it ships with a policy engine or not at all.
+- **Restore to a *new* VMID.** `restore_backup` exists but is not equivalent to
+  the third-party server's: the plan resolves an **existing** guest and the
+  apply passes `force=true`, so a same-shaped call overwrites rather than
+  creates. This is the gap most likely to be missed, because the tool exists and
+  the call succeeds.
 
-**Testing status:** All 169 tests pass, including adversarial coverage of the change-set lifecycle, fingerprint binding, expiry enforcement, and two-principal approval. Release 0.3 was validated against a live two-node Proxmox cluster with `delete_container` exercised through the full change-set flow. Confirmed: plan returned Proxmox-accurate preview; approval bound the preview digest; fingerprint mismatch after guest edit refused apply; approval expiry was enforced; `--lab-mode` permitted single-operator delete; the waiver file was reloaded on SIGHUP.
+Both are tracked in #57. Everything else the third-party `proxmox-mcp` offers
+has an equivalent here --- see `docs/MIGRATING-FROM-PROXMOX-MCP.md`, which also
+lists the arguments that changed shape.
 
-**Read surface:** The complete 16-tool read catalog from 0.1 remains unchanged.
+### Change control
+
+Destructive work goes through plan → approve → apply. The plan renders a
+server-generated preview and records the action; the approval binds the plan
+digest over `(owner, device, expected fingerprint, actions)`; the apply
+re-checks the guest's fingerprint and refuses one that moved.
+
+Two things worth stating plainly, because both are easy to assume wrongly:
+
+- **The preview is not hashed into the digest.** It is stored with its own hash,
+  so the text an approver read cannot be edited afterwards without the store
+  refusing it --- but what an approver commits to is the operation and its
+  parameters, not the prose describing them (#56).
+- **`--lab-mode` is the *protection* override, not a blanket waiver.** It
+  supplies the override a protected guest needs, so on a lab-mode server a
+  **protected** guest is approved on creation with no second principal, while an
+  **ordinary** guest still requires one and self-approval is refused. That
+  inversion surprises people.
+
+`--waivers-file` (default `/etc/proxmoxmcp/waivers.json`, mode 0600,
+service-owned) carries time-boxed operator waivers. Both overrides originate
+outside the tool call: **there is deliberately no `grant_waiver` tool and no
+`force` argument**, because an override a caller can pass is not an override.
 
 ### What's implemented
 
@@ -32,18 +69,15 @@ Release 0.3 delivers the `destructive` tier: plan → approve → apply, with a 
 - **Two-stage authorization:**
   1. **Stage 1** (before the catalog call): Bearer token validation, tool and cluster scope checks.
   2. **Stage 2** (guest-addressed tools only): Guest resolution, grant evaluation (VMID range, tag, pool selectors), and fail-closed protection.
-- **Protection union:** A guest is protected if it appears in `protected_vmids` **or** carries a tag from `protected_tags`. A protected guest cannot be addressed by any mutating tool, even with a wildcard token. (Read tools see protected guests normally.)
-- **Catalog-driven dispatch:** Every tool's HTTP method, path template, query flag, and type filter is declared once in `catalog.rs`. The runtime resolves `{node}` and `{vmid}` parameters and assembles the outbound call without hand-written per-tool client code.
-- **SIGHUP reload:** `systemctl reload` (or `kill -HUP`) reloads `clusters.json` in place without dropping in-flight calls. A failed reload logs and retains the previous snapshot.
-- **Per-cluster CA pinning:** Each cluster in the inventory can name a `ca_pem_path` to pin a specific trust anchor. When omitted, the server uses the system's default trust roots. This is only needed for clusters whose API certificate is self-signed or issued by a private CA; clusters with publicly-trusted certificates (e.g., Let's Encrypt) do not require it. No `--insecure` flag exists at any layer.
+- **Protection union:** A guest is protected if it appears in `protected_vmids` **or** carries a tag from `protected_tags`. A protected guest is refused by every destructive and service-interrupting tool unless a waiver or lab mode supplies an override. (Read tools see protected guests normally.)
+- **The node is never accepted from the caller.** It is resolved on every call, and again at apply, because guests migrate. The one exception is `create_vm`/`create_container`, where there is no existing guest to resolve --- so the caller names the node, and it is the one place a caller can address the wrong host.
+- **Catalog-driven dispatch:** Every read tool's HTTP method, path template, query flag, and type filter is declared once in `catalog.rs`.
+- **In-flight recovery:** A change set left `Applying` with a task handle is re-probed at startup, so an apply interrupted by a restart resolves rather than staying unresolved forever.
+- **SIGHUP reload:** `systemctl reload` reloads `clusters.json` in place without dropping in-flight calls. A failed reload logs and retains the previous snapshot.
+- **Per-cluster CA pinning:** Each cluster can name a `ca_pem_path`. There is **no insecure-skip-verify at any layer**, so a cluster with a private CA needs its CA installed and must be addressed by a name its certificate covers.
 - **Audit logging:** JSON-structured logs with optional PII redaction (HMAC-keyed or drop). Every tool call logs cluster, guest, tier, and protection status.
 
-### What's deliberately absent
-
-- **Every mutating tool.** The complete destructive tier (`delete_vm`, `delete_container`, `delete_snapshot`, `delete_backup`, `restore_backup`, `rollback_snapshot`) and the low tier (`clone_vm`, `create_snapshot`, `create_backup`, `start_vm`, `stop_vm`, etc.) are registered in `WRITE_TOOLS` but unimplemented. A token with `"tools": ["*"]` cannot call them: `WRITE_TOOLS` names every mutating tool — including ones no release has registered yet — and a wildcard tool scope deliberately excludes that registry, so the stage-1 preflight refuses the call with `403 insufficient_scope` before it reaches dispatch. The registry is complete ahead of the tools it names, so the guard is already in place when release 0.2 begins registering them.
-- **Override and lab mode** (release 0.3): `--lab-mode`, `--waivers-file`, and the `lab_unrestricted` token flag. These belong to release 0.3's change-control surface and are deliberately omitted so a flag that is present but ignored cannot confuse an operator.
-
-### The 16 read tools
+### The 17 read tools
 
 | Tool | Scope | Description |
 |------|-------|-------------|
@@ -52,8 +86,8 @@ Release 0.3 delivers the `destructive` tier: plan → approve → apply, with a 
 | `get_node_status` | node | Detailed status for one node |
 | `get_vms` | cluster | All QEMU guests with node, status, tags |
 | `get_containers` | cluster | All LXC guests with node, status, tags |
-| `get_vm_config` | guest (QEMU) | Configuration including Proxmox digest |
-| `get_container_config` | guest (LXC) | Configuration including Proxmox digest |
+| `get_vm_config` | guest (QEMU only) | Configuration including Proxmox digest |
+| `get_container_config` | guest (LXC only) | Configuration including Proxmox digest |
 | `get_container_ip` | guest (LXC only) | Network interfaces and addresses |
 | `get_guest_status` | guest | Current runtime status |
 | `list_snapshots` | guest | Snapshots of one guest |
@@ -63,8 +97,42 @@ Release 0.3 delivers the `destructive` tier: plan → approve → apply, with a 
 | `list_templates` | storage | Container templates on one storage backend |
 | `list_tasks` | node | Recent tasks on one node |
 | `get_task_status` | task | Status of one task by UPID |
+| `get_proxmox_change_set` | change set | One change set's state and preview |
 
-Guest-addressed tools (`get_vm_config`, `get_container_config`, `get_container_ip`, `get_guest_status`, `list_snapshots`) take `(cluster, vmid)` only. The server resolves the guest's current node on every call — accepting a node from the caller is how a request addresses the wrong guest after a migration.
+The three type-specific reads refuse the other guest type by name rather than
+addressing an endpoint that cannot exist.
+
+### The 18 low tools
+
+Lifecycle: `start_vm`, `stop_vm`\*, `shutdown_vm`\*, `reset_vm`\*,
+`start_container`, `stop_container`\*, `restart_container`\*.
+
+Provisioning: `create_vm`, `create_container`, `clone_vm`, `download_iso`,
+`resize_disk`, `create_snapshot`, `create_backup`,
+`update_container_resources`\*.
+
+Tasks and change sets: `stop_task`\*, `plan_proxmox_destroy`,
+`approve_proxmox_change_set`.
+
+\* interrupts a running guest. That axis is tracked separately from the tier: a
+tool can be `low` and still take a service down, and the protection gate applies
+to both.
+
+Notes that catch people out:
+
+- `create_container` defaults to `unprivileged=1`. Proxmox reads an omitted
+  field as privileged, so silence must not select the dangerous option.
+- Config keys that reach the hypervisor are refused: `hookscript`, `args`, `mpN`
+  host mounts, `hostpciN`/`usbN`/`devN`/`serialN`/`parallelN` passthrough, raw
+  `lxc.*`, and any value carrying an absolute host path. A create is a `low`
+  operation and must not become code execution on the node.
+- A create refuses a VMID that already exists. Proxmox restores a backup by
+  POSTing to the same endpoint, so without that check a `low` create could
+  overwrite a live guest.
+- `resize_disk` grows only. Shrinking is unsupported here **and in Proxmox** ---
+  `qm resize` and `pct resize` reject a reduction.
+- Container stops are immediate. There is no graceful LXC path: `shutdown_vm` is
+  QEMU-only.
 
 ## Changing a token's scopes
 
@@ -104,7 +172,7 @@ Stage 1 refuses:
 - An invalid or missing bearer token (unless `--allow-no-auth` on loopback)
 - A tool not in the token's `tools` list
 - A cluster not in the token's `devices` list
-- Any tool in `WRITE_TOOLS` (the complete mutating catalog is registered but unimplemented)
+- Any tool in `WRITE_TOOLS` that a wildcard scope tried to reach. `tools: ["*"]` deliberately excludes that registry, so a wildcard token reaches no mutating tool: each must be named explicitly.
 
 Tokens with no `grant` key are **refused for guest-addressed tools**. This is fail-closed: a token that declares no guest selector must not become a wildcard.
 
@@ -226,7 +294,7 @@ The core crate has a non-default `testing` feature that pulls in `rcgen`, `rustl
 |---|---|---|---|
 | Vendor | Juniper Junos / SRX | Palo Alto PAN-OS | Proxmox VE |
 | Transport | NETCONF over SSH | HTTPS XML-API | HTTPS REST |
-| Status | shipping | shipping | 0.1, read surface |
+| Status | shipping | shipping | shipping, 0.8.0 |
 
 All three consume `mecmcp` — the shared Rust crate family underneath mechub's per-vendor MCP servers.
 
