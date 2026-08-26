@@ -216,7 +216,8 @@ never a value a caller passes.
 > routed through a change set: the only destructive plan tool is
 > `plan_proxmox_destroy`, which destroys the whole guest, so sending a shrink
 > "through the change-set flow" would have meant destroying the VM. Callers are
-> directed to the Proxmox UI or CLI instead. The rest of this section describes
+> refused outright: Proxmox itself rejects a reduction, so there is no path to
+> steer callers toward. The rest of this section describes
 > the original design.
 
 `resize_disk` is the single tier-split-on-argument case: grow is `low`, shrink is

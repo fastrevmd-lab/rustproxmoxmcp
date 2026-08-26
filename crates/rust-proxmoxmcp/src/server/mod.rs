@@ -319,8 +319,8 @@ pub struct ResizeArgs {
     ///
     /// Only the `+` form is treated as growing. An absolute value may be
     /// smaller than the current disk, which destroys data, so it is refused.
-    /// Shrinking is not supported by any tool on this server; use the Proxmox
-    /// UI or CLI, where the consequences are visible.
+    /// Shrinking is not supported: `qm resize` and `pct resize` reject a
+    /// reduction, so there is no supported path to it from here either.
     pub size: String,
 }
 
@@ -1745,7 +1745,7 @@ impl ProxmoxServer {
 
     #[tool(
         name = "resize_disk",
-        description = "Grow a guest disk. Only the '+N' form is accepted. Shrinking is not supported by any tool on this server -- do it from the Proxmox UI or CLI."
+        description = "Grow a guest disk. Only the '+N' form is accepted. Shrinking is not supported: Proxmox itself rejects a reduction, so there is no path to it here."
     )]
     async fn resize_disk(
         &self,
@@ -1762,9 +1762,9 @@ impl ProxmoxServer {
             return tool_error(format!(
                 "size '{}' is not an unambiguous grow, so this server will not perform it. \
                  Only the '+N' form adds capacity; an absolute size may be smaller than the \
-                 current disk, which destroys data. Shrinking a disk is not supported by any \
-                 tool here — do it from the Proxmox UI or CLI, where the consequences are \
-                 visible.",
+                 current disk, which destroys data. Shrinking is not supported here, and \
+                 Proxmox does not support it either: `qm resize` and `pct resize` reject a \
+                 reduction. Re-issue this call with a '+N' size to grow the disk.",
                 args.size
             ));
         }
