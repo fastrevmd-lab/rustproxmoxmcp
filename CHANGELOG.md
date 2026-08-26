@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-08-26
+
+**No tool ships in this release.** The MCP tool surface is byte-identical to
+0.7.0 -- verified, not assumed. Upgrading changes nothing an MCP client can
+call, and no token needs re-minting.
+
+What lands is the `guest_exec` core primitive, its tests, and the cutover
+documentation. `execute_vm_command` parity is **not** delivered: nothing
+calls `guest_exec`, so it is unreachable from the tool surface. The branch
+was titled "guest_exec behind a change set" and it is not behind one, because
+it is not behind anything. Wiring it to the destructive change-set flow is
+tracked in #57.
+
+Versioned as a patch on the operator-facing view, where nothing changed.
+Consumers of the `rust-proxmoxmcp-core` **library** do see an additive public
+function, which by strict semver would be a minor bump.
+
+### Added
+
+- `guests::guest_exec` -- run a command inside a QEMU guest through the guest
+  agent. Strictly more powerful than `destroy_vm`, which is why the intended
+  wiring is a change set and why shipping it unreachable is the conservative
+  state rather than a gap to paper over.
+- `docs/MIGRATING-FROM-PROXMOX-MCP.md` -- the cutover guide from the
+  third-party `proxmox-mcp` server, including the UPID/task mapping that
+  replaces its job model.
+
+### Fixed
+
+- Two claims in the migration guide that were not true when written: the
+  approval does not bind the preview text (#56), and shrinking a disk has no
+  supported path here or in Proxmox -- an earlier draft directed it at
+  `plan_proxmox_destroy`, which destroys the whole guest.
+
 ## [0.7.0] - 2026-08-26
 
 Provisioning. Two tools become reachable -- `clone_vm` and `resize_disk` --
