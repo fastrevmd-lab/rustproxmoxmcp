@@ -2365,7 +2365,11 @@ impl ProxmoxServer {
                     tier = "low",
                     interrupts = true,
                     upid = %args.upid,
-                    scope = "node",
+                    // Not `scope`: that key already carries the caller's
+                    // authorization scope elsewhere in this module, and reusing
+                    // it here would put a target kind into the field audit
+                    // queries group authorization by.
+                    task_scope = "node",
                     "proxmox task stop requested"
                 );
             }
