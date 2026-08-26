@@ -379,7 +379,14 @@ const REFUSED_CONFIG_PREFIXES: &[&str] =
     &["mp", "hostpci", "usb", "dev", "serial", "parallel", "lxc."];
 
 /// Arguments for changing an LXC guest's resource allocation.
+// Unknown fields are refused rather than ignored. The third-party
+// server takes these arguments in a different shape, and serde
+// dropping what it does not recognise would let an old-shaped call
+// succeed having applied almost none of it -- a create with no disk,
+// a container with no template, a resource change that moved only
+// the field whose name happened to match.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ContainerResourceArgs {
     /// Inventory name of the cluster.
     pub cluster: String,
@@ -397,7 +404,14 @@ pub struct ContainerResourceArgs {
 }
 
 /// Arguments for stopping a running task.
+// Unknown fields are refused rather than ignored. The third-party
+// server takes these arguments in a different shape, and serde
+// dropping what it does not recognise would let an old-shaped call
+// succeed having applied almost none of it -- a create with no disk,
+// a container with no template, a resource change that moved only
+// the field whose name happened to match.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StopTaskArgs {
     /// Inventory name of the cluster.
     pub cluster: String,
@@ -411,7 +425,14 @@ pub struct StopTaskArgs {
 }
 
 /// Arguments for creating a guest from scratch.
+// Unknown fields are refused rather than ignored. The third-party
+// server takes these arguments in a different shape, and serde
+// dropping what it does not recognise would let an old-shaped call
+// succeed having applied almost none of it -- a create with no disk,
+// a container with no template, a resource change that moved only
+// the field whose name happened to match.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateGuestArgs {
     /// Inventory name of the cluster.
     pub cluster: String,
@@ -429,7 +450,14 @@ pub struct CreateGuestArgs {
 }
 
 /// Arguments for downloading an image to a storage.
+// Unknown fields are refused rather than ignored. The third-party
+// server takes these arguments in a different shape, and serde
+// dropping what it does not recognise would let an old-shaped call
+// succeed having applied almost none of it -- a create with no disk,
+// a container with no template, a resource change that moved only
+// the field whose name happened to match.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DownloadIsoArgs {
     /// Inventory name of the cluster.
     pub cluster: String,

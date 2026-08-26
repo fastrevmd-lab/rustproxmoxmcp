@@ -5,6 +5,93 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-08-26
+
+Five tools. **Two gaps against the third-party server remain** -- see below;
+the opening of an earlier draft of this entry said one, which was wrong.
+
+**Re-mint or widen your tokens**: `KNOWN_TOOLS` grows by five, and a token
+minted against 0.7.1 carries none of the new scopes.
+
+**Arguments are not the same shape as 970's**, and unknown fields are now
+refused rather than ignored. A call written for the old server would otherwise
+have succeeded having applied almost none of it.
+
+**Two gaps remain, not one.**
+
+`execute_vm_command` is deliberately absent: the design spec makes it
+conditional on `mecmcp-policy` compiling an allow/deny rule set over the command
+subject, and that is not wired yet.
+
+`restore_backup` is present but **not equivalent**. The third-party tool takes
+`vmid` as a *new* restore target and offers `storage` and `unique`; here the
+plan resolves an **existing** guest and the apply passes `force=true`, so the
+same-shaped call overwrites a live guest rather than creating one.
+Restore-to-a-new-VMID has no equivalent. Do not read "five tools shipped" as
+"parity reached" -- see #57.
+
+### Added
+
+- **`create_vm`** and **`create_container`**, over the `create_guest` primitive
+  that had shipped in 0.7.0 with no tool calling it. `create_container`
+  defaults to `unprivileged=1`.
+- **`download_iso`**, over `download_url`. Requires an unrestricted guest scope:
+  a storage belongs to no guest, so no selector this grant carries can narrow
+  it.
+- **`update_container_resources`** -- cores, memory and swap on an LXC guest.
+  Cores apply immediately; memory and swap take effect at the next start, and
+  the response says so rather than implying the change is live.
+- **`stop_task`** -- cancel a running Proxmox task.
+
+### Security
+
+- **A `low` create could restore over an existing guest.** Proxmox restores a
+  backup by POSTing to the *same* endpoint a create uses; the difference is
+  three form fields (`archive`, `force`, `restore`). Because config keys were
+  forwarded verbatim, a token holding only `create_vm` could send them and
+  overwrite a live guest, skipping the destructive tier, the protection check
+  and change-set approval entirely. A create now refuses a VMID that already
+  exists, which closes the class rather than the one spelling of it, and the
+  restore controls are refused by name.
+- **Host-reaching config is refused**: `hookscript` and `args` run on the node,
+  `mpN` mounts a host path into a container, `hostpciN`/`usbN`/`devN`/`serialN`/
+  `parallelN` pass host devices through, and `lxc.*` can express all of them.
+  Values are checked too -- `scsi0` stays valid for `local-lvm:32` and is
+  refused for `/dev/sdb`.
+- **`unprivileged` is handled by value, not by key.** Proxmox reads an omitted
+  field as `0`, so refusing the key outright had permitted *only* privileged
+  containers. `1` is accepted, `0` refused, and a container gets `1` when the
+  caller says nothing.
+- **`stop_task` applies the protection gate.** A UPID's worker id names the
+  guest for guest-addressed work, and cancelling that interrupts the guest, so
+  it authorises the VMID exactly as every other interrupting tool does.
+  Guest-addressability is decided by worker **kind**, not by whether the id is
+  numeric -- `cephdestroyosd:3` is an OSD, and reading it as guest 3 would let
+  a token scoped to 3 cancel node work.
+- **`stop_task` reads the node from the handle.** It had taken a `node`
+  argument; a mismatched one addresses a path the task does not live at, and
+  Proxmox reports a successful cancel having stopped nothing.
+- **Rollbacks are not interruptible.** They rewrite a guest in place exactly as
+  restores and destroys do, and the partial-state guard had not listed them.
+- Download URLs are redacted in the audit record. A presigned URL carries its
+  authorisation in the userinfo or query string, and the audit target is
+  durable.
+
+### Fixed
+
+- `checksum_verified` claimed what the call cannot know: Proxmox verifies inside
+  the download task, so a mismatch surfaces later as a failed task. Renamed to
+  `checksum_verification_requested`.
+- The existence check refreshes the cluster snapshot first. A guest destroyed
+  moments earlier still sat in the cache, so a freed VMID reported as taken for
+  the rest of the TTL.
+- A node job with no worker id -- `aptupdate::root@pam:` -- can be cancelled.
+  The strict UPID parse rejects the empty field, so the one tool that exists to
+  cancel those had refused them.
+- `stop_task`'s audit event keeps the guest and its protection verdict. A
+  protected guest interrupted under a waiver had left no evidence of why it was
+  allowed.
+
 ## [0.7.1] - 2026-08-26
 
 **No tool ships in this release.** The MCP tool surface is byte-identical to
