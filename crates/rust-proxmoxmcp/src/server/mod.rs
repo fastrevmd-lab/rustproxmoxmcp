@@ -224,8 +224,9 @@ impl ProxmoxServer {
         waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
         lab_mode: bool,
         evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
+        state_file: Option<&std::path::Path>,
     ) -> Result<Self, mecmcp_changeset::CoordinatorError> {
-        let coordinator = change_set::build_coordinator(None, lab_mode, evidence.clone())?;
+        let coordinator = change_set::build_coordinator(state_file, lab_mode, evidence.clone())?;
         Ok(Self::new(
             clusters,
             clients,
@@ -544,30 +545,52 @@ impl ProxmoxServer {
                 continue;
             };
 
-            // The cluster is not on the record, so try each configured client
-            // until one recognises the task. A UPID names its node, not its
-            // cluster, and two clusters can both have a node of that name.
-            let mut resolved = None;
-            for (cluster, client) in self.clients.iter() {
-                let upid_encoded = task_id.replace(':', "%3A");
-                let path = format!(
-                    "/api2/json/nodes/{}/tasks/{upid_encoded}/status",
-                    upid.node()
-                );
-                if let Ok(data) = client.get_json(&path, &[], &[]).await {
-                    resolved = Some((cluster.clone(), data));
-                    break;
-                }
-            }
-
-            let Some((cluster, data)) = resolved else {
+            // The cluster is on the record: `device` is `{cluster}/{vmid}`, the
+            // shape `plan_destroy` writes. Asking every configured client in
+            // turn would be worse than unnecessary — a UPID names its node, not
+            // its cluster, and two clusters can both have a node of that name,
+            // so the first one that answers could be answering about a
+            // different task entirely.
+            let Some((cluster, _)) = record.device.split_once('/') else {
                 tracing::error!(
                     target: "audit",
                     change_set = %record.id,
-                    %task_id,
-                    "no configured cluster could answer for this task; leaving it Applying"
+                    device = %record.device,
+                    "the record's device is not cluster/vmid; cannot choose a client"
                 );
                 continue;
+            };
+            let cluster = cluster.to_owned();
+
+            let Some(client) = self.clients.get(&cluster) else {
+                tracing::error!(
+                    target: "audit",
+                    change_set = %record.id,
+                    %cluster,
+                    "the record names a cluster this server no longer configures; \
+                     leaving it Applying rather than guessing"
+                );
+                continue;
+            };
+
+            let upid_encoded = task_id.replace(':', "%3A");
+            let path = format!(
+                "/api2/json/nodes/{}/tasks/{upid_encoded}/status",
+                upid.node()
+            );
+            let data = match client.get_json(&path, &[], &[]).await {
+                Ok(data) => data,
+                Err(error) => {
+                    tracing::error!(
+                        target: "audit",
+                        change_set = %record.id,
+                        %cluster,
+                        %task_id,
+                        %error,
+                        "could not read the task status; leaving it Applying"
+                    );
+                    continue;
+                }
             };
 
             let status = data.get("status").and_then(serde_json::Value::as_str);
@@ -585,20 +608,52 @@ impl ProxmoxServer {
                 continue;
             }
 
-            let exitstatus = data
-                .get("exitstatus")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
+            // A stopped task without an exit status is an answer this code
+            // does not have. Defaulting to "" would classify as failure and
+            // assert an outcome nobody observed — the same mistake
+            // `load_with_recovery` used to make. Leave it `Applying` and say
+            // so; a human can read the task.
+            let Some(exitstatus) = data.get("exitstatus").and_then(serde_json::Value::as_str)
+            else {
+                tracing::error!(
+                    target: "audit",
+                    change_set = %record.id,
+                    %cluster,
+                    %task_id,
+                    "the task is no longer running but reports no exit status; \
+                     leaving it Applying rather than inventing an outcome"
+                );
+                continue;
+            };
+
             let outcome = rust_proxmoxmcp_core::task::classify_exit_status(exitstatus);
-            record.state = match outcome {
-                rust_proxmoxmcp_core::task::TaskOutcome::Ok => {
-                    mecmcp_changeset::ChangeSetState::Applied
-                }
-                rust_proxmoxmcp_core::task::TaskOutcome::Failed(_) => {
-                    mecmcp_changeset::ChangeSetState::Failed
-                }
+            let succeeded = matches!(outcome, rust_proxmoxmcp_core::task::TaskOutcome::Ok);
+            record.state = if succeeded {
+                mecmcp_changeset::ChangeSetState::Applied
+            } else {
+                mecmcp_changeset::ChangeSetState::Failed
             };
             record.task_id = None;
+
+            // Close the evidence chain. Without this the record settles while
+            // the chain still ends at apply intent, so the evidence says a
+            // destroy was attempted and never says what happened to it.
+            if let Some(recorder) = &self.evidence
+                && let Err(receipt_error) = recorder.result_receipt(
+                    &record.id,
+                    &record.id,
+                    &record.device,
+                    record.approver.as_deref().unwrap_or("recovered-at-startup"),
+                    succeeded,
+                    exitstatus,
+                )
+            {
+                tracing::error!(
+                    %receipt_error,
+                    change_set = %record.id,
+                    "recovered outcome not written to the evidence chain"
+                );
+            }
 
             tracing::warn!(
                 target: "audit",
@@ -1802,6 +1857,13 @@ impl ProxmoxServer {
         // failing quietly, so it is said loudly instead.
         {
             let mut in_flight = record.clone();
+            // `Applying`, not the `Approved` snapshot this was verified from.
+            // `recover_in_flight` looks for `Applying` plus a handle, so
+            // persisting `Approved + task_id` would store the handle somewhere
+            // recovery never looks — and would leave the set approved, so a
+            // retry could issue a second destroy against a guest the first one
+            // already removed.
+            in_flight.state = mecmcp_changeset::ChangeSetState::Applying;
             in_flight.task_id = Some(upid_str.clone());
             if let Err(error) = self.coordinator.update_change_set(in_flight).await {
                 tracing::error!(

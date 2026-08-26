@@ -37,6 +37,21 @@ pub struct ProxmoxCli {
     #[arg(long = "lab-mode")]
     pub lab_mode: bool,
 
+    /// Absolute path to the change-set and operation state file.
+    ///
+    /// Spelled `--state-file` on every mecmcp server, per
+    /// `mecmcp/docs/PACKAGING.md`. **Without it the coordinator keeps change
+    /// sets in memory only**: every approval, preview and in-flight apply is
+    /// lost on restart, and `recover_in_flight` has nothing to scan. This
+    /// server shipped without the flag, so that is what 0.3 did.
+    ///
+    /// Left optional rather than defaulted so an existing deployment does not
+    /// silently start writing a file its unit never provisioned; the packaged
+    /// unit passes `$STATE_DIRECTORY/changeset-state.json`, and startup warns
+    /// loudly when it is unset.
+    #[arg(long = "state-file")]
+    pub state_file: Option<PathBuf>,
+
     /// Time-boxed operator waivers (spec §4.2). Mode 0600, service-owned.
     #[arg(long = "waivers-file", default_value = "/etc/proxmoxmcp/waivers.json")]
     pub waivers_file: PathBuf,
