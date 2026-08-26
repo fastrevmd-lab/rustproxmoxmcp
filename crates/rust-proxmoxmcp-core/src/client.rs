@@ -265,10 +265,10 @@ impl ProxmoxClient {
     }
 }
 
-/// Percent-encode a string for use in a URL query parameter.
+/// Percent-encode a string for use in a URL query parameter or path segment.
 ///
 /// Encodes all characters except unreserved ones (alphanumeric, `-`, `.`, `_`, `~`).
-fn percent_encode(s: &str) -> String {
+pub(crate) fn percent_encode(s: &str) -> String {
     s.as_bytes()
         .iter()
         .map(|&byte| {
