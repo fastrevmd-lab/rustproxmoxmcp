@@ -216,6 +216,7 @@ const RESULT_LIMITS: ResultLimits = ResultLimits {
 pub const KNOWN_TOOLS: &[&str] = &[
     "apply_proxmox_change_set",
     "approve_proxmox_change_set",
+    "clone_vm",
     "create_backup",
     "create_snapshot",
     // AUTHORIZATION_ONLY_TOOLS: see below. Sorted in with the rest so the
@@ -244,6 +245,7 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "list_templates",
     "plan_proxmox_destroy",
     "reset_vm",
+    "resize_disk",
     "restart_container",
     "restore_backup",
     "rollback_snapshot",
@@ -281,6 +283,44 @@ pub struct GuestArgs {
     pub cluster: String,
     /// Numeric guest id, unique within the cluster.
     pub vmid: u32,
+}
+
+/// Arguments for cloning one guest.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CloneArgs {
+    /// Inventory name of the cluster.
+    pub cluster: String,
+    /// Guest to clone from.
+    pub vmid: u32,
+    /// VMID for the new guest. Must not be a protected pin.
+    pub newid: u32,
+    /// Name or hostname for the clone. Optional.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Full copy rather than a linked clone.
+    ///
+    /// Defaults to a full copy: a linked clone shares base storage with its
+    /// source, so deleting the source later breaks the clone. The cheaper
+    /// option should be asked for, not assumed.
+    #[serde(default = "default_true")]
+    pub full: bool,
+}
+
+/// Arguments for resizing one guest disk.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ResizeArgs {
+    /// Inventory name of the cluster.
+    pub cluster: String,
+    /// Numeric guest id.
+    pub vmid: u32,
+    /// Disk to resize, e.g. `rootfs`, `scsi0`.
+    pub disk: String,
+    /// New size: `+8G` to grow by, or an absolute value.
+    ///
+    /// Only the `+` form is treated as growing. An absolute value may be
+    /// smaller than the current disk, which destroys data, so it is refused
+    /// here and must go through the change-set flow.
+    pub size: String,
 }
 
 /// Arguments for taking a snapshot of one guest.
@@ -321,6 +361,11 @@ pub struct BackupArgs {
 /// vzdump's non-interrupting mode.
 fn default_backup_mode() -> String {
     "snapshot".to_owned()
+}
+
+/// A clone is a full copy unless the caller asks otherwise.
+const fn default_true() -> bool {
+    true
 }
 
 /// Arguments for a storage-scoped read.
@@ -1605,6 +1650,158 @@ impl ProxmoxServer {
     }
 
     #[tool(
+        name = "clone_vm",
+        description = "Clone a guest into a new VMID. Additive, so permitted on a protected source."
+    )]
+    async fn clone_vm(
+        &self,
+        Parameters(args): Parameters<CloneArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        use rust_proxmoxmcp_core::protect::creation_allowed;
+
+        let guest_args = GuestArgs {
+            cluster: args.cluster.clone(),
+            vmid: args.vmid,
+        };
+        let authorized = match self.authorize_low("clone_vm", &guest_args, &context).await {
+            Ok(authorized) => authorized,
+            Err(result) => return *result,
+        };
+
+        let client = match self.client_for(&args.cluster) {
+            Ok(client) => client,
+            Err(result) => return *result,
+        };
+
+        // The destination does not exist, so the protection union has nothing
+        // to evaluate against it. A pinned VMID is pinned because something is
+        // expected to live there; letting a clone claim it means the real guest
+        // has nowhere to go and the next delete against that number protects
+        // the wrong thing.
+        if !creation_allowed(client.cluster(), args.newid) {
+            return tool_error(format!(
+                "vmid {} is a protected pin in cluster {}; a clone may not claim it",
+                args.newid, args.cluster
+            ));
+        }
+
+        let guest = authorized.guest();
+        let upid = match rust_proxmoxmcp_core::guests::clone_guest(
+            client,
+            &guest.node,
+            guest.r#type,
+            guest.vmid,
+            args.newid,
+            args.name.as_deref(),
+            args.full,
+        )
+        .await
+        {
+            Ok(upid) => upid,
+            Err(error) => return tool_error(error),
+        };
+
+        tracing::info!(
+            target: "audit",
+            tool = "clone_vm",
+            cluster = args.cluster,
+            vmid = guest.vmid,
+            newid = args.newid,
+            node = %guest.node,
+            tier = "low",
+            interrupts = false,
+            full = args.full,
+            protection = %authorized.protection().summary(),
+            upid = %upid,
+            "proxmox clone started"
+        );
+
+        tool_result::<_, String>(
+            Ok(serde_json::json!({ "upid": upid, "vmid": args.newid, "node": guest.node })),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
+    }
+
+    #[tool(
+        name = "resize_disk",
+        description = "Grow a guest disk. A shrink is refused here and must go through the change-set flow."
+    )]
+    async fn resize_disk(
+        &self,
+        Parameters(args): Parameters<ResizeArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        use rust_proxmoxmcp_core::guests::resize_shrinks;
+
+        // Checked before authorization, because the answer decides which tier
+        // this call belongs to. A shrink is not a low-tier operation and must
+        // not be authorised as one — `authorize_low` would grant it on a
+        // `low` action tier the operator never intended for data loss.
+        if resize_shrinks(&args.size) {
+            return tool_error(format!(
+                "size '{}' is not an unambiguous grow. Only the '+N' form adds capacity; \
+                 an absolute size may be smaller than the current disk, which destroys \
+                 data. Plan a shrink through plan_proxmox_destroy instead.",
+                args.size
+            ));
+        }
+
+        let guest_args = GuestArgs {
+            cluster: args.cluster.clone(),
+            vmid: args.vmid,
+        };
+        let authorized = match self
+            .authorize_low("resize_disk", &guest_args, &context)
+            .await
+        {
+            Ok(authorized) => authorized,
+            Err(result) => return *result,
+        };
+
+        let client = match self.client_for(&args.cluster) {
+            Ok(client) => client,
+            Err(result) => return *result,
+        };
+        let guest = authorized.guest();
+
+        let upid = match rust_proxmoxmcp_core::guests::resize_disk(
+            client,
+            &guest.node,
+            guest.r#type,
+            guest.vmid,
+            &args.disk,
+            &args.size,
+        )
+        .await
+        {
+            Ok(upid) => upid,
+            Err(error) => return tool_error(error),
+        };
+
+        tracing::info!(
+            target: "audit",
+            tool = "resize_disk",
+            cluster = args.cluster,
+            vmid = guest.vmid,
+            node = %guest.node,
+            tier = "low",
+            interrupts = false,
+            disk = %args.disk,
+            size = %args.size,
+            protection = %authorized.protection().summary(),
+            "proxmox disk resized"
+        );
+
+        tool_result::<_, String>(
+            Ok(serde_json::json!({ "upid": upid, "vmid": guest.vmid, "node": guest.node })),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
+    }
+
+    #[tool(
         name = "plan_proxmox_destroy",
         description = "Plan a guest destroy operation for two-principal approval."
     )]
@@ -2549,9 +2746,11 @@ mod tests {
         // release has registered yet — deriving from it would let this test
         // pass for a tool that does not exist.
         let low_tools = [
+            "clone_vm",
             "create_backup",
             "create_snapshot",
             "reset_vm",
+            "resize_disk",
             "restart_container",
             "shutdown_vm",
             "start_container",
