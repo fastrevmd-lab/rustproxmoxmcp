@@ -26,6 +26,16 @@ fn routes() -> Vec<common::Route> {
             status: 200,
             body: br#"{"data":null}"#,
         },
+        common::Route {
+            path: "/api2/json/nodes/pve2/tasks/UPID%3Apve2%3A0000A1B2%3A00C3D4E5%3A66BC1234%3Aaptupdate%3A%3Aroot%40pam%3A",
+            status: 200,
+            body: br#"{"data":null}"#,
+        },
+        common::Route {
+            path: "/api2/json/nodes/pve2/tasks/UPID%3Apve2%3A0000A1B2%3A00C3D4E5%3A66BC1234%3Asrvreload%3Apve2%3Aroot%40pam%3A",
+            status: 200,
+            body: br#"{"data":null}"#,
+        },
     ]
 }
 
@@ -269,4 +279,46 @@ async fn the_cancel_goes_to_the_node_named_in_the_handle() {
         .into_iter()
         .any(|r| r.method == "DELETE" && r.path.starts_with("/api2/json/nodes/pve2/tasks/"));
     assert!(sent_to_pve2, "the cancel must address the handle's node");
+}
+
+/// Node work carries numeric ids too. `cephdestroyosd:617` is OSD 617, and
+/// reading it as guest 617 would let a token scoped to 600-699 cancel node work
+/// whenever the numbers happened to coincide.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn node_work_with_a_guest_shaped_id_still_needs_a_wildcard_scope() {
+    let h =
+        common::TestServer::start_with_routes(spec(&["stop_task"], &["vmid:600-699"]), routes())
+            .await;
+
+    let err = common::call(
+        &h,
+        "stop_task",
+        json!({"cluster":"pve3","upid":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:cephdestroyosd:617:root@pam:"}),
+    )
+    .await
+    .expect_err("an OSD id is not a VMID");
+    assert!(err.contains('*'), "{err}");
+
+    let deletes = h
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "DELETE")
+        .count();
+    assert_eq!(deletes, 0);
+}
+
+/// A node job may legitimately have no worker id at all, and must still be
+/// cancellable — the strict UPID parse rejects those outright.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_job_without_a_worker_id_can_be_stopped() {
+    let h = common::TestServer::start_with_routes(spec(&["stop_task"], &["*"]), routes()).await;
+
+    let out = common::call(
+        &h,
+        "stop_task",
+        json!({"cluster":"pve3","upid":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:aptupdate::root@pam:"}),
+    )
+    .await
+    .expect("a node job with no worker id is still a task");
+    assert_eq!(out["node"], "pve2");
 }

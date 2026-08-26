@@ -729,6 +729,49 @@ pub fn stopping_task_leaves_partial_state(upid: &str) -> bool {
     )
 }
 
+/// The node a task handle names, without requiring the rest to parse.
+///
+/// [`crate::task::Upid`] refuses a handle whose worker id is empty, which is
+/// legitimate for node jobs -- `UPID:pve2:...:aptupdate::root@pam:` has none.
+/// Cancelling those is exactly what a node-level stop is for, so the node is
+/// read directly rather than through a parse that rejects them.
+///
+/// Returns `None` when the handle is not a UPID at all.
+#[must_use]
+pub fn upid_node(upid: &str) -> Option<&str> {
+    let mut fields = upid.split(':');
+    if fields.next()? != "UPID" {
+        return None;
+    }
+    let node = fields.next()?;
+    if node.is_empty() || node.chars().any(|c| c.is_control() || c == '/') {
+        return None;
+    }
+    Some(node)
+}
+
+/// Whether a task handle names a guest, and which one.
+///
+/// Decided by the **worker kind**, not by whether the id happens to be a
+/// number. Proxmox emits node-level work with numeric ids too --
+/// `cephdestroyosd:<osdid>` is an OSD number, not a VMID -- so treating any
+/// digits as a guest would let a guest-scoped token cancel node work whenever
+/// the numbers coincided, and would reject an unrestricted caller whose OSD
+/// number does not resolve as a guest.
+///
+/// QEMU workers are `qm*` and container workers are `vz*`. Both still need a
+/// numeric id: a node-wide `vzdump` with no guest id is node-level work under
+/// a guest-shaped kind.
+#[must_use]
+pub fn task_guest(upid: &str) -> Option<u32> {
+    let mut fields = upid.split(':');
+    let kind = fields.nth(5)?;
+    if !(kind.starts_with("qm") || kind.starts_with("vz")) {
+        return None;
+    }
+    fields.next()?.parse::<u32>().ok()
+}
+
 /// Ask Proxmox to stop a running task.
 ///
 /// The task is asked to stop; it is not guaranteed to have stopped when this
@@ -832,5 +875,57 @@ mod task_cancellation_tests {
                 "{upid:?} cannot be classified and must be refused"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod task_addressing_tests {
+    use super::{task_guest, upid_node};
+
+    #[test]
+    fn a_guest_worker_names_its_guest() {
+        for (upid, want) in [
+            (
+                "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:qmigrate:905:root@pam:",
+                Some(905),
+            ),
+            (
+                "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdump:617:root@pam:",
+                Some(617),
+            ),
+            (
+                "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:qmstart:100:root@pam:",
+                Some(100),
+            ),
+        ] {
+            assert_eq!(task_guest(upid), want, "{upid}");
+        }
+    }
+
+    /// Node-level work carries numeric ids too. `cephdestroyosd:3` is OSD 3,
+    /// and reading it as guest 3 would let a token scoped to guest 3 cancel it.
+    #[test]
+    fn node_work_with_a_numeric_id_is_not_a_guest() {
+        for upid in [
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:cephdestroyosd:3:root@pam:",
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:srvreload:pve2:root@pam:",
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:aptupdate::root@pam:",
+            // A node-wide backup under a guest-shaped kind, with no guest id.
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdump::root@pam:",
+        ] {
+            assert_eq!(task_guest(upid), None, "{upid}");
+        }
+    }
+
+    /// A node job with no worker id is still cancellable, so its node must be
+    /// readable without the strict parse that rejects the empty field.
+    #[test]
+    fn the_node_is_readable_even_without_a_worker_id() {
+        assert_eq!(
+            upid_node("UPID:pve2:0000A1B2:00C3D4E5:66BC1234:aptupdate::root@pam:"),
+            Some("pve2")
+        );
+        assert_eq!(upid_node("not-a-upid"), None);
+        assert_eq!(upid_node("UPID::x:y:z:aptupdate::root@pam:"), None);
     }
 }

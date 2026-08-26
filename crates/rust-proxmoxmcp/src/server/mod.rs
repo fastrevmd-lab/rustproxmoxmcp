@@ -2259,11 +2259,13 @@ impl ProxmoxServer {
         // here follows that rule because guests migrate; it matters just as
         // much for a task, where a mismatched node addresses a path the task
         // does not live at and Proxmox answers that cheerfully.
-        let parsed = match rust_proxmoxmcp_core::task::Upid::parse(&args.upid) {
-            Ok(parsed) => parsed,
-            Err(error) => return tool_error(format!("upid: {error}")),
+        let Some(node) = rust_proxmoxmcp_core::guests::upid_node(&args.upid).map(ToOwned::to_owned)
+        else {
+            return tool_error(format!(
+                "'{}' is not a task handle: a UPID is 'UPID:node:...:worker:id:user:'",
+                args.upid
+            ));
         };
-        let node = parsed.node().to_owned();
 
         let caller = Self::caller(&context);
         if let Err(error) = authorize_call(
@@ -2294,18 +2296,22 @@ impl ProxmoxServer {
         // interrupting tool does, protection gate included. Cancelling a
         // migration of a protected guest is not a node-level act merely because
         // the endpoint happens to be addressed by node.
-        match parsed.id().parse::<u32>() {
-            Ok(task_vmid) => {
+        // Guest-addressability comes from the worker kind, not from whether the
+        // id is a number: `cephdestroyosd:3` is OSD 3, and reading it as guest
+        // 3 would let a token scoped to guest 3 cancel node work.
+        let authorized = match rust_proxmoxmcp_core::guests::task_guest(&args.upid) {
+            Some(task_vmid) => {
                 let guest_args = GuestArgs {
                     cluster: args.cluster.clone(),
                     vmid: task_vmid,
                 };
-                if let Err(result) = self.authorize_low("stop_task", &guest_args, &context).await {
-                    return *result;
+                match self.authorize_low("stop_task", &guest_args, &context).await {
+                    Ok(authorized) => Some(authorized),
+                    Err(result) => return *result,
                 }
             }
-            Err(_) => {
-                // A node-level task names no guest, so no selector can narrow it
+            None => {
+                // Node-level work names no guest, so no selector can narrow it
                 // and no protection gate applies. An unrestricted guest scope
                 // stands in, as it does for `download_iso`.
                 if !grant.is_unrestricted_guest_scope() {
@@ -2316,8 +2322,9 @@ impl ProxmoxServer {
                         args.upid
                     ));
                 }
+                None
             }
-        }
+        };
 
         if let Err(error) = rust_proxmoxmcp_core::guests::stop_task(client, &node, &args.upid).await
         {
@@ -2332,6 +2339,13 @@ impl ProxmoxServer {
             tier = "low",
             interrupts = true,
             upid = %args.upid,
+            // Present for guest-addressed work, absent for node jobs. A
+            // protected guest allowed through a waiver or lab mode has to leave
+            // that verdict in the record, or the trail says a protected guest's
+            // operation was interrupted with no evidence of why it was allowed.
+            vmid = ?authorized.as_ref().map(|a| a.guest().vmid),
+            guest = ?authorized.as_ref().map(|a| a.guest().name.clone()),
+            protection = ?authorized.as_ref().map(|a| a.protection().summary()),
             "proxmox task stop requested"
         );
 
