@@ -401,10 +401,12 @@ pub struct ContainerResourceArgs {
 pub struct StopTaskArgs {
     /// Inventory name of the cluster.
     pub cluster: String,
-    /// Node running the task. A UPID names its node, but Proxmox addresses the
-    /// cancel by path, so it is taken explicitly rather than parsed out.
-    pub node: String,
     /// Task handle, as returned by any tool that starts one.
+    ///
+    /// The node is read from the handle rather than accepted as an argument. A
+    /// UPID names the node that owns the task, and a caller-supplied node that
+    /// disagreed would address a path the task does not live at -- Proxmox
+    /// would answer cheerfully and stop nothing.
     pub upid: String,
 }
 
@@ -2253,6 +2255,16 @@ impl ProxmoxServer {
             ));
         }
 
+        // The node comes from the handle, never the caller. Every other tool
+        // here follows that rule because guests migrate; it matters just as
+        // much for a task, where a mismatched node addresses a path the task
+        // does not live at and Proxmox answers that cheerfully.
+        let parsed = match rust_proxmoxmcp_core::task::Upid::parse(&args.upid) {
+            Ok(parsed) => parsed,
+            Err(error) => return tool_error(format!("upid: {error}")),
+        };
+        let node = parsed.node().to_owned();
+
         let caller = Self::caller(&context);
         if let Err(error) = authorize_call(
             caller.as_ref(),
@@ -2276,19 +2288,38 @@ impl ProxmoxServer {
             return tool_error("stop_task requires the 'low' action tier");
         }
 
-        // A task names a node, not a guest. Its `id` field may name one, but a
-        // node-wide task has none, so there is nothing for a guest selector to
-        // match — the same gap `download_iso` runs into.
-        if !grant.is_unrestricted_guest_scope() {
-            return tool_error(
-                "stop_task addresses a node-level task rather than a guest, so it requires a token \
-                 whose guest scope is '*'. This token is narrowed to specific guests and cannot be \
-                 checked against a task.",
-            );
+        // A UPID's `id` names the guest for guest-addressed work: `vzdump:617`
+        // is a backup *of 617*. Interrupting it interrupts that guest's
+        // operation, so it goes through the same authorization every other
+        // interrupting tool does, protection gate included. Cancelling a
+        // migration of a protected guest is not a node-level act merely because
+        // the endpoint happens to be addressed by node.
+        match parsed.id().parse::<u32>() {
+            Ok(task_vmid) => {
+                let guest_args = GuestArgs {
+                    cluster: args.cluster.clone(),
+                    vmid: task_vmid,
+                };
+                if let Err(result) = self.authorize_low("stop_task", &guest_args, &context).await {
+                    return *result;
+                }
+            }
+            Err(_) => {
+                // A node-level task names no guest, so no selector can narrow it
+                // and no protection gate applies. An unrestricted guest scope
+                // stands in, as it does for `download_iso`.
+                if !grant.is_unrestricted_guest_scope() {
+                    return tool_error(format!(
+                        "task '{}' is node-level rather than guest-addressed, so it requires a \
+                         token whose guest scope is '*'. This token is narrowed to specific \
+                         guests and cannot be checked against it.",
+                        args.upid
+                    ));
+                }
+            }
         }
 
-        if let Err(error) =
-            rust_proxmoxmcp_core::guests::stop_task(client, &args.node, &args.upid).await
+        if let Err(error) = rust_proxmoxmcp_core::guests::stop_task(client, &node, &args.upid).await
         {
             return tool_error(error);
         }
@@ -2297,7 +2328,7 @@ impl ProxmoxServer {
             target: "audit",
             tool = "stop_task",
             cluster = args.cluster,
-            node = %args.node,
+            node = %node,
             tier = "low",
             interrupts = true,
             upid = %args.upid,
@@ -2307,7 +2338,7 @@ impl ProxmoxServer {
         tool_result::<_, String>(
             Ok(serde_json::json!({
                 "upid": args.upid,
-                "node": args.node,
+                "node": node,
                 "note": "a stop was requested; read the task status to learn whether it stopped",
             })),
             ResultFormat::PrettyJson,

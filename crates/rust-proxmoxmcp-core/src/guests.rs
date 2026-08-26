@@ -720,7 +720,12 @@ pub fn stopping_task_leaves_partial_state(upid: &str) -> bool {
     }
     matches!(
         worker_type,
+        // Restores and destroys rewrite a guest in place...
         "qmrestore" | "vzrestore" | "qmdestroy" | "vzdestroy"
+        // ...and so does a rollback, which is the same replacement with the
+        // source being a snapshot rather than an archive. Interrupting one
+        // leaves disks and configuration from different points in time.
+        | "qmrollback" | "vzrollback"
     )
 }
 
@@ -801,6 +806,8 @@ mod task_cancellation_tests {
             "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzrestore:617:root@pam:",
             "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:qmdestroy:617:root@pam:",
             "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:617:root@pam:",
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:qmrollback:617:root@pam:",
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzrollback:617:root@pam:",
         ] {
             assert!(
                 stopping_task_leaves_partial_state(upid),

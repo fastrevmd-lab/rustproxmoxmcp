@@ -108,7 +108,7 @@ async fn a_backup_task_can_be_stopped() {
         &h,
         "stop_task",
         json!({
-            "cluster":"pve3","node":"pve2",
+            "cluster":"pve3",
             "upid":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdump:617:root@pam:"
         }),
     )
@@ -125,13 +125,9 @@ async fn stopping_a_restore_is_refused() {
 
     for worker in ["qmrestore", "vzrestore", "qmdestroy", "vzdestroy"] {
         let upid = format!("UPID:pve2:0000A1B2:00C3D4E5:66BC1234:{worker}:617:root@pam:");
-        let err = common::call(
-            &h,
-            "stop_task",
-            json!({"cluster":"pve3","node":"pve2","upid":upid}),
-        )
-        .await
-        .expect_err("a restore or destroy must not be interruptible");
+        let err = common::call(&h, "stop_task", json!({"cluster":"pve3","upid":upid}))
+            .await
+            .expect_err("a restore or destroy must not be interruptible");
         assert!(err.contains("half-way"), "{worker}: {err}");
     }
 
@@ -152,17 +148,45 @@ async fn an_unreadable_task_handle_is_refused() {
     let err = common::call(
         &h,
         "stop_task",
-        json!({"cluster":"pve3","node":"pve2","upid":"not-a-upid"}),
+        json!({"cluster":"pve3","upid":"not-a-upid"}),
     )
     .await
     .expect_err("an unreadable handle must be refused");
     assert!(!err.is_empty());
 }
 
-/// A task belongs to a node, not a guest, so a narrowed guest scope has nothing
-/// to match against.
+/// A guest-addressed task is checked against the guest scope, so a narrowed
+/// token may cancel work on a guest it holds -- and may not on one it does not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_narrowed_token_may_not_stop_a_task() {
+async fn a_narrowed_token_is_scoped_per_guest_not_shut_out() {
+    let h =
+        common::TestServer::start_with_routes(spec(&["stop_task"], &["vmid:600-699"]), routes())
+            .await;
+
+    // 617 is inside the scope.
+    common::call(
+        &h,
+        "stop_task",
+        json!({"cluster":"pve3","upid":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdump:617:root@pam:"}),
+    )
+    .await
+    .expect("617 is in scope");
+
+    // 700 is not.
+    let err = common::call(
+        &h,
+        "stop_task",
+        json!({"cluster":"pve3","upid":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdump:700:root@pam:"}),
+    )
+    .await
+    .expect_err("700 is outside vmid:600-699");
+    assert!(!err.is_empty());
+}
+
+/// A node-level task names no guest, so nothing can narrow it and an
+/// unrestricted scope stands in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_narrowed_token_may_not_stop_a_node_level_task() {
     let h =
         common::TestServer::start_with_routes(spec(&["stop_task"], &["vmid:600-699"]), routes())
             .await;
@@ -170,13 +194,10 @@ async fn a_narrowed_token_may_not_stop_a_task() {
     let err = common::call(
         &h,
         "stop_task",
-        json!({
-            "cluster":"pve3","node":"pve2",
-            "upid":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdump:617:root@pam:"
-        }),
+        json!({"cluster":"pve3","upid":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:srvreload:pve2:root@pam:"}),
     )
     .await
-    .expect_err("a guest-scoped token must not stop a node task");
+    .expect_err("a node-level task needs an unrestricted scope");
     assert!(err.contains('*'), "{err}");
 }
 
@@ -198,4 +219,54 @@ async fn get_container_ip_refuses_a_qemu_guest_by_name() {
         err.to_uppercase().contains("QEMU") || err.to_lowercase().contains("container"),
         "the refusal must name the guest-type mismatch: {err}"
     );
+}
+
+/// A UPID whose `id` is a VMID names *that guest's* operation. Cancelling it
+/// interrupts the guest, so it goes through the protection gate rather than
+/// past it on a wildcard scope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_a_protected_guests_task_is_refused() {
+    let h = common::TestServer::start_with_routes(spec(&["stop_task"], &["*"]), routes()).await;
+
+    let err = common::call(
+        &h,
+        "stop_task",
+        json!({"cluster":"pve3","upid":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:qmigrate:905:root@pam:"}),
+    )
+    .await
+    .expect_err("905 is protected");
+    assert!(
+        err.to_lowercase().contains("protect"),
+        "the refusal must name protection: {err}"
+    );
+
+    let deletes = h
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "DELETE")
+        .count();
+    assert_eq!(deletes, 0, "no cancel may be sent");
+}
+
+/// The node is read from the handle. A caller cannot send the cancel to a node
+/// the task does not live on, where Proxmox would report success and stop
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_cancel_goes_to_the_node_named_in_the_handle() {
+    let h = common::TestServer::start_with_routes(spec(&["stop_task"], &["*"]), routes()).await;
+
+    let out = common::call(
+        &h,
+        "stop_task",
+        json!({"cluster":"pve3","upid":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdump:617:root@pam:"}),
+    )
+    .await
+    .expect("stop");
+    assert_eq!(out["node"], "pve2");
+
+    let sent_to_pve2 = h
+        .requests()
+        .into_iter()
+        .any(|r| r.method == "DELETE" && r.path.starts_with("/api2/json/nodes/pve2/tasks/"));
+    assert!(sent_to_pve2, "the cancel must address the handle's node");
 }
