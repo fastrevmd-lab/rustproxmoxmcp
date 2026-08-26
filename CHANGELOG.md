@@ -5,6 +5,58 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-08-26
+
+Provisioning. Two tools become reachable -- `clone_vm` and `resize_disk` --
+and the guards a create needs that a guest-addressed operation never did.
+
+### Added
+
+- **`clone_vm`** and **`resize_disk`**. Both names were already in
+  `WRITE_TOOLS` at 0.6.0 but absent from `KNOWN_TOOLS`, so no token could be
+  granted them. **Re-mint or widen your tokens** to use them: a token minted
+  against 0.6.0 carries neither scope.
+- `clone_guest`, `create_guest`, `download_url` and `resize_disk` primitives.
+  `create_guest` and `download_url` have **no tool calling them yet** -- see
+  issue #57 for what still stands between this server and retiring the
+  third-party one.
+
+### Security
+
+- **A clone can no longer escape its token's guest scope.** `authorize_low`
+  checked the *source* and nothing looked at `newid`, so a token scoped to
+  `vmid:600-699` could clone 606 into 800 -- creating a guest outside its
+  grant, and probing which VMIDs were free while doing it. Only the grant
+  terms a bare number can answer participate: `*` and `vmid:`. A `tag:` or
+  `pool:` grant cannot admit a creation destination, because the new guest's
+  tags are whatever the caller sets, which would let a token choose its own
+  scope.
+- **A create is checked against `protected_vmids`.** The protection union is
+  evaluated against a resolved guest, so a pinned VMID was unenforced at
+  exactly the moment it was cheapest to enforce -- the VMID does not exist
+  yet. Letting a create claim a pinned number means the next `delete_vm`
+  against it is refused for protecting a guest nobody intended to protect.
+
+### Fixed
+
+- **The resize refusal no longer names an action that destroys the guest.**
+  It directed a shrink to `plan_proxmox_destroy`, which takes a cluster and a
+  vmid and deletes the whole guest -- it has no disk or size field. The
+  correction went through four revisions: the schema description still named
+  the change-set flow after the error message stopped, and the replacement
+  advice ("use the Proxmox UI or CLI") was itself unsupported, because
+  `qm resize` and `pct resize` reject a reduction too. It now states that
+  shrinking is unsupported here *and* in Proxmox, and names only the retry
+  that works.
+- **The resize audit event keeps its task handle.** It was empty when the
+  resize answered synchronously.
+- A synchronous resize returning `null` is a completed resize, not a failure.
+- A container names itself `hostname` and a VM names itself `name`. Proxmox
+  ignores the wrong spelling silently, so a clone would have succeeded under
+  the wrong name with nobody told.
+- A download checksum is verified only when algorithm and value are both
+  present; one alone is ignored. They now travel together or not at all.
+
 ## [0.6.0] - 2026-08-26
 
 Completes the destructive tier. 0.3 built the change-set machinery and wired
