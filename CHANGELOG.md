@@ -5,6 +5,104 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-08-26
+
+**No tool ships in this release.** The MCP tool surface is byte-identical to
+0.7.0 -- verified, not assumed. Upgrading changes nothing an MCP client can
+call, and no token needs re-minting.
+
+What lands is the `guest_exec` core primitive, its tests, and the cutover
+documentation. `execute_vm_command` parity is **not** delivered: nothing
+calls `guest_exec`, so it is unreachable from the tool surface. The branch
+was titled "guest_exec behind a change set" and it is not behind one, because
+it is not behind anything. Wiring it to the destructive change-set flow is
+tracked in #57.
+
+Versioned as a patch on the operator-facing view, where nothing changed.
+Consumers of the `rust-proxmoxmcp-core` **library** do see an additive public
+function, which by strict semver would be a minor bump.
+
+### Security
+
+- **The fingerprint re-check at apply was a no-op inside the resource-cache
+  window.** `GuestIndex` caches `/cluster/resources` for
+  `resource_cache_ttl_secs` (default 10s), and the apply handler never dropped
+  it. Plan and apply therefore read the *same* cached snapshot and the
+  comparison could not fail: a guest renamed, migrated, stopped, started, or
+  newly tagged `protected` between approval and apply compared equal and was
+  acted on. Apply now invalidates the snapshot before re-resolving.
+
+  The existing test passed only because its harness invalidated the cache
+  itself. A second test now moves the guest **without** invalidating -- what
+  Proxmox actually does -- and it fails against the old handler.
+
+- **A fetch that began before an invalidation can no longer republish stale
+  state.** `GuestIndex::resolve` inserted last-write-wins, so an in-flight
+  `/cluster/resources` request that started before the change could land after
+  the invalidation and put the pre-change snapshot back. Apply resolves twice
+  -- once for protection, once inside `authorize` where the fingerprint is
+  computed -- so the second read could consume that reinserted snapshot and
+  match, defeating the invalidation above. A generation counter now refuses an
+  insert from any fetch that started before the last invalidation.
+
+  The comparison happens **inside** the write-locked critical section. Doing
+  it before taking the lock left a time-of-check/time-of-use gap in which an
+  invalidation could bump the generation and clear the map, after which the
+  insert would republish pre-change state on the strength of an already-stale
+  comparison. It is correct only because invalidation bumps the generation
+  before it takes that lock.
+
+  Covered by a test that parks a request mid-flight against the mock server
+  and invalidates around it, rather than hoping for the interleaving. The mock
+  gained a `captured_count` signal for this: `request_count` rises when a
+  request is *recorded*, which is before its route is read, so a test
+  synchronising on it can swap the route first and hand the parked request the
+  post-change body -- passing for the wrong reason.
+
+- **Invalidation is cluster-scoped.** `invalidate()` cleared every cluster's
+  snapshot, so applying to one cluster evicted still-valid state for all the
+  others and made their next operation pay a fetch that could fail if that
+  cluster was briefly unreachable. Apply now uses `invalidate_cluster`.
+
+### Added
+
+- `guests::guest_exec` -- run a command inside a QEMU guest through the guest
+  agent. Strictly more powerful than `destroy_vm`, which is why the intended
+  wiring is a change set and why shipping it unreachable is the conservative
+  state rather than a gap to paper over.
+- `docs/MIGRATING-FROM-PROXMOX-MCP.md` -- the cutover guide from the
+  third-party `proxmox-mcp` server, including the UPID/task mapping that
+  replaces its job model.
+
+### Fixed
+
+- **Seven corrections to the migration guide**, three of them serious enough
+  to mislead an operator into damage or a failed cutover:
+  - It claimed `execute_vm_command` maps to `op: "guest_exec"` with a
+    `command` argument. No such mapping exists: `PlanDestroyArgs` has no
+    `command` field and `build_destroy_action` rejects `guest_exec`.
+  - It still told operators to shrink a disk "from the Proxmox UI or CLI".
+    Proxmox refuses a reduction too, so the guide now names no alternative.
+  - It promised "a guest that changed after approval is refused". The
+    fingerprint sends `config_digest` and `disks` **empty** at both plan and
+    apply, so a configuration-only change does not move it. The guarantee is
+    now stated as what it actually covers.
+  - `delete_backup` and `delete_iso` rows omitted the required `storage_node`.
+  - The token checklist omitted that plan and apply authorise a second time
+    against each destructive operation's own scope name.
+  - Options that silently vanished with a same-named tool are now listed:
+    `graceful` on stop, `vmstate` on snapshot, clone placement.
+  - Every parity gap is now named in the guide, with a plain instruction not
+    to cut over until #57 closes -- including `restore_backup`, whose target
+    semantics are the **opposite** of the incumbent's: it overwrites an
+    existing guest with `force=true` rather than restoring to a new VMID.
+  - `shutdown_vm` is QEMU-only, so containers have no graceful stop at all;
+    the guide said otherwise.
+  - `clone_vm` silently ignores `snapname`, cloning current state rather than
+    the requested snapshot, and renames `source_vmid`/`target_vmid`.
+- The approval does not bind the preview text (#56), stated in the guide
+  rather than implied.
+
 ## [0.7.0] - 2026-08-26
 
 Provisioning. Two tools become reachable -- `clone_vm` and `resize_disk` --

@@ -48,6 +48,16 @@ pub struct TlsMockServer {
     ca_pem_file: tempfile::NamedTempFile,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
     routes: Arc<Mutex<Vec<Route>>>,
+    /// Held open by [`TlsMockServer::hold_responses`] to keep a request
+    /// in flight while the test changes state around it.
+    gate: Arc<tokio::sync::RwLock<()>>,
+    /// Incremented once a request has chosen its response body.
+    ///
+    /// `request_count` rises when a request is *recorded*, which is before the
+    /// route is read. A test that changes routes on that signal can win the
+    /// race and hand the parked request the new body -- making a staleness
+    /// test pass for the wrong reason.
+    captured: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl TlsMockServer {
@@ -68,11 +78,15 @@ impl TlsMockServer {
 
         let requests = Arc::new(Mutex::new(Vec::new()));
         let routes_arc = Arc::new(Mutex::new(routes));
+        let gate = Arc::new(tokio::sync::RwLock::new(()));
+        let captured = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         Self::serve(
             listener,
             server_config,
             Arc::clone(&routes_arc),
             Arc::clone(&requests),
+            Arc::clone(&gate),
+            Arc::clone(&captured),
         );
 
         Self {
@@ -80,7 +94,27 @@ impl TlsMockServer {
             ca_pem_file,
             requests,
             routes: routes_arc,
+            gate,
+            captured,
         }
+    }
+
+    /// Hold every in-flight and subsequent response until the returned guard
+    /// is dropped.
+    ///
+    /// Lets a test park a request mid-flight and change state around it --
+    /// the only way to exercise a race between a fetch and an invalidation.
+    pub async fn hold_responses(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.gate).write_owned().await
+    }
+
+    /// How many requests have chosen their response body.
+    ///
+    /// Synchronise on this, not `request_count`, when a test needs a parked
+    /// request to be carrying a specific response.
+    #[must_use]
+    pub fn captured_count(&self) -> usize {
+        self.captured.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The HTTPS endpoint URI.
@@ -169,6 +203,8 @@ impl TlsMockServer {
         server_config: rustls::ServerConfig,
         routes: Arc<Mutex<Vec<Route>>>,
         requests: Arc<Mutex<Vec<RecordedRequest>>>,
+        gate: Arc<tokio::sync::RwLock<()>>,
+        captured: Arc<std::sync::atomic::AtomicUsize>,
     ) {
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
         tokio::spawn(async move {
@@ -179,11 +215,13 @@ impl TlsMockServer {
                 let acceptor = acceptor.clone();
                 let routes = Arc::clone(&routes);
                 let requests = Arc::clone(&requests);
+                let gate = Arc::clone(&gate);
+                let captured = Arc::clone(&captured);
                 tokio::spawn(async move {
                     let Ok(mut tls) = acceptor.accept(stream).await else {
                         return;
                     };
-                    Self::handle_request(&mut tls, &routes, &requests).await;
+                    Self::handle_request(&mut tls, &routes, &requests, &gate, &captured).await;
                 });
             }
         });
@@ -194,6 +232,8 @@ impl TlsMockServer {
         stream: &mut S,
         routes: &Arc<Mutex<Vec<Route>>>,
         requests: &Arc<Mutex<Vec<RecordedRequest>>>,
+        gate: &Arc<tokio::sync::RwLock<()>>,
+        captured: &Arc<std::sync::atomic::AtomicUsize>,
     ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
@@ -268,6 +308,7 @@ impl TlsMockServer {
 
         // Match a route by path (ignoring query string).
         let path = target.split('?').next().expect("split target");
+
         let (status, body) = {
             let routes_guard = routes.lock().expect("lock routes");
             let route = routes_guard.iter().find(|r| r.path == path);
@@ -277,6 +318,16 @@ impl TlsMockServer {
                 (404, b"Not Found" as &[u8])
             }
         }; // Guard is dropped here, before any await
+
+        // Announce that the body is fixed. A test synchronising on this cannot
+        // change the answer under a parked request.
+        captured.fetch_add(1, std::sync::atomic::Ordering::Release);
+
+        // Block *after* choosing the body, so a held request carries the
+        // response as it was when the request arrived. Holding before this
+        // point would let `replace_route` change the answer under a parked
+        // request, which is the opposite of what a staleness test needs.
+        let _release = gate.read().await;
 
         // Write the response.
         let response = format!(

@@ -595,3 +595,53 @@ pub async fn download_url(
     let data = client.post_form(path_template, params, &form).await?;
     upid_from(data)
 }
+
+/// Run a command inside a QEMU guest through the guest agent.
+///
+/// The most dangerous operation in this surface, and the reason it is reachable
+/// only through a change set. It is strictly more powerful than `destroy_vm`:
+/// it can do anything the guest's root user can, and it leaves no Proxmox-level
+/// record of what it did — the task says a command ran, not what it changed.
+///
+/// QEMU only. A container has no guest agent; `pct exec` is a different
+/// mechanism with different authorization, and pretending the two are one tool
+/// would hide that difference.
+///
+/// Returns the agent's PID, which `guest-exec-status` reads. Not a UPID: the
+/// command runs inside the guest, so Proxmox's task system never sees it and
+/// the task endpoints cannot report on it.
+///
+/// # Errors
+///
+/// Returns [`ProxmoxError::Malformed`] if the response carries no PID,
+/// [`ProxmoxError::Unauthorized`] for 401/403, [`ProxmoxError::Api`] for any
+/// other error status, or [`ProxmoxError::Http`] for network errors.
+pub async fn guest_exec(
+    client: &ProxmoxClient,
+    node: &str,
+    vmid: u32,
+    command: &[String],
+) -> Result<i64, ProxmoxError> {
+    if command.is_empty() {
+        return Err(ProxmoxError::Malformed("command is empty".into()));
+    }
+
+    let path_template = "/api2/json/nodes/{node}/qemu/{vmid}/agent/exec";
+    let vmid_string = vmid.to_string();
+    let params = &[("node", node), ("vmid", vmid_string.as_str())];
+
+    // Proxmox takes the argv as repeated `command` fields, which preserves the
+    // caller's word boundaries. Joining into one string would hand the guest's
+    // shell a line to re-split, and an argument containing a space would become
+    // two — a different command than the approver reviewed.
+    let form: Vec<(&str, &str)> = command
+        .iter()
+        .map(|argument| ("command", argument.as_str()))
+        .collect();
+
+    let data = client.post_form(path_template, params, &form).await?;
+
+    data.get("pid")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| ProxmoxError::Malformed("agent exec returned no pid".into()))
+}

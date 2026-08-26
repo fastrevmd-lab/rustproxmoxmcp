@@ -103,3 +103,101 @@ async fn a_second_resolve_within_the_ttl_issues_no_second_request() {
     index.resolve(&client, "pve3", 606).await.expect("second");
     assert_eq!(server.request_count(), 1);
 }
+
+/// A fetch that began before an invalidation must not publish its result
+/// afterwards.
+///
+/// This is the race a destructive apply depends on not happening: it drops the
+/// cluster snapshot precisely so its fingerprint re-check sees post-change
+/// state. Last-insert-wins would let an older in-flight fetch put the
+/// pre-change snapshot back, and the re-check would compare equal and destroy
+/// a guest that had moved.
+///
+/// The fetch is parked mid-flight with `hold_responses` so the interleaving is
+/// deterministic rather than hoped for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetch_started_before_an_invalidation_does_not_repopulate_the_cache() {
+    let (index, client, server) = index_and_client().await;
+    let index = std::sync::Arc::new(index);
+    let client = std::sync::Arc::new(client);
+
+    // Park every response, then start a fetch that will read the OLD body.
+    let hold = server.hold_responses().await;
+    let stale_fetch = {
+        let index = std::sync::Arc::clone(&index);
+        let client = std::sync::Arc::clone(&client);
+        tokio::spawn(async move { index.resolve(&client, "pve3", 905).await.map(|g| g.node) })
+    };
+
+    // Wait until the server has *chosen its body*, not merely recorded the
+    // request. `request_count` rises before route selection, so synchronising
+    // on it lets the route swap below win the race and hand the parked request
+    // the post-change body -- which would make this test pass without any
+    // stale data existing to republish.
+    for _ in 0..300 {
+        if server.captured_count() >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        server.captured_count() >= 1,
+        "the parked fetch must already hold the pre-change body"
+    );
+
+    // The world changes, and the cache is invalidated -- both while that
+    // earlier fetch is still parked holding pre-change data.
+    server.replace_route(Route {
+        path: "/api2/json/cluster/resources",
+        status: 200,
+        body: br#"{"data":[{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve3","status":"running","tags":"protected"}]}"#,
+    });
+    index.invalidate_cluster("pve3");
+
+    // Let the parked fetch complete. Its body is the pre-change one, and it
+    // must actually have succeeded: an error would mean nothing stale was ever
+    // offered to the cache, and the assertion below would pass vacuously.
+    drop(hold);
+    let stale_node = stale_fetch
+        .await
+        .expect("join")
+        .expect("the parked fetch must succeed");
+    assert_eq!(
+        stale_node, "pve2",
+        "the parked fetch must have carried the pre-change node"
+    );
+
+    // The next reader must not be served that reinserted pre-change snapshot.
+    let after = index.resolve(&client, "pve3", 905).await.expect("resolve");
+    assert_eq!(
+        after.node, "pve3",
+        "a fetch that started before the invalidation must not repopulate the cache"
+    );
+}
+
+/// Invalidating one cluster must not evict another's snapshot.
+#[tokio::test]
+async fn invalidating_one_cluster_leaves_the_others_cached() {
+    let (index, client, server) = index_and_client().await;
+
+    index.resolve(&client, "pve3", 905).await.expect("warm a");
+    index.resolve(&client, "other", 905).await.expect("warm b");
+    let warmed = server.request_count();
+
+    index.invalidate_cluster("pve3");
+
+    // The untouched cluster answers from cache: no new request.
+    index.resolve(&client, "other", 905).await.expect("cached");
+    assert_eq!(
+        server.request_count(),
+        warmed,
+        "invalidating pve3 must not evict the other cluster"
+    );
+
+    // The invalidated one refetches.
+    index.resolve(&client, "pve3", 905).await.expect("refetch");
+    assert!(
+        server.request_count() > warmed,
+        "the invalidated cluster must refetch"
+    );
+}
