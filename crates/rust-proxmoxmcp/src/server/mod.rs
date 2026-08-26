@@ -369,7 +369,6 @@ const REFUSED_CONFIG_KEYS: &[&str] = &[
     "force",
     "hookscript",
     "args",
-    "unprivileged",
     "cicustom",
 ];
 
@@ -1194,6 +1193,14 @@ impl ProxmoxServer {
         //
         // A protected guest is caught here too, before its tags are ever
         // consulted, because it exists.
+        // Drop the cluster snapshot first. A guest destroyed moments ago is
+        // still in the cached `/cluster/resources` response -- the apply path
+        // reads the guest to fingerprint it, which repopulates the cache, and
+        // nothing invalidates after the destroy task finishes. Without this, a
+        // VMID that is genuinely free reports as taken for the rest of the TTL,
+        // and the error tells the caller to destroy something already gone.
+        self.index.invalidate_cluster(cluster);
+
         match self.index.resolve(client, cluster, vmid).await {
             Ok(existing) => {
                 return Err(Box::new(tool_error(format!(
@@ -1249,6 +1256,20 @@ impl ProxmoxServer {
                  without them and set them from the Proxmox UI if you genuinely need them.",
                 offending.join(", ")
             )));
+        }
+
+        // `unprivileged` is the one key where the *value* decides, and the
+        // default decides against us: Proxmox treats an omitted field as 0,
+        // meaning privileged. Refusing the key outright therefore permitted
+        // only privileged containers -- the exact opposite of the intent.
+        // `unprivileged=1` is the safe setting and is accepted; 0 is refused.
+        if let Some(value) = config.get("unprivileged")
+            && value.trim() != "1"
+        {
+            return Some(tool_error(
+                "unprivileged=0 creates a privileged container, whose root maps to host root. \
+                 Pass unprivileged=1, or omit nothing and let this server pass it for you.",
+            ));
         }
 
         // A host path in any value, under any key. Proxmox storage references
@@ -2031,8 +2052,18 @@ impl ProxmoxServer {
             Err(result) => return *result,
         };
 
-        let config: Vec<(&str, &str)> = args
-            .config
+        // Proxmox reads an omitted `unprivileged` as 0 -- privileged. Silence
+        // must not select the dangerous option, so a container gets 1 unless
+        // the caller said otherwise (and `reject_unsafe_config` has already
+        // refused their saying 0).
+        let mut config_owned = args.config.clone();
+        if kind == GuestType::Lxc {
+            config_owned
+                .entry("unprivileged".to_owned())
+                .or_insert_with(|| "1".to_owned());
+        }
+
+        let config: Vec<(&str, &str)> = config_owned
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();
@@ -2060,7 +2091,7 @@ impl ProxmoxServer {
             vmid = args.vmid,
             node = %args.node,
             kind = %kind.path_segment(),
-            config_keys = %args.config.keys().cloned().collect::<Vec<_>>().join(","),
+            config_keys = %config_owned.keys().cloned().collect::<Vec<_>>().join(","),
             tier = "low",
             interrupts = false,
             upid = %upid,

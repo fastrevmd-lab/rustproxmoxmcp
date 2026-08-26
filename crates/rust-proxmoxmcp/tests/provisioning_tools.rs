@@ -316,7 +316,6 @@ async fn host_mounts_and_device_passthrough_are_refused() {
         ("mp0", "/,mp=/host"),
         ("hostpci0", "0000:01:00"),
         ("usb0", "host=1234:5678"),
-        ("unprivileged", "0"),
         ("lxc.cgroup.devices.allow", "a"),
     ] {
         let err = common::call(
@@ -364,4 +363,62 @@ async fn a_host_path_in_any_value_is_refused() {
     )
     .await
     .expect("a storage-backed disk must still be allowed");
+}
+
+/// Proxmox reads an omitted `unprivileged` as 0 -- privileged. Refusing the key
+/// outright therefore permitted only privileged containers, which was the exact
+/// opposite of the intent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_container_defaults_to_unprivileged() {
+    let h = common::TestServer::start_with_routes(
+        spec_with(&["create_container"], &["*"]),
+        provisioning_routes(),
+    )
+    .await;
+
+    common::call(
+        &h,
+        "create_container",
+        json!({"cluster":"pve3","node":"pve2","vmid":651,"config":{"hostname":"ct-651"}}),
+    )
+    .await
+    .expect("create");
+
+    let body = h
+        .requests()
+        .into_iter()
+        .find(|r| r.method == "POST" && r.path.ends_with("/lxc"))
+        .map(|r| r.body.clone())
+        .expect("the create must have been sent");
+    assert!(
+        body.contains("unprivileged=1"),
+        "silence must not select the privileged option: {body}"
+    );
+}
+
+/// `unprivileged=1` is the safe setting and must be accepted; 0 is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unprivileged_one_is_allowed_and_zero_is_not() {
+    let h = common::TestServer::start_with_routes(
+        spec_with(&["create_container"], &["*"]),
+        provisioning_routes(),
+    )
+    .await;
+
+    common::call(
+        &h,
+        "create_container",
+        json!({"cluster":"pve3","node":"pve2","vmid":651,"config":{"unprivileged":"1"}}),
+    )
+    .await
+    .expect("unprivileged=1 is the safe setting and must be allowed");
+
+    let err = common::call(
+        &h,
+        "create_container",
+        json!({"cluster":"pve3","node":"pve2","vmid":651,"config":{"unprivileged":"0"}}),
+    )
+    .await
+    .expect_err("a privileged container must be refused");
+    assert!(err.contains("privileged"), "{err}");
 }
