@@ -26,6 +26,28 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// Tool names that exist only as an authorization scope.
+///
+/// No `#[tool]` handler answers to these — the generic `plan_proxmox_destroy`
+/// and `apply_proxmox_change_set` handlers do the work. They are in
+/// `KNOWN_TOOLS` so the token CLI accepts them as a scope, and in `WRITE_TOOLS`
+/// so a wildcard token does not reach them.
+///
+/// Enumerated rather than left implicit because two invariants have to know
+/// about them: every other `KNOWN_TOOLS` entry must have a handler, and must
+/// fall into a known tier category. Naming the exception keeps both checks
+/// meaningful for everything else.
+#[cfg_attr(not(test), allow(dead_code))]
+const AUTHORIZATION_ONLY_TOOLS: &[&str] = &[
+    "delete_backup",
+    "delete_container",
+    "delete_iso",
+    "delete_snapshot",
+    "delete_vm",
+    "restore_backup",
+    "rollback_snapshot",
+];
+
 /// The concrete tool name a destructive operation authorises against.
 ///
 /// `plan_proxmox_destroy` and `apply_proxmox_change_set` are generic handlers.
@@ -37,9 +59,18 @@ use std::sync::Arc;
 /// So the operation maps to its own tool name and that scope is enforced too,
 /// at plan and again at apply. Both, because a scope can be narrowed between
 /// the two, and the apply is the call that acts.
-const fn tool_for_op(op: &str) -> Option<&'static str> {
+///
+/// `destroy_guest` maps by the *resolved* guest type, because `delete_vm` and
+/// `delete_container` are distinct scopes in `WRITE_TOOLS` and the dispatch
+/// calls a different primitive for each. Mapping both to `delete_vm` would
+/// deny a token granted `delete_container` its own containers, and let a token
+/// granted only `delete_vm` delete them.
+const fn tool_for_op(op: &str, kind: GuestType) -> Option<&'static str> {
     match op.as_bytes() {
-        b"destroy_guest" | b"destroy" => Some("delete_vm"),
+        b"destroy_guest" | b"destroy" => Some(match kind {
+            GuestType::Lxc => "delete_container",
+            GuestType::Qemu => "delete_vm",
+        }),
         b"delete_snapshot" => Some("delete_snapshot"),
         b"rollback_snapshot" => Some("rollback_snapshot"),
         b"delete_backup" => Some("delete_backup"),
@@ -81,16 +112,19 @@ fn render_destructive_preview(
             action.snapname.as_deref().unwrap_or("?")
         ),
         "delete_backup" => format!(
-            "DELETE BACKUP '{}' on storage '{}'\n  \
+            "DELETE BACKUP '{}' on storage '{}' at node '{}'\n  \
              The archive is removed. A backup cannot be re-created from the guest \
              as it was when the backup was taken.",
             action.volid.as_deref().unwrap_or("?"),
-            action.storage.as_deref().unwrap_or("?")
+            action.storage.as_deref().unwrap_or("?"),
+            action.storage_node.as_deref().unwrap_or("?")
         ),
         "delete_iso" => format!(
-            "DELETE ISO '{}' on storage '{}'\n  The image is removed. It can be downloaded again.",
+            "DELETE ISO '{}' on storage '{}' at node '{}'\n  \
+             The image is removed. It can be downloaded again.",
             action.volid.as_deref().unwrap_or("?"),
-            action.storage.as_deref().unwrap_or("?")
+            action.storage.as_deref().unwrap_or("?"),
+            action.storage_node.as_deref().unwrap_or("?")
         ),
         "restore_backup" => format!(
             "RESTORE {target} from '{}'\n  \
@@ -184,6 +218,13 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "approve_proxmox_change_set",
     "create_backup",
     "create_snapshot",
+    // AUTHORIZATION_ONLY_TOOLS: see below. Sorted in with the rest so the
+    // sortedness invariant still holds.
+    "delete_backup",
+    "delete_container",
+    "delete_iso",
+    "delete_snapshot",
+    "delete_vm",
     "get_cluster_status",
     "get_container_config",
     "get_container_ip",
@@ -204,6 +245,8 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "plan_proxmox_destroy",
     "reset_vm",
     "restart_container",
+    "restore_backup",
+    "rollback_snapshot",
     "shutdown_vm",
     "start_container",
     "start_vm",
@@ -1651,7 +1694,7 @@ impl ProxmoxServer {
         // Without this a token allowlisted for the generic handlers could
         // select any operation, and `WRITE_TOOLS` naming each destructive tool
         // separately would mean nothing.
-        let Some(op_tool) = tool_for_op(&action.op) else {
+        let Some(op_tool) = tool_for_op(&action.op, guest.r#type) else {
             return tool_error(format!("unknown destructive operation '{}'", action.op));
         };
         if let Err(error) =
@@ -1743,12 +1786,21 @@ impl ProxmoxServer {
                 job_id: None,
             });
             if let Err(error) = coordinator.update_change_set(with_preview).await {
+                // Fail the plan rather than returning one whose preview is not
+                // in the store. Approval and apply never require a preview, so
+                // a change set created without one still executes — the
+                // operator would have approved text that no longer exists
+                // anywhere, and nothing downstream would notice.
                 tracing::error!(
                     %error,
                     change_set = %output.change_set_id,
-                    "the preview could not be persisted; the approver's text is not \
-                     recoverable from the store"
+                    "the preview could not be persisted; the plan is refused"
                 );
+                return tool_error(format!(
+                    "plan refused: the preview could not be persisted ({error}). \
+                     The change set exists but has no stored preview, so it must not \
+                     be approved; cancel it and plan again."
+                ));
             }
         }
 
@@ -2098,7 +2150,7 @@ impl ProxmoxServer {
         // Again at apply. A scope can be narrowed between plan and apply, and
         // the apply is the call that acts — checking only at plan would let a
         // token whose authority was revoked still execute what it had planned.
-        let Some(op_tool) = tool_for_op(&action.op) else {
+        let Some(op_tool) = tool_for_op(&action.op, guest.r#type) else {
             return tool_error(format!(
                 "the change set names an unknown operation '{}'",
                 action.op
@@ -2469,8 +2521,10 @@ mod tests {
             assert!(
                 read_tools.contains(tool)
                     || changeset_tools.contains(tool)
-                    || low_tools.contains(tool),
-                "{tool} is in KNOWN_TOOLS but not in READ_TOOLS, changeset, or low-tier tools"
+                    || low_tools.contains(tool)
+                    || AUTHORIZATION_ONLY_TOOLS.contains(tool),
+                "{tool} is in KNOWN_TOOLS but not in READ_TOOLS, changeset, low-tier, \
+                 or authorization-only tools"
             );
         }
 
@@ -2529,14 +2583,27 @@ mod tests {
             .map(|tool| tool.name.into_owned())
             .collect();
         for name in KNOWN_TOOLS {
+            // The authorization-only names deliberately have no handler: the
+            // generic plan/apply handlers do the work, and these exist so a
+            // token can be scoped to one operation rather than all of them.
+            if AUTHORIZATION_ONLY_TOOLS.contains(name) {
+                continue;
+            }
             assert!(
                 registered.contains(*name),
                 "{name} is in KNOWN_TOOLS but has no #[tool] handler"
             );
         }
+        // Compare against the names that actually have handlers: the
+        // authorization-only entries are in KNOWN_TOOLS by design and the
+        // router will never list them.
+        let handler_names = KNOWN_TOOLS
+            .iter()
+            .filter(|name| !AUTHORIZATION_ONLY_TOOLS.contains(*name))
+            .count();
         assert_eq!(
             registered.len(),
-            KNOWN_TOOLS.len(),
+            handler_names,
             "router has tools absent from KNOWN_TOOLS"
         );
     }
@@ -2716,6 +2783,7 @@ mod destructive_action_tests {
 mod destructive_scope_tests {
     use super::{build_destroy_action, render_destructive_preview, tool_for_op};
     use crate::server::change_set::PlanDestroyArgs;
+    use rust_proxmoxmcp_core::selector::GuestType;
 
     /// Every operation authorises against its own tool name, so a token
     /// allowlisted only for the generic handlers cannot select any operation
@@ -2731,9 +2799,9 @@ mod destructive_scope_tests {
             ("delete_iso", "delete_iso"),
             ("restore_backup", "restore_backup"),
         ] {
-            assert_eq!(tool_for_op(op), Some(tool), "{op}");
+            assert_eq!(tool_for_op(op, GuestType::Qemu), Some(tool), "{op}");
         }
-        assert_eq!(tool_for_op("delete_everything"), None);
+        assert_eq!(tool_for_op("delete_everything", GuestType::Qemu), None);
     }
 
     /// Every mapped tool is in WRITE_TOOLS, or the scope check would be
@@ -2748,7 +2816,7 @@ mod destructive_scope_tests {
             "delete_iso",
             "restore_backup",
         ] {
-            let tool = tool_for_op(op).unwrap();
+            let tool = tool_for_op(op, GuestType::Qemu).unwrap();
             assert!(
                 rust_proxmoxmcp_core::tier::WRITE_TOOLS.contains(&tool),
                 "{tool} is not in WRITE_TOOLS, so a wildcard token would reach it"
@@ -2829,5 +2897,77 @@ mod destructive_scope_tests {
         };
         let error = build_destroy_action(&args).expect_err("storage_node is required");
         assert!(error.contains("storage_node"), "{error}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod grantable_scope_tests {
+    use super::{KNOWN_TOOLS, tool_for_op};
+    use rust_proxmoxmcp_core::selector::GuestType;
+
+    /// Every name the scope check demands must be grantable through the token
+    /// CLI, which validates against `KNOWN_TOOLS`.
+    ///
+    /// This is the test that was missing. The check landed without it and made
+    /// the whole destructive tier unusable: `token add --tools delete_snapshot`
+    /// was refused as an unknown tool, and a wildcard excludes these by design,
+    /// so no token could plan or apply *any* destructive operation. The unit
+    /// tests passed throughout because they build tokens directly and never
+    /// cross the CLI's validation.
+    #[test]
+    fn every_operation_scope_is_grantable() {
+        for op in [
+            "destroy_guest",
+            "destroy",
+            "delete_snapshot",
+            "rollback_snapshot",
+            "delete_backup",
+            "delete_iso",
+            "restore_backup",
+        ] {
+            for kind in [GuestType::Lxc, GuestType::Qemu] {
+                let tool = tool_for_op(op, kind).unwrap();
+                assert!(
+                    KNOWN_TOOLS.contains(&tool),
+                    "{op} authorises against '{tool}', which the token CLI rejects as unknown"
+                );
+            }
+        }
+    }
+
+    /// ...and every one of them stays excluded from the tool wildcard, or
+    /// making them grantable would have handed them to every `*` token.
+    #[test]
+    fn grantable_does_not_mean_reachable_by_wildcard() {
+        for op in ["destroy_guest", "delete_snapshot", "restore_backup"] {
+            for kind in [GuestType::Lxc, GuestType::Qemu] {
+                let tool = tool_for_op(op, kind).unwrap();
+                assert!(
+                    rust_proxmoxmcp_core::tier::WRITE_TOOLS.contains(&tool),
+                    "{tool} became reachable by a wildcard token"
+                );
+            }
+        }
+    }
+
+    /// A container destroy and a VM destroy are different scopes. Mapping both
+    /// to `delete_vm` denied a `delete_container` token its own containers, and
+    /// let a `delete_vm` token delete them.
+    #[test]
+    fn a_guest_destroy_authorises_against_its_guest_type() {
+        assert_eq!(
+            tool_for_op("destroy_guest", GuestType::Lxc),
+            Some("delete_container")
+        );
+        assert_eq!(
+            tool_for_op("destroy_guest", GuestType::Qemu),
+            Some("delete_vm")
+        );
+        // The 0.3 spelling maps the same way.
+        assert_eq!(
+            tool_for_op("destroy", GuestType::Lxc),
+            Some("delete_container")
+        );
     }
 }

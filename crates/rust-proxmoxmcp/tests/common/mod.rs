@@ -379,6 +379,9 @@ pub async fn handler_with_guest(_vmid: u32, protected: bool) -> TestServer {
             // scope, which the per-operation check now refuses — correctly:
             // that was the bypass it exists to close.
             "delete_vm".to_owned(),
+            // The fixture guest is an LXC, and a guest destroy authorises
+            // against its own type: delete_container, not delete_vm.
+            "delete_container".to_owned(),
         ],
         guests: vec!["*".to_owned()],
     };

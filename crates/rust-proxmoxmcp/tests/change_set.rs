@@ -135,6 +135,9 @@ async fn a_protected_guest_with_matching_waiver_can_be_applied() {
             // The operation's own tool: the per-operation scope check refuses
             // a plan whose token holds only the generic handler.
             "delete_vm".to_owned(),
+            // The fixture guest is an LXC, and a guest destroy authorises
+            // against its own type: delete_container, not delete_vm.
+            "delete_container".to_owned(),
             "approve_proxmox_change_set".to_owned(),
             "apply_proxmox_change_set".to_owned(),
         ],
@@ -211,6 +214,9 @@ async fn a_protected_guest_with_lab_mode_can_be_applied() {
             // The operation's own tool: the per-operation scope check refuses
             // a plan whose token holds only the generic handler.
             "delete_vm".to_owned(),
+            // The fixture guest is an LXC, and a guest destroy authorises
+            // against its own type: delete_container, not delete_vm.
+            "delete_container".to_owned(),
             "approve_proxmox_change_set".to_owned(),
             "apply_proxmox_change_set".to_owned(),
         ],
