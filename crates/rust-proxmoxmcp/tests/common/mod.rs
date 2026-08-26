@@ -225,6 +225,7 @@ impl TestServer {
             waivers,
             lab_mode,
             None,
+            None,
         )
         .expect("build server");
         let token_store_arc =

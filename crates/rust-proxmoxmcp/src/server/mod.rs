@@ -18,13 +18,23 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use rust_proxmoxmcp_core::{
-    ProxmoxGrant, Tier, catalog::read_tool, client::ProxmoxClient, inventory::ClusterInventory,
-    resolve::GuestIndex, selector::GuestType, tier::WRITE_TOOLS,
+    Intent, ProxmoxGrant, catalog::read_tool, client::ProxmoxClient, guests::LifecycleVerb,
+    inventory::ClusterInventory, resolve::GuestIndex, selector::GuestType, tier::WRITE_TOOLS,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// Principal recorded on a receipt written by startup recovery.
+///
+/// The executor of an apply is the token that called
+/// `apply_proxmox_change_set`, which is not the approver — two-person control
+/// exists so those differ. When the process that knew the executor dies before
+/// writing the receipt, that identity is simply gone, and no field on the
+/// change set carries it. An explicit marker says so; reusing the approver
+/// would put a name on a destructive execution that person did not perform.
+const RECOVERED_EXECUTOR: &str = "unknown:recovered-at-startup";
 
 /// Result size limits for MCP tool responses.
 const RESULT_LIMITS: ResultLimits = ResultLimits {
@@ -37,6 +47,8 @@ const RESULT_LIMITS: ResultLimits = ResultLimits {
 pub const KNOWN_TOOLS: &[&str] = &[
     "apply_proxmox_change_set",
     "approve_proxmox_change_set",
+    "create_backup",
+    "create_snapshot",
     "get_cluster_status",
     "get_container_config",
     "get_container_ip",
@@ -55,6 +67,13 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "list_tasks",
     "list_templates",
     "plan_proxmox_destroy",
+    "reset_vm",
+    "restart_container",
+    "shutdown_vm",
+    "start_container",
+    "start_vm",
+    "stop_container",
+    "stop_vm",
 ];
 
 /// Arguments for a cluster-scoped read.
@@ -84,6 +103,46 @@ pub struct GuestArgs {
     pub cluster: String,
     /// Numeric guest id, unique within the cluster.
     pub vmid: u32,
+}
+
+/// Arguments for taking a snapshot of one guest.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SnapshotArgs {
+    /// Inventory name of the cluster.
+    pub cluster: String,
+    /// Numeric guest id, unique within the cluster.
+    pub vmid: u32,
+    /// Snapshot name, as it will appear in `list_snapshots`.
+    pub snapname: String,
+    /// Optional free-text description. An empty one is omitted.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// Arguments for backing up one guest.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BackupArgs {
+    /// Inventory name of the cluster.
+    pub cluster: String,
+    /// Numeric guest id, unique within the cluster.
+    pub vmid: u32,
+    /// Target storage, as reported by `get_storage`.
+    pub storage: String,
+    /// vzdump mode: `snapshot`, `suspend`, or `stop`.
+    ///
+    /// Defaults to `snapshot`, the only mode that does not interrupt the
+    /// guest — which is what keeps `create_backup` out of the interrupting
+    /// set and therefore usable on a protected guest.
+    #[serde(default = "default_backup_mode")]
+    pub mode: String,
+    /// Optional compression: `zstd`, `lzo`, `gzip`.
+    #[serde(default)]
+    pub compress: Option<String>,
+}
+
+/// vzdump's non-interrupting mode.
+fn default_backup_mode() -> String {
+    "snapshot".to_owned()
 }
 
 /// Arguments for a storage-scoped read.
@@ -175,8 +234,9 @@ impl ProxmoxServer {
         waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
         lab_mode: bool,
         evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
+        state_file: Option<&std::path::Path>,
     ) -> Result<Self, mecmcp_changeset::CoordinatorError> {
-        let coordinator = change_set::build_coordinator(None, lab_mode, evidence.clone())?;
+        let coordinator = change_set::build_coordinator(state_file, lab_mode, evidence.clone())?;
         Ok(Self::new(
             clusters,
             clients,
@@ -274,7 +334,7 @@ impl ProxmoxServer {
             };
             let authorized = match self
                 .index
-                .authorize(client, cluster, vmid, &grant, Tier::Read, None)
+                .authorize(client, cluster, vmid, &grant, Intent::read())
                 .await
             {
                 Ok(authorized) => authorized,
@@ -442,6 +502,378 @@ impl ProxmoxServer {
         .await
     }
 
+    /// Re-probe every apply that was in flight when this process last stopped.
+    ///
+    /// Called once at startup. A change set left in `Applying` with a
+    /// `task_id` means the previous process started a destructive operation
+    /// and died before observing its result. Proxmox kept running it, so the
+    /// answer exists — it just has to be asked for.
+    ///
+    /// Without this the record stays `Applying` forever and an operator has to
+    /// read the device to find out what happened. That is the "detectable but
+    /// not recoverable" limitation the 0.3 README documented.
+    ///
+    /// Failures here are logged, never fatal: a server that refuses to start
+    /// because one historical task cannot be re-probed is worse than one that
+    /// starts and says which change set is still unresolved.
+    pub async fn recover_in_flight(&self) {
+        let records = self.coordinator.change_sets().await;
+        for mut record in records {
+            if record.state != mecmcp_changeset::ChangeSetState::Applying {
+                // A handle on a settled record means the process died between
+                // finishing and clearing it. Nothing to re-probe, but say so:
+                // it is evidence about a crash, not noise.
+                if record.task_id.is_some() {
+                    tracing::warn!(
+                        target: "audit",
+                        change_set = %record.id,
+                        state = ?record.state,
+                        "a settled change set still carries a task handle; \
+                         the previous process died after finishing"
+                    );
+                }
+                continue;
+            }
+            let Some(task_id) = record.task_id.clone() else {
+                tracing::error!(
+                    target: "audit",
+                    change_set = %record.id,
+                    device = %record.device,
+                    "an apply is stuck in Applying with no task handle; it predates \
+                     handle persistence and must be resolved against the device by hand"
+                );
+                continue;
+            };
+
+            let Ok(upid) = rust_proxmoxmcp_core::task::Upid::parse(&task_id) else {
+                tracing::error!(
+                    target: "audit",
+                    change_set = %record.id,
+                    %task_id,
+                    "the stored task handle does not parse; cannot re-probe"
+                );
+                continue;
+            };
+
+            // The cluster is on the record: `device` is `{cluster}/{vmid}`, the
+            // shape `plan_destroy` writes. Asking every configured client in
+            // turn would be worse than unnecessary — a UPID names its node, not
+            // its cluster, and two clusters can both have a node of that name,
+            // so the first one that answers could be answering about a
+            // different task entirely.
+            let Some((cluster, _)) = record.device.split_once('/') else {
+                tracing::error!(
+                    target: "audit",
+                    change_set = %record.id,
+                    device = %record.device,
+                    "the record's device is not cluster/vmid; cannot choose a client"
+                );
+                continue;
+            };
+            let cluster = cluster.to_owned();
+
+            let Some(client) = self.clients.get(&cluster) else {
+                tracing::error!(
+                    target: "audit",
+                    change_set = %record.id,
+                    %cluster,
+                    "the record names a cluster this server no longer configures; \
+                     leaving it Applying rather than guessing"
+                );
+                continue;
+            };
+
+            let upid_encoded = task_id.replace(':', "%3A");
+            let path = format!(
+                "/api2/json/nodes/{}/tasks/{upid_encoded}/status",
+                upid.node()
+            );
+            let data = match client.get_json(&path, &[], &[]).await {
+                Ok(data) => data,
+                Err(error) => {
+                    tracing::error!(
+                        target: "audit",
+                        change_set = %record.id,
+                        %cluster,
+                        %task_id,
+                        %error,
+                        "could not read the task status; leaving it Applying"
+                    );
+                    continue;
+                }
+            };
+
+            let status = data.get("status").and_then(serde_json::Value::as_str);
+            if status == Some("running") {
+                // Still going. Leave it alone — this process did not start it
+                // and must not adopt a poll loop for it, but the operator can
+                // now see which task it is.
+                tracing::warn!(
+                    target: "audit",
+                    change_set = %record.id,
+                    %cluster,
+                    %task_id,
+                    "an apply from a previous process is still running"
+                );
+                continue;
+            }
+
+            // A stopped task without an exit status is an answer this code
+            // does not have. Defaulting to "" would classify as failure and
+            // assert an outcome nobody observed — the same mistake
+            // `load_with_recovery` used to make. Leave it `Applying` and say
+            // so; a human can read the task.
+            let Some(exitstatus) = data.get("exitstatus").and_then(serde_json::Value::as_str)
+            else {
+                tracing::error!(
+                    target: "audit",
+                    change_set = %record.id,
+                    %cluster,
+                    %task_id,
+                    "the task is no longer running but reports no exit status; \
+                     leaving it Applying rather than inventing an outcome"
+                );
+                continue;
+            };
+
+            let outcome = rust_proxmoxmcp_core::task::classify_exit_status(exitstatus);
+            let succeeded = matches!(outcome, rust_proxmoxmcp_core::task::TaskOutcome::Ok);
+            record.state = if succeeded {
+                mecmcp_changeset::ChangeSetState::Applied
+            } else {
+                mecmcp_changeset::ChangeSetState::Failed
+            };
+            record.task_id = None;
+
+            // Close the evidence chain. Without this the record settles while
+            // the chain still ends at apply intent, so the evidence says a
+            // destroy was attempted and never says what happened to it.
+            if let Some(recorder) = &self.evidence
+                && let Err(receipt_error) = recorder.result_receipt(
+                    &record.id,
+                    &record.id,
+                    &record.device,
+                    // Not `record.approver`. The approver is who authorised the
+                    // change set; the executor is whichever token called
+                    // `apply_proxmox_change_set`, and two-person control exists
+                    // precisely so those differ. Naming the approver here would
+                    // attribute a destructive execution to someone who did not
+                    // perform it — a worse defect in an audit trail than
+                    // admitting the executor is unknown, which is the honest
+                    // answer: the process that knew it died, and nothing
+                    // persisted it.
+                    RECOVERED_EXECUTOR,
+                    succeeded,
+                    // Matches the normal path: a nonempty value is serialised
+                    // into `error`, so passing the exit status on success
+                    // produces a receipt reading `outcome: success` alongside
+                    // `error: "OK"`.
+                    if succeeded { "" } else { exitstatus },
+                )
+            {
+                tracing::error!(
+                    %receipt_error,
+                    change_set = %record.id,
+                    "recovered outcome not written to the evidence chain"
+                );
+            }
+
+            tracing::warn!(
+                target: "audit",
+                change_set = %record.id,
+                %cluster,
+                %task_id,
+                state = ?record.state,
+                %exitstatus,
+                "recovered an apply that was in flight at shutdown"
+            );
+
+            if let Err(error) = self.coordinator.update_change_set(record).await {
+                tracing::error!(%error, "could not persist the recovered outcome");
+            }
+        }
+    }
+
+    /// Stage 1 + stage 2 authorization for a low-tier guest call.
+    ///
+    /// Shared by the additive tools, which need the same gate as the
+    /// lifecycle verbs but no verb dispatch. Interruption is derived from the
+    /// tool name inside `Intent::low`, so an additive tool cannot accidentally
+    /// be treated as interrupting or vice versa.
+    async fn authorize_low(
+        &self,
+        tool: &'static str,
+        args: &GuestArgs,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<rust_proxmoxmcp_core::AuthorizedGuest, Box<CallToolResult>> {
+        use rust_proxmoxmcp_core::protect::{Override, destructive_allowed, protection_of};
+
+        let caller = Self::caller(context);
+        if let Err(error) = authorize_call(caller.as_ref(), tool, Some(&args.cluster), WRITE_TOOLS)
+        {
+            return Err(Box::new(tool_error(error)));
+        }
+
+        let client = self.client_for(&args.cluster)?;
+        let grant = resolve_grant(caller.as_ref())?;
+
+        let resolved = self
+            .index
+            .resolve(client, &args.cluster, args.vmid)
+            .await
+            .map_err(|error| Box::new(tool_error(error)))?;
+        let protection = protection_of(client.cluster(), Some(&resolved), false);
+
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_secs();
+        let override_ = destructive_allowed(
+            &protection,
+            &self.waivers,
+            &args.cluster,
+            args.vmid,
+            now_unix,
+            self.lab_mode,
+        );
+        let override_applies = !matches!(override_, Override::None);
+
+        self.index
+            .authorize(
+                client,
+                &args.cluster,
+                args.vmid,
+                &grant,
+                Intent::low_with_override(tool, override_applies),
+            )
+            .await
+            .map_err(|error| Box::new(tool_error(error)))
+    }
+
+    /// Serve one low-tier lifecycle verb.
+    ///
+    /// Shared by all seven lifecycle tools because the only differences are
+    /// the verb, the guest type the tool name implies, and the audit label.
+    /// Writing them out seven times would be seven chances to forget the
+    /// protection check.
+    async fn serve_lifecycle(
+        &self,
+        tool: &'static str,
+        verb: LifecycleVerb,
+        required_type: GuestType,
+        args: &GuestArgs,
+        context: &RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        use rust_proxmoxmcp_core::protect::{Override, destructive_allowed, protection_of};
+
+        let caller = Self::caller(context);
+        if let Err(error) = authorize_call(caller.as_ref(), tool, Some(&args.cluster), WRITE_TOOLS)
+        {
+            return tool_error(error);
+        }
+
+        let client = match self.client_for(&args.cluster) {
+            Ok(client) => client,
+            Err(result) => return *result,
+        };
+
+        let grant = match resolve_grant(caller.as_ref()) {
+            Ok(grant) => grant,
+            Err(error) => return *error,
+        };
+
+        // Resolve first so protection can be computed before authorization,
+        // exactly as the destroy path does: a waiver or lab mode has to be
+        // known before the gate runs, not after it has already refused.
+        let resolved = match self.index.resolve(client, &args.cluster, args.vmid).await {
+            Ok(guest) => guest,
+            Err(error) => return tool_error(error),
+        };
+        let protection = protection_of(client.cluster(), Some(&resolved), false);
+
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_secs();
+
+        // Reuses the destroy path's override rules. An interrupting call is not
+        // destructive, but the question a waiver answers is the same one:
+        // may this protected guest be disrupted right now?
+        let override_ = destructive_allowed(
+            &protection,
+            &self.waivers,
+            &args.cluster,
+            args.vmid,
+            now_unix,
+            self.lab_mode,
+        );
+        let override_applies = !matches!(override_, Override::None);
+
+        let authorized = match self
+            .index
+            .authorize(
+                client,
+                &args.cluster,
+                args.vmid,
+                &grant,
+                Intent::low_with_override(tool, override_applies),
+            )
+            .await
+        {
+            Ok(authorized) => authorized,
+            Err(error) => return tool_error(error),
+        };
+
+        let guest = authorized.guest();
+        if guest.r#type != required_type {
+            return tool_error(format!(
+                "{tool} requires {} guest {}, but it is {}",
+                required_type.path_segment(),
+                args.vmid,
+                guest.r#type.path_segment()
+            ));
+        }
+
+        let upid = match rust_proxmoxmcp_core::guests::lifecycle(
+            client,
+            &guest.node,
+            guest.r#type,
+            guest.vmid,
+            verb,
+        )
+        .await
+        {
+            Ok(upid) => upid,
+            Err(error) => return tool_error(error),
+        };
+
+        tracing::info!(
+            target: "audit",
+            tool,
+            cluster = args.cluster,
+            vmid = guest.vmid,
+            node = %guest.node,
+            guest_name = %guest.name,
+            tier = "low",
+            interrupts = rust_proxmoxmcp_core::tier::interrupts_service(tool),
+            protection = %authorized.protection().summary(),
+            override_applied = override_applies,
+            scope = scope_desc(caller.as_ref()),
+            upid = %upid,
+            "proxmox lifecycle call"
+        );
+
+        tool_result::<_, String>(
+            Ok(serde_json::json!({
+                "upid": upid,
+                "vmid": guest.vmid,
+                "node": guest.node,
+            })),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
+    }
+
     #[tool(
         name = "get_container_ip",
         description = "Network interfaces and addresses of one LXC guest."
@@ -473,7 +905,7 @@ impl ProxmoxServer {
         };
         let authorized = match self
             .index
-            .authorize(client, &args.cluster, args.vmid, &grant, Tier::Read, None)
+            .authorize(client, &args.cluster, args.vmid, &grant, Intent::read())
             .await
         {
             Ok(authorized) => authorized,
@@ -663,6 +1095,248 @@ impl ProxmoxServer {
         .await
     }
 
+    #[tool(name = "start_vm", description = "Start a stopped QEMU guest.")]
+    async fn start_vm(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_lifecycle(
+            "start_vm",
+            LifecycleVerb::Start,
+            GuestType::Qemu,
+            &args,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "stop_vm",
+        description = "Stop a QEMU guest immediately, without asking the guest OS."
+    )]
+    async fn stop_vm(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_lifecycle(
+            "stop_vm",
+            LifecycleVerb::Stop,
+            GuestType::Qemu,
+            &args,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "shutdown_vm",
+        description = "Ask a QEMU guest's OS to shut down cleanly."
+    )]
+    async fn shutdown_vm(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_lifecycle(
+            "shutdown_vm",
+            LifecycleVerb::Shutdown,
+            GuestType::Qemu,
+            &args,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(name = "reset_vm", description = "Hard power-cycle a QEMU guest.")]
+    async fn reset_vm(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_lifecycle(
+            "reset_vm",
+            LifecycleVerb::Reset,
+            GuestType::Qemu,
+            &args,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(name = "start_container", description = "Start a stopped LXC guest.")]
+    async fn start_container(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_lifecycle(
+            "start_container",
+            LifecycleVerb::Start,
+            GuestType::Lxc,
+            &args,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "stop_container",
+        description = "Stop an LXC guest immediately."
+    )]
+    async fn stop_container(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_lifecycle(
+            "stop_container",
+            LifecycleVerb::Stop,
+            GuestType::Lxc,
+            &args,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(name = "restart_container", description = "Reboot an LXC guest.")]
+    async fn restart_container(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_lifecycle(
+            "restart_container",
+            LifecycleVerb::Reboot,
+            GuestType::Lxc,
+            &args,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "create_snapshot",
+        description = "Take a snapshot of one guest. Additive, so permitted on a protected guest."
+    )]
+    async fn create_snapshot(
+        &self,
+        Parameters(args): Parameters<SnapshotArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        let guest_args = GuestArgs {
+            cluster: args.cluster.clone(),
+            vmid: args.vmid,
+        };
+        let authorized = match self
+            .authorize_low("create_snapshot", &guest_args, &context)
+            .await
+        {
+            Ok(authorized) => authorized,
+            Err(result) => return *result,
+        };
+        let guest = authorized.guest();
+
+        let upid = match rust_proxmoxmcp_core::guests::create_snapshot(
+            match self.client_for(&args.cluster) {
+                Ok(client) => client,
+                Err(result) => return *result,
+            },
+            &guest.node,
+            guest.r#type,
+            guest.vmid,
+            &args.snapname,
+            args.description.as_deref(),
+        )
+        .await
+        {
+            Ok(upid) => upid,
+            Err(error) => return tool_error(error),
+        };
+
+        tracing::info!(
+            target: "audit",
+            tool = "create_snapshot",
+            cluster = args.cluster,
+            vmid = guest.vmid,
+            node = %guest.node,
+            tier = "low",
+            interrupts = false,
+            protection = %authorized.protection().summary(),
+            snapname = %args.snapname,
+            upid = %upid,
+            "proxmox snapshot created"
+        );
+
+        tool_result::<_, String>(
+            Ok(serde_json::json!({ "upid": upid, "vmid": guest.vmid, "node": guest.node })),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
+    }
+
+    #[tool(
+        name = "create_backup",
+        description = "Back up one guest with vzdump. Additive, so permitted on a protected guest."
+    )]
+    async fn create_backup(
+        &self,
+        Parameters(args): Parameters<BackupArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        let guest_args = GuestArgs {
+            cluster: args.cluster.clone(),
+            vmid: args.vmid,
+        };
+        let authorized = match self
+            .authorize_low("create_backup", &guest_args, &context)
+            .await
+        {
+            Ok(authorized) => authorized,
+            Err(result) => return *result,
+        };
+        let guest = authorized.guest();
+
+        let upid = match rust_proxmoxmcp_core::guests::create_backup(
+            match self.client_for(&args.cluster) {
+                Ok(client) => client,
+                Err(result) => return *result,
+            },
+            &guest.node,
+            guest.vmid,
+            &args.storage,
+            &args.mode,
+            args.compress.as_deref(),
+        )
+        .await
+        {
+            Ok(upid) => upid,
+            Err(error) => return tool_error(error),
+        };
+
+        tracing::info!(
+            target: "audit",
+            tool = "create_backup",
+            cluster = args.cluster,
+            vmid = guest.vmid,
+            node = %guest.node,
+            tier = "low",
+            interrupts = false,
+            protection = %authorized.protection().summary(),
+            storage = %args.storage,
+            mode = %args.mode,
+            upid = %upid,
+            "proxmox backup started"
+        );
+
+        tool_result::<_, String>(
+            Ok(serde_json::json!({ "upid": upid, "vmid": guest.vmid, "node": guest.node })),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
+    }
+
     #[tool(
         name = "plan_proxmox_destroy",
         description = "Plan a guest destroy operation for two-principal approval."
@@ -731,8 +1405,7 @@ impl ProxmoxServer {
                 &args.cluster,
                 args.vmid,
                 &grant,
-                Tier::Destructive,
-                Some(override_applies),
+                Intent::destructive(override_applies),
             )
             .await
         {
@@ -1070,8 +1743,7 @@ impl ProxmoxServer {
                 &args.cluster,
                 args.vmid,
                 &grant,
-                Tier::Destructive,
-                Some(override_applies),
+                Intent::destructive(override_applies),
             )
             .await
         {
@@ -1192,11 +1864,40 @@ impl ProxmoxServer {
             Err(error) => return tool_error(error),
         };
 
-        // Note: The UPID should be persisted into the operation record BEFORE
-        // polling (spec §8), but mecmcp-changeset doesn't yet expose a method
-        // to update a change set with the task ID. For now, we proceed without
-        // persistence, which means a crashed apply is detectable but not
-        // recoverable. This will be addressed in a follow-up task.
+        // Persist the UPID BEFORE polling (spec §8).
+        //
+        // The window this closes is between Proxmox accepting the operation and
+        // this process observing its result. A crash in that window used to
+        // leave the record in `Applying` with nothing recorded about which
+        // vendor operation to ask after — detectable, but resolvable only by a
+        // human reading the device. With the handle on disk, `recover_in_flight`
+        // can re-probe it at startup.
+        //
+        // A failure to persist is logged rather than fatal: the destructive
+        // operation has already been accepted by Proxmox, so refusing here
+        // would abandon a running task *and* report failure for something that
+        // is going to happen anyway. Losing the handle is worse than the write
+        // failing quietly, so it is said loudly instead.
+        {
+            let mut in_flight = record.clone();
+            // `Applying`, not the `Approved` snapshot this was verified from.
+            // `recover_in_flight` looks for `Applying` plus a handle, so
+            // persisting `Approved + task_id` would store the handle somewhere
+            // recovery never looks — and would leave the set approved, so a
+            // retry could issue a second destroy against a guest the first one
+            // already removed.
+            in_flight.state = mecmcp_changeset::ChangeSetState::Applying;
+            in_flight.task_id = Some(upid_str.clone());
+            if let Err(error) = self.coordinator.update_change_set(in_flight).await {
+                tracing::error!(
+                    target: "audit",
+                    %error,
+                    change_set = %record.id,
+                    upid = %upid_str,
+                    "task handle not persisted; a crash now leaves this apply unrecoverable"
+                );
+            }
+        }
 
         // Poll the task to completion using mecmcp_job.
         let token = tokio_util::sync::CancellationToken::new();
@@ -1286,6 +1987,10 @@ impl ProxmoxServer {
         match outcome {
             rust_proxmoxmcp_core::task::TaskOutcome::Ok => {
                 record.state = mecmcp_changeset::ChangeSetState::Applied;
+                // The outcome is known, so the handle has nothing left to
+                // recover. Leaving it set would make a finished apply look
+                // in-flight to `recover_in_flight` on the next start.
+                record.task_id = None;
                 if let Err(error) = self.coordinator.update_change_set(record).await {
                     tracing::error!(%error, "could not mark the change set applied");
                 }
@@ -1307,6 +2012,7 @@ impl ProxmoxServer {
                 // digest and principal, which is worse than refusing the retry.
                 // A fresh plan is the correct path after a failed destroy.
                 record.state = mecmcp_changeset::ChangeSetState::Failed;
+                record.task_id = None;
                 if let Err(error) = self.coordinator.update_change_set(record).await {
                     tracing::error!(%error, "could not mark the change set failed");
                 }
@@ -1401,10 +2107,41 @@ mod tests {
             "apply_proxmox_change_set",
         ];
 
+        // Low-tier tools added in 0.4. Listed rather than derived from
+        // WRITE_TOOLS, because that registry deliberately names tools no
+        // release has registered yet — deriving from it would let this test
+        // pass for a tool that does not exist.
+        let low_tools = [
+            "create_backup",
+            "create_snapshot",
+            "reset_vm",
+            "restart_container",
+            "shutdown_vm",
+            "start_container",
+            "start_vm",
+            "stop_container",
+            "stop_vm",
+        ];
+
         for tool in KNOWN_TOOLS {
             assert!(
-                read_tools.contains(tool) || changeset_tools.contains(tool),
-                "{tool} is in KNOWN_TOOLS but not in READ_TOOLS or changeset tools"
+                read_tools.contains(tool)
+                    || changeset_tools.contains(tool)
+                    || low_tools.contains(tool),
+                "{tool} is in KNOWN_TOOLS but not in READ_TOOLS, changeset, or low-tier tools"
+            );
+        }
+
+        // Every low-tier tool is registered, and every one is in WRITE_TOOLS so
+        // a wildcard token cannot reach it.
+        for tool in &low_tools {
+            assert!(
+                KNOWN_TOOLS.contains(tool),
+                "low-tier tool {tool} missing from KNOWN_TOOLS"
+            );
+            assert!(
+                rust_proxmoxmcp_core::tier::WRITE_TOOLS.contains(tool),
+                "low-tier tool {tool} is not in WRITE_TOOLS, so a wildcard token would reach it"
             );
         }
 

@@ -197,6 +197,67 @@ impl ProxmoxClient {
             .ok_or_else(|| ProxmoxError::Malformed("response has no 'data' member".into()))
     }
 
+    /// Issue a POST against a path template and return the unwrapped `data`.
+    ///
+    /// Proxmox takes mutating parameters as an
+    /// `application/x-www-form-urlencoded` body, not JSON, so `form` is encoded
+    /// that way. The template is expanded by `mecmcp-openapi` under the same
+    /// rules as [`Self::get_json`]: nothing is sanitised, because a rewritten
+    /// value is a value the caller did not send.
+    ///
+    /// Most mutating endpoints answer `{"data": "UPID:..."}` — the operation is
+    /// asynchronous and the UPID is the handle to it. A few answer
+    /// `{"data": null}`, so a null `data` member is returned as
+    /// [`serde_json::Value::Null`] rather than treated as an error; only a
+    /// *missing* member is malformed.
+    ///
+    /// # Errors
+    ///
+    /// Returns:
+    /// - [`ProxmoxError::Malformed`] for a rejected parameter, a response
+    ///   without a `data` member, or invalid JSON
+    /// - [`ProxmoxError::Unauthorized`] for 401 or 403 status
+    /// - [`ProxmoxError::Api`] for any other error status
+    /// - [`ProxmoxError::Http`] for network or protocol errors
+    pub async fn post_form(
+        &self,
+        path_template: &str,
+        params: &[(&str, &str)],
+        form: &[(&str, &str)],
+    ) -> Result<serde_json::Value, ProxmoxError> {
+        let expanded = mecmcp_openapi::expand_path(path_template, params)
+            .map_err(|error| ProxmoxError::Malformed(error.to_string()))?;
+
+        let url = format!("{}{expanded}", self.cluster.endpoint.trim_end_matches('/'));
+
+        let body = form
+            .iter()
+            .map(|(key, value)| format!("{}={}", percent_encode(key), percent_encode(value)))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        let request = HttpRequest::new(Method::Post, &url)?
+            .header("Accept", "application/json")?
+            .header("Content-Type", "application/x-www-form-urlencoded")?
+            .secret_header("Authorization", &self.authorization)?
+            .body(body.into_bytes());
+
+        let response = self.http.send(request).await?;
+        if response.status() >= 400 {
+            return Err(ProxmoxError::from_response(
+                response.status(),
+                response.body(),
+            ));
+        }
+
+        let parsed: serde_json::Value = serde_json::from_slice(response.body())
+            .map_err(|error| ProxmoxError::Malformed(error.to_string()))?;
+        parsed
+            .get("data")
+            .cloned()
+            .ok_or_else(|| ProxmoxError::Malformed("response has no 'data' member".into()))
+    }
+
     /// The cluster this client is bound to.
     #[must_use]
     pub fn cluster(&self) -> &Cluster {

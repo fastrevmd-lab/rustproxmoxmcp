@@ -149,9 +149,13 @@ impl GuestIndex {
         cluster: &str,
         vmid: u32,
         grant: &ProxmoxGrant,
-        tier: Tier,
-        override_applies: Option<bool>,
+        intent: Intent,
     ) -> Result<AuthorizedGuest, ProxmoxError> {
+        let Intent {
+            tier,
+            interrupts,
+            override_applies,
+        } = intent;
         let guest = self.resolve(client, cluster, vmid).await?;
 
         if !grant.allows_guest(guest.facts()) {
@@ -168,12 +172,26 @@ impl GuestIndex {
 
         let protection = protection_of(client.cluster(), Some(&guest), false);
 
-        if tier == Tier::Destructive
+        // Protection holds back anything that would disrupt the guest, which is
+        // a wider set than the destructive tier. `interrupts` carries the
+        // low-tier half: a stop destroys nothing, so it stays `Tier::Low`, but
+        // taking a protected guest out of service is exactly what protection
+        // exists to prevent. Before 0.4 no low-tier tool existed, so keying on
+        // `== Destructive` was indistinguishable from "everything disruptive".
+        //
+        // The complement is deliberate: start, snapshot and backup are `Low`
+        // and *not* interrupting, so they stay available on a protected guest.
+        if (tier == Tier::Destructive || interrupts)
             && protection.is_protected()
             && !override_applies.unwrap_or(false)
         {
+            let kind = if tier == Tier::Destructive {
+                "a destructive call"
+            } else {
+                "interrupting a protected guest"
+            };
             return Err(ProxmoxError::Denied(format!(
-                "guest {vmid} is protected ({}); a destructive call needs a waiver",
+                "guest {vmid} is protected ({}); {kind} needs a waiver",
                 protection.summary()
             )));
         }
@@ -261,4 +279,68 @@ fn parse_tags(raw: Option<&str>) -> Vec<String> {
         .filter(|tag| !tag.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+/// What a caller intends to do to a guest.
+///
+/// Bundled rather than passed as three parameters because they are one
+/// decision: the tier drives the grant action, interruption drives protection,
+/// and the override records that a waiver or `--lab-mode` already applies.
+/// Splitting them across the signature invited a caller to pass the wrong
+/// boolean; naming the constructors makes the intent unambiguous at the call
+/// site.
+#[derive(Debug, Clone, Copy)]
+pub struct Intent {
+    /// Action class, which selects the grant action required.
+    pub tier: Tier,
+    /// Whether the call takes a running guest out of service.
+    pub interrupts: bool,
+    /// Whether a waiver or lab mode already permits a protected guest.
+    pub override_applies: Option<bool>,
+}
+
+impl Intent {
+    /// Observation. Never interrupts, never needs an override.
+    #[must_use]
+    pub const fn read() -> Self {
+        Self {
+            tier: Tier::Read,
+            interrupts: false,
+            override_applies: None,
+        }
+    }
+
+    /// A low-tier call, with interruption derived from the tool name.
+    ///
+    /// Derived rather than passed so a new tool cannot be added with the wrong
+    /// answer: `crate::tier::interrupts_service` is the single place that
+    /// decides, and it is covered by tests naming both halves of the list.
+    #[must_use]
+    pub fn low(tool: &str) -> Self {
+        Self {
+            tier: Tier::Low,
+            interrupts: crate::tier::interrupts_service(tool),
+            override_applies: None,
+        }
+    }
+
+    /// A low-tier call against a guest a waiver or lab mode already permits.
+    #[must_use]
+    pub fn low_with_override(tool: &str, override_applies: bool) -> Self {
+        Self {
+            override_applies: Some(override_applies),
+            ..Self::low(tool)
+        }
+    }
+
+    /// A destructive call. Its tier already refuses a protected guest, so
+    /// interruption is not consulted.
+    #[must_use]
+    pub const fn destructive(override_applies: bool) -> Self {
+        Self {
+            tier: Tier::Destructive,
+            interrupts: false,
+            override_applies: Some(override_applies),
+        }
+    }
 }

@@ -16,7 +16,7 @@ use rust_proxmoxmcp_core::{
     resolve::GuestIndex, selector::Selector,
 };
 use server::ProxmoxServer;
-use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 /// Resolve the token file path, applying the legacy fallback ONLY when the
 /// configured path is the canonical /var/lib/proxmoxmcp/tokens.json.
@@ -339,7 +339,16 @@ async fn main() -> Result<()> {
         Transport::Stdio => {
             // SIGHUP reloads the inventory in place. Stdio has no token store.
             install_sighup_reload(Arc::clone(&clusters), Arc::clone(&index), None)?;
-            serve_stdio(clusters, clients, index, waivers, args.lab_mode, recorder).await
+            serve_stdio(
+                clusters,
+                clients,
+                index,
+                waivers,
+                args.lab_mode,
+                recorder,
+                args.state_file.clone(),
+            )
+            .await
         }
         Transport::StreamableHttp => {
             let token_store = load_http_token_store(&args.common)?;
@@ -425,6 +434,7 @@ async fn main() -> Result<()> {
                 waivers,
                 args.lab_mode,
                 recorder,
+                args.state_file.clone(),
             )
             .await
         }
@@ -517,11 +527,33 @@ async fn serve_stdio(
     waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
     lab_mode: bool,
     evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
+    state_file: Option<PathBuf>,
 ) -> Result<()> {
     let handler = ProxmoxServer::new_with_default_coordinator(
-        clusters, clients, index, waivers, lab_mode, evidence,
+        clusters,
+        clients,
+        index,
+        waivers,
+        lab_mode,
+        evidence,
+        state_file.as_deref(),
     )
     .context("build server")?;
+
+    // Before serving: settle any apply that was in flight when this process
+    // last stopped. Proxmox kept running it, so the answer exists and only has
+    // to be asked for. Doing it before the first request means a caller never
+    // sees a change set stuck in `Applying` that this server could have
+    // resolved.
+    if state_file.is_none() {
+        tracing::warn!(
+            target: "audit",
+            "no --state-file: change sets live in memory only, so every approval, \
+             preview and in-flight apply is lost on restart and crash recovery \
+             cannot run. Pass --state-file to persist them."
+        );
+    }
+    handler.recover_in_flight().await;
 
     if lab_mode {
         tracing::warn!(
@@ -657,11 +689,33 @@ async fn serve_http(
     waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
     lab_mode: bool,
     evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
+    state_file: Option<PathBuf>,
 ) -> Result<()> {
     let handler = ProxmoxServer::new_with_default_coordinator(
-        clusters, clients, index, waivers, lab_mode, evidence,
+        clusters,
+        clients,
+        index,
+        waivers,
+        lab_mode,
+        evidence,
+        state_file.as_deref(),
     )
     .context("build server")?;
+
+    // Before serving: settle any apply that was in flight when this process
+    // last stopped. Proxmox kept running it, so the answer exists and only has
+    // to be asked for. Doing it before the first request means a caller never
+    // sees a change set stuck in `Applying` that this server could have
+    // resolved.
+    if state_file.is_none() {
+        tracing::warn!(
+            target: "audit",
+            "no --state-file: change sets live in memory only, so every approval, \
+             preview and in-flight apply is lost on restart and crash recovery \
+             cannot run. Pass --state-file to persist them."
+        );
+    }
+    handler.recover_in_flight().await;
 
     if lab_mode {
         tracing::warn!(

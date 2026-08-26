@@ -9,6 +9,7 @@ User=proxmoxmcp
 Group=proxmoxmcp
 ExecStart=/usr/local/bin/rust-proxmoxmcp \
     --clusters-file /etc/proxmoxmcp/clusters.json \
+    --state-file ${STATE_DIRECTORY}/changeset-state.json \
     --tokens-file /var/lib/proxmoxmcp/tokens.json \
     --transport streamable-http \
     --host 127.0.0.1 --port 30031 \
