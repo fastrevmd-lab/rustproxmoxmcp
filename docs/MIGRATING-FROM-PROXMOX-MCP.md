@@ -83,22 +83,22 @@ need in the token scope, not just the two handlers.
 
 | third-party | why |
 |---|---|
+| `cancel_job` | use `stop_task` with the UPID. Restores, destroys and rollbacks are refused: stopping one half-way leaves a guest that is neither its old self nor its new one |
+| `create_vm` | `create_vm`. Config keys are forwarded as given; those that reach the host are refused, and a VMID that already exists is refused rather than restored over |
+| `create_container` | `create_container`, which defaults to `unprivileged=1` |
+| `download_iso` | `download_iso`. Requires an unrestricted guest scope: a storage belongs to no guest |
+| `update_container_resources` | `update_container_resources`. Cores apply immediately; memory and swap take effect at the next start |
 | `get_job` | use `get_task_status` with the UPID |
 | `list_jobs` | use `list_tasks` for a node |
 | `poll_job` | applies follow their UPID to completion within the call; a crashed apply is re-probed at startup |
-| `cancel_job` | **none.** Proxmox tasks are not cancellable through this surface |
 | `retry_job` | **none.** A failed apply needs a fresh plan — the change set is terminal, and retrying one whose receipt is already written would carry an empty digest and principal |
-| `execute_vm_command` | **none.** The `guests::guest_exec` primitive exists in the core library as of 0.7.1, but no tool calls it, so there is nothing to reach from MCP. Wiring it behind the change-set flow is tracked in #57 |
-| `create_vm`, `create_container` | **none.** `guests::create_guest` exists in core with no tool calling it — same gap, same issue |
-| `download_iso` | **none.** `guests::download_url` exists in core with no tool calling it |
-| `update_container_resources` | **none.** Not implemented at any layer |
-| `restore_backup` to a new VMID | **none.** The mapping above overwrites an existing guest; see the semantics note below |
+| `execute_vm_command` | **none.** Deliberate: the design spec makes it conditional on `mecmcp-policy` compiling an allow/deny rule set over the command subject, which is not wired. Arbitrary command execution inside every guest is remote code execution as a tool call, and it ships with a policy engine or not at all. Tracked in #57 |
+| `restore_backup` to a new VMID | **none.** The mapping above resolves an **existing** guest and applies with `force=true`, so it overwrites rather than creates. See the semantics note below — this is the gap most likely to be missed, because the tool exists and the call succeeds |
 
-These are genuine gaps, not oversights. A caller that depends on them has to
-change rather than be shimmed. **Do not cut over from the third-party server
-until #57 closes** unless you can give up all of the above: four of them have
-tested core functions sitting behind no tool, which is not the same as being
-available.
+Two genuine gaps, and a caller that depends on either has to change rather than
+be shimmed. **You can cut over for everything else as of 0.8.0** — but read the
+`restore_backup` note first, because that one does not fail loudly. It does the
+wrong thing successfully.
 
 ### Here but not there
 

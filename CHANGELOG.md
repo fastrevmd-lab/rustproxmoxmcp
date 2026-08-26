@@ -11,9 +11,18 @@ Five tools, closing all but one of the gaps against the third-party server.
 **Re-mint or widen your tokens**: `KNOWN_TOOLS` grows by five, and a token
 minted against 0.7.1 carries none of the new scopes.
 
-`execute_vm_command` is deliberately **not** here. The design spec makes it
-conditional on `mecmcp-policy` compiling an allow/deny rule set over the
-command subject, and that is not wired yet -- see #57.
+**Two gaps remain, not one.**
+
+`execute_vm_command` is deliberately absent: the design spec makes it
+conditional on `mecmcp-policy` compiling an allow/deny rule set over the command
+subject, and that is not wired yet.
+
+`restore_backup` is present but **not equivalent**. The third-party tool takes
+`vmid` as a *new* restore target and offers `storage` and `unique`; here the
+plan resolves an **existing** guest and the apply passes `force=true`, so the
+same-shaped call overwrites a live guest rather than creating one.
+Restore-to-a-new-VMID has no equivalent. Do not read "five tools shipped" as
+"parity reached" -- see #57.
 
 ### Added
 
