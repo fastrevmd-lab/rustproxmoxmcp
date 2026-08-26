@@ -441,6 +441,58 @@ pub async fn handler_with_guest(_vmid: u32, protected: bool) -> TestServer {
     TestServer::start_with_routes(spec, routes).await
 }
 
+/// Routes for a QEMU guest that answers the agent endpoints.
+///
+/// The exec fixture uses a *QEMU* guest: the agent is a QEMU feature and
+/// Proxmox exposes no exec endpoint for containers, so the LXC fixture the
+/// destroy tests use cannot serve here.
+#[must_use]
+pub fn exec_routes() -> Vec<Route> {
+    vec![
+        Route {
+            path: "/api2/json/nodes",
+            status: 200,
+            body: br#"{"data":[{"node":"pve2","status":"online"},{"node":"pve3","status":"online"}]}"#,
+        },
+        Route {
+            path: "/api2/json/cluster/resources",
+            status: 200,
+            body: br#"{"data":[{"id":"qemu/617","type":"qemu","vmid":617,"name":"test-guest-617","node":"pve2","status":"running","tags":"test"}]}"#,
+        },
+        Route {
+            path: "/api2/json/nodes/pve2/qemu/617/agent/exec",
+            status: 200,
+            body: br#"{"data":{"pid":4242}}"#,
+        },
+        Route {
+            path: "/api2/json/nodes/pve2/qemu/617/agent/exec-status",
+            status: 200,
+            body: br#"{"data":{"exited":1,"exitcode":0,"out-data":"ok
+"}}"#,
+        },
+    ]
+}
+
+/// A handler whose token may plan and apply a guest-agent command.
+pub async fn handler_with_exec(_vmid: u32) -> TestServer {
+    TestServer::start_with_routes(
+        TokenSpec {
+            clusters: vec!["pve3".to_owned()],
+            tools: vec![
+                "plan_proxmox_exec".to_owned(),
+                "get_proxmox_change_set".to_owned(),
+                "approve_proxmox_change_set".to_owned(),
+                "apply_proxmox_change_set".to_owned(),
+                // The operation's own scope, not just the plan tool's.
+                "execute_vm_command".to_owned(),
+            ],
+            guests: vec!["*".to_owned()],
+        },
+        exec_routes(),
+    )
+    .await
+}
+
 /// Make an MCP tool call.
 ///
 /// Uses McpClient with proper initialize handshake. McpClient is synchronous,

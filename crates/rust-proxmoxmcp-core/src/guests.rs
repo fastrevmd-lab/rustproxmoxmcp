@@ -827,3 +827,116 @@ mod task_cancellation_tests {
         }
     }
 }
+
+/// What a guest-agent command produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestExecOutput {
+    /// Whether the command finished. False means the poll ran out of time.
+    pub exited: bool,
+    /// Exit code, when the command finished.
+    pub exit_code: Option<i64>,
+    /// Standard output, as far as the agent captured it.
+    pub stdout: String,
+    /// Standard error, as far as the agent captured it.
+    pub stderr: String,
+    /// Whether the agent truncated either stream.
+    pub truncated: bool,
+}
+
+/// Read the status of a command started by [`guest_exec`].
+///
+/// # Errors
+///
+/// As [`destroy_container`], minus the UPID parse.
+pub async fn guest_exec_status(
+    client: &ProxmoxClient,
+    node: &str,
+    vmid: u32,
+    pid: i64,
+) -> Result<GuestExecOutput, ProxmoxError> {
+    let path_template = "/api2/json/nodes/{node}/qemu/{vmid}/agent/exec-status";
+    let vmid_string = vmid.to_string();
+    let pid_string = pid.to_string();
+    let params = &[("node", node), ("vmid", vmid_string.as_str())];
+
+    let data = client
+        .get_json(path_template, params, &[("pid", pid_string.as_str())])
+        .await?;
+
+    // `exited` is 0 or 1 rather than a bool, and the stream fields are absent
+    // when empty rather than present and empty.
+    let exited = data
+        .get("exited")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0)
+        == 1;
+
+    let string_field = |key: &str| {
+        data.get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let truncated_field = |key: &str| {
+        data.get(key)
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+            == 1
+    };
+
+    Ok(GuestExecOutput {
+        exited,
+        exit_code: data.get("exitcode").and_then(serde_json::Value::as_i64),
+        stdout: string_field("out-data"),
+        stderr: string_field("err-data"),
+        truncated: truncated_field("out-truncated") || truncated_field("err-truncated"),
+    })
+}
+
+/// Run a command in a QEMU guest and wait for it to finish.
+///
+/// [`guest_exec`] returns a PID and nothing else, so on its own it cannot tell
+/// a caller whether the command worked. This starts it and polls
+/// [`guest_exec_status`] until the agent reports it exited or `attempts` run
+/// out.
+///
+/// A poll that runs out returns `exited: false` rather than an error: the
+/// command is still running inside the guest, and reporting failure would be
+/// wrong. The caller decides what a timeout means.
+///
+/// `delay` is awaited between polls. The first status read happens immediately,
+/// because a short command is usually already done.
+///
+/// # Errors
+///
+/// As [`guest_exec`] and [`guest_exec_status`].
+pub async fn guest_exec_and_wait(
+    client: &ProxmoxClient,
+    node: &str,
+    vmid: u32,
+    command: &[String],
+    attempts: u32,
+    delay: std::time::Duration,
+) -> Result<(i64, GuestExecOutput), ProxmoxError> {
+    let pid = guest_exec(client, node, vmid, command).await?;
+
+    let mut last = GuestExecOutput {
+        exited: false,
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        truncated: false,
+    };
+
+    for attempt in 0..attempts.max(1) {
+        if attempt > 0 {
+            tokio::time::sleep(delay).await;
+        }
+        last = guest_exec_status(client, node, vmid, pid).await?;
+        if last.exited {
+            return Ok((pid, last));
+        }
+    }
+
+    Ok((pid, last))
+}

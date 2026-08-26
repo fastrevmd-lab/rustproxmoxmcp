@@ -86,6 +86,7 @@ pub const WRITE_TOOLS: &[&str] = &[
     "create_vm",
     "download_iso",
     "plan_proxmox_destroy",
+    "plan_proxmox_exec",
     "reset_vm",
     "restart_container",
     "shutdown_vm",

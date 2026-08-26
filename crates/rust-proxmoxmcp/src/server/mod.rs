@@ -44,6 +44,7 @@ const AUTHORIZATION_ONLY_TOOLS: &[&str] = &[
     "delete_iso",
     "delete_snapshot",
     "delete_vm",
+    "execute_vm_command",
     "restore_backup",
     "rollback_snapshot",
 ];
@@ -76,6 +77,7 @@ const fn tool_for_op(op: &str, kind: GuestType) -> Option<&'static str> {
         b"delete_backup" => Some("delete_backup"),
         b"delete_iso" => Some("delete_iso"),
         b"restore_backup" => Some("restore_backup"),
+        b"guest_exec" => Some("execute_vm_command"),
         _ => None,
     }
 }
@@ -132,6 +134,26 @@ fn render_destructive_preview(
              there is no snapshot of the pre-restore state unless one was taken.",
             action.volid.as_deref().unwrap_or("?")
         ),
+        "guest_exec" => {
+            // Rendered one argument per line and quoted. An approver has to be
+            // able to see exactly what will run, including where the word
+            // boundaries fall -- a command joined into a single line hides
+            // whether an argument contained a space.
+            let argv = action
+                .command
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|word| format!("    {word:?}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "RUN COMMAND in {target}\n  \
+                 Executed by the QEMU guest agent as its user, normally root. \
+                 There is no shell: these arguments are passed through as given.\n\
+                 {argv}"
+            )
+        }
         other => format!("UNKNOWN OPERATION '{other}' on {target}"),
     }
 }
@@ -192,8 +214,52 @@ fn build_destroy_action(
         storage,
         volid,
         storage_node,
+        command: None,
     })
 }
+
+/// Build the action for a guest-agent command.
+///
+/// Separate from [`build_destroy_action`] because the parameters do not
+/// overlap: this needs an argv and nothing else, and the destroy operations
+/// need storage coordinates it has no use for. Both produce the same action
+/// type, so approve and apply are shared.
+fn build_exec_action(args: &change_set::PlanExecArgs) -> Result<change_set::DestroyAction, String> {
+    if args.command.is_empty() {
+        return Err(
+            "command is empty: give the argv to run, e.g. [\"systemctl\", \"status\", \"nginx\"]"
+                .to_owned(),
+        );
+    }
+    if args.command.iter().any(|word| word.is_empty()) {
+        return Err(
+            "command contains an empty argument, which the guest would receive as a bare '' and \
+             is almost never intended"
+                .to_owned(),
+        );
+    }
+    if args.command.iter().any(|word| word.contains('\0')) {
+        return Err("command contains a NUL byte".to_owned());
+    }
+
+    Ok(change_set::DestroyAction {
+        op: "guest_exec".to_owned(),
+        cluster: args.cluster.clone(),
+        vmid: args.vmid,
+        snapname: None,
+        storage: None,
+        volid: None,
+        storage_node: None,
+        command: Some(args.command.clone()),
+    })
+}
+
+/// How many times an apply reads a guest-agent command's status before giving
+/// up. With [`GUEST_EXEC_POLL_DELAY`] this is a thirty-second ceiling.
+const GUEST_EXEC_POLL_ATTEMPTS: u32 = 30;
+
+/// Gap between guest-agent status reads.
+const GUEST_EXEC_POLL_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Principal recorded on a receipt written by startup recovery.
 ///
@@ -227,6 +293,7 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "delete_snapshot",
     "delete_vm",
     "download_iso",
+    "execute_vm_command",
     "get_cluster_status",
     "get_container_config",
     "get_container_ip",
@@ -245,6 +312,7 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "list_tasks",
     "list_templates",
     "plan_proxmox_destroy",
+    "plan_proxmox_exec",
     "reset_vm",
     "resize_disk",
     "restart_container",
@@ -1104,7 +1172,7 @@ impl ProxmoxServer {
         kind: GuestType,
         node: &str,
         vmid: u32,
-    ) -> Result<String, rust_proxmoxmcp_core::ProxmoxError> {
+    ) -> Result<(String, Option<serde_json::Value>), rust_proxmoxmcp_core::ProxmoxError> {
         use rust_proxmoxmcp_core::guests;
 
         let missing = |name: &str| {
@@ -1120,20 +1188,25 @@ impl ProxmoxServer {
             "destroy_guest" | "destroy" => match kind {
                 GuestType::Lxc => guests::destroy_container(client, node, vmid, true).await,
                 GuestType::Qemu => guests::destroy_vm(client, node, vmid, true).await,
-            },
+            }
+            .map(|upid| (upid, None)),
             "delete_snapshot" => {
                 let snapname = action
                     .snapname
                     .as_deref()
                     .ok_or_else(|| missing("snapname"))?;
-                guests::delete_snapshot(client, node, kind, vmid, snapname).await
+                guests::delete_snapshot(client, node, kind, vmid, snapname)
+                    .await
+                    .map(|upid| (upid, None))
             }
             "rollback_snapshot" => {
                 let snapname = action
                     .snapname
                     .as_deref()
                     .ok_or_else(|| missing("snapname"))?;
-                guests::rollback_snapshot(client, node, kind, vmid, snapname).await
+                guests::rollback_snapshot(client, node, kind, vmid, snapname)
+                    .await
+                    .map(|upid| (upid, None))
             }
             "delete_backup" | "delete_iso" => {
                 let storage = action
@@ -1150,11 +1223,51 @@ impl ProxmoxServer {
                     .as_deref()
                     .ok_or_else(|| missing("storage_node"))?;
                 let data = guests::delete_volume(client, storage_node, storage, volid).await?;
-                Ok(data.as_str().unwrap_or_default().to_owned())
+                Ok((data.as_str().unwrap_or_default().to_owned(), None))
             }
             "restore_backup" => {
                 let volid = action.volid.as_deref().ok_or_else(|| missing("volid"))?;
-                guests::restore_backup(client, node, kind, vmid, volid, true).await
+                guests::restore_backup(client, node, kind, vmid, volid, true)
+                    .await
+                    .map(|upid| (upid, None))
+            }
+            "guest_exec" => {
+                // The agent is a QEMU feature; Proxmox exposes no LXC exec.
+                if kind != GuestType::Qemu {
+                    return Err(rust_proxmoxmcp_core::ProxmoxError::Malformed(format!(
+                        "vmid {vmid} is an LXC container; the guest agent is a QEMU feature and \
+                         Proxmox exposes no exec endpoint for containers"
+                    )));
+                }
+                let command = action
+                    .command
+                    .as_deref()
+                    .ok_or_else(|| missing("command"))?;
+
+                let (pid, output) = guests::guest_exec_and_wait(
+                    client,
+                    node,
+                    vmid,
+                    command,
+                    GUEST_EXEC_POLL_ATTEMPTS,
+                    GUEST_EXEC_POLL_DELAY,
+                )
+                .await?;
+
+                // No UPID: the agent runs the command itself rather than
+                // through a Proxmox task, so there is no handle to follow and
+                // nothing for startup recovery to re-probe.
+                Ok((
+                    String::new(),
+                    Some(serde_json::json!({
+                        "pid": pid,
+                        "exited": output.exited,
+                        "exit_code": output.exit_code,
+                        "stdout": output.stdout,
+                        "stderr": output.stderr,
+                        "truncated": output.truncated,
+                    })),
+                ))
             }
             other => Err(rust_proxmoxmcp_core::ProxmoxError::Malformed(format!(
                 "unknown destructive operation '{other}'"
@@ -2511,6 +2624,55 @@ impl ProxmoxServer {
         Parameters(args): Parameters<change_set::PlanDestroyArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
+        let cluster = args.cluster.clone();
+        let vmid = args.vmid;
+        self.plan_change_set(
+            "plan_proxmox_destroy",
+            cluster,
+            vmid,
+            || build_destroy_action(&args),
+            context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "plan_proxmox_exec",
+        description = "Plan a command to run inside a QEMU guest via its agent, for approval. There is no shell: the argv is passed through as given. QEMU only."
+    )]
+    async fn plan_exec(
+        &self,
+        Parameters(args): Parameters<change_set::PlanExecArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        let cluster = args.cluster.clone();
+        let vmid = args.vmid;
+        self.plan_change_set(
+            "plan_proxmox_exec",
+            cluster,
+            vmid,
+            || build_exec_action(&args),
+            context,
+        )
+        .await
+    }
+
+    /// Shared body for every plan tool.
+    ///
+    /// `plan_proxmox_destroy` and `plan_proxmox_exec` differ only in the action
+    /// they build and the scope they authorise against. Everything after that --
+    /// protection, the override decision, the fingerprint, the per-operation
+    /// scope check, change-set creation and preview persistence -- is one flow,
+    /// and it is the flow the security properties live in. Two copies would
+    /// drift, and the copy that drifted would be the one nobody re-read.
+    async fn plan_change_set(
+        &self,
+        plan_tool: &'static str,
+        cluster: String,
+        vmid: u32,
+        build: impl FnOnce() -> Result<change_set::DestroyAction, String>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
         use change_set::ChangeSetResponse;
         use mecmcp_changeset::WaiverKind;
         use rust_proxmoxmcp_core::{
@@ -2520,16 +2682,12 @@ impl ProxmoxServer {
         };
 
         let caller = Self::caller(&context);
-        if let Err(error) = authorize_call(
-            caller.as_ref(),
-            "plan_proxmox_destroy",
-            Some(&args.cluster),
-            WRITE_TOOLS,
-        ) {
+        if let Err(error) = authorize_call(caller.as_ref(), plan_tool, Some(&cluster), WRITE_TOOLS)
+        {
             return tool_error(error);
         }
 
-        let client = match self.client_for(&args.cluster) {
+        let client = match self.client_for(&cluster) {
             Ok(client) => client,
             Err(result) => return *result,
         };
@@ -2540,7 +2698,7 @@ impl ProxmoxServer {
         };
 
         // Resolve guest and compute protection to determine override.
-        let guest = match self.index.resolve(client, &args.cluster, args.vmid).await {
+        let guest = match self.index.resolve(client, &cluster, vmid).await {
             Ok(guest) => guest,
             Err(error) => return tool_error(error),
         };
@@ -2554,8 +2712,8 @@ impl ProxmoxServer {
         let override_ = destructive_allowed(
             &protection,
             &self.waivers,
-            &args.cluster,
-            args.vmid,
+            &cluster,
+            vmid,
             now_unix,
             self.lab_mode,
         );
@@ -2567,8 +2725,8 @@ impl ProxmoxServer {
             .index
             .authorize(
                 client,
-                &args.cluster,
-                args.vmid,
+                &cluster,
+                vmid,
                 &grant,
                 Intent::destructive(override_applies),
             )
@@ -2582,7 +2740,7 @@ impl ProxmoxServer {
 
         // Compute fingerprint.
         let state = GuestState {
-            cluster: args.cluster.clone(),
+            cluster: cluster.clone(),
             vmid: guest.vmid,
             name: guest.name.clone(),
             kind: guest.r#type.path_segment().to_owned(),
@@ -2596,7 +2754,7 @@ impl ProxmoxServer {
         let expected_fingerprint = fingerprint(&state);
 
         // Built before the preview, because the preview describes it.
-        let action = match build_destroy_action(&args) {
+        let action = match build() {
             Ok(action) => action,
             Err(error) => return tool_error(error),
         };
@@ -2608,9 +2766,7 @@ impl ProxmoxServer {
         let Some(op_tool) = tool_for_op(&action.op, guest.r#type) else {
             return tool_error(format!("unknown destructive operation '{}'", action.op));
         };
-        if let Err(error) =
-            authorize_call(caller.as_ref(), op_tool, Some(&args.cluster), WRITE_TOOLS)
-        {
+        if let Err(error) = authorize_call(caller.as_ref(), op_tool, Some(&cluster), WRITE_TOOLS) {
             return tool_error(error);
         }
 
@@ -2645,7 +2801,7 @@ impl ProxmoxServer {
             .map(|ctx| ctx.token_name.clone())
             .unwrap_or_else(|| "stdio".to_owned());
 
-        let device = format!("{}/{}", args.cluster, args.vmid);
+        let device = format!("{}/{}", cluster, vmid);
         // Validate the operation and its parameters before anything is
         // recorded. A change set whose action names an operation the apply
         // cannot dispatch is a change set an approver may sign and nobody can
@@ -3124,11 +3280,11 @@ impl ProxmoxServer {
             return tool_error(error);
         }
 
-        let upid_str = match self
+        let (upid_str, execution_detail) = match self
             .execute_destructive(client, &action, guest.r#type, &state.node, args.vmid)
             .await
         {
-            Ok(upid) => upid,
+            Ok(outcome) => outcome,
             Err(error) => {
                 // Proxmox answering "no" and the request vanishing are different
                 // facts, and the receipt must not conflate them. An `Api`,
@@ -3201,15 +3357,32 @@ impl ProxmoxServer {
                 tracing::error!(%error, "could not mark the change set applied");
             }
 
-            return tool_result::<_, String>(
-                Ok(serde_json::json!({
-                    "outcome": "ok",
-                    "synchronous": true,
-                    "upid": serde_json::Value::Null,
-                })),
-                ResultFormat::PrettyJson,
-                RESULT_LIMITS,
-            );
+            // `outcome` describes the apply, not the command. A guest-agent
+            // command that ran and exited non-zero is a *completed* apply --
+            // what was approved happened -- and its own result is data. Both
+            // are reported so neither can be read as the other.
+            let mut response = serde_json::json!({
+                "outcome": "ok",
+                "synchronous": true,
+                "upid": serde_json::Value::Null,
+            });
+            if let Some(detail) = execution_detail
+                && let Some(object) = response.as_object_mut()
+            {
+                {
+                    object.insert("execution".to_owned(), detail);
+                    object.insert(
+                        "note".to_owned(),
+                        serde_json::Value::String(
+                            "outcome describes the apply; read execution.exit_code for what the \
+                             command itself returned"
+                                .to_owned(),
+                        ),
+                    );
+                }
+            }
+
+            return tool_result::<_, String>(Ok(response), ResultFormat::PrettyJson, RESULT_LIMITS);
         }
 
         // Parse the UPID to extract the node for polling.
@@ -3474,6 +3647,7 @@ mod tests {
             "create_snapshot",
             "create_vm",
             "download_iso",
+            "plan_proxmox_exec",
             "reset_vm",
             "resize_disk",
             "stop_task",
@@ -3806,6 +3980,7 @@ mod destructive_scope_tests {
             storage: Some("local".to_owned()),
             volid: volid.map(ToOwned::to_owned),
             storage_node: Some("pve2".to_owned()),
+            command: None,
         }
     }
 

@@ -442,3 +442,92 @@ async fn a_guest_that_moved_is_refused_even_while_the_resource_cache_is_warm() {
         .count();
     assert_eq!(destroys, 0, "the guest must not be touched");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_exec_plan_shows_the_command_in_its_preview() {
+    let h = common::handler_with_exec(617).await;
+    let planned = common::call(
+        &h,
+        "plan_proxmox_exec",
+        json!({"cluster":"pve3","vmid":617,"command":["systemctl","status","nginx"]}),
+    )
+    .await
+    .expect("plan");
+
+    let preview = planned["preview"].as_str().expect("preview");
+    assert!(preview.contains("RUN COMMAND"), "{preview}");
+    // Each argument on its own line and quoted: an approver has to see where
+    // the word boundaries fall, or an argument containing a space is invisible.
+    for word in ["systemctl", "status", "nginx"] {
+        assert!(
+            preview.contains(&format!("{word:?}")),
+            "{word} missing: {preview}"
+        );
+    }
+    assert!(
+        preview.to_lowercase().contains("no shell"),
+        "the preview must say the argv is not shell-interpreted: {preview}"
+    );
+}
+
+/// An argv with a space in one word must stay one word all the way to the
+/// preview, or the approver reviews a different command than the one that runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_argument_containing_a_space_stays_one_argument() {
+    let h = common::handler_with_exec(617).await;
+    let planned = common::call(
+        &h,
+        "plan_proxmox_exec",
+        json!({"cluster":"pve3","vmid":617,"command":["echo","hello world"]}),
+    )
+    .await
+    .expect("plan");
+
+    let preview = planned["preview"].as_str().expect("preview");
+    assert!(
+        preview.contains("\"hello world\""),
+        "the space must not split the argument: {preview}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_command_is_refused() {
+    let h = common::handler_with_exec(617).await;
+    let err = common::call(
+        &h,
+        "plan_proxmox_exec",
+        json!({"cluster":"pve3","vmid":617,"command":[]}),
+    )
+    .await
+    .expect_err("an empty argv must be refused");
+    assert!(err.to_lowercase().contains("empty"), "{err}");
+}
+
+/// The exec scope is separate from the plan tool's, exactly as the destructive
+/// operations are: holding `plan_proxmox_exec` alone must not be enough.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn planning_an_exec_needs_the_execute_scope() {
+    let h = common::TestServer::start_with_routes(
+        common::TokenSpec {
+            clusters: vec!["pve3".to_owned()],
+            tools: vec![
+                "plan_proxmox_exec".to_owned(),
+                "get_proxmox_change_set".to_owned(),
+                "approve_proxmox_change_set".to_owned(),
+                "apply_proxmox_change_set".to_owned(),
+            ],
+            guests: vec!["*".to_owned()],
+        },
+        common::exec_routes(),
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "plan_proxmox_exec",
+        json!({"cluster":"pve3","vmid":617,"command":["id"]}),
+    )
+    .await
+    .expect_err("the execute_vm_command scope is required");
+    assert!(err.to_lowercase().contains("execute_vm_command"), "{err}");
+}

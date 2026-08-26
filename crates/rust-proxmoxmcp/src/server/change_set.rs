@@ -12,6 +12,22 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Arguments for planning a guest-agent command.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PlanExecArgs {
+    /// Inventory name of the cluster.
+    pub cluster: String,
+    /// Numeric guest id. QEMU only: Proxmox has no LXC exec endpoint.
+    pub vmid: u32,
+    /// Argument vector, e.g. `["systemctl", "status", "nginx"]`.
+    ///
+    /// A list rather than a shell line: Proxmox passes it to the agent as
+    /// separate arguments, so nothing re-splits it and an argument containing
+    /// a space stays one argument. There is no shell, so pipes, redirection
+    /// and globbing do not apply -- run a shell explicitly if you need them.
+    pub command: Vec<String>,
+}
+
 /// Arguments for planning a destroy operation.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PlanDestroyArgs {
@@ -103,6 +119,13 @@ pub(crate) struct DestroyAction {
     /// Volume id, for the volume operations and restore.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volid: Option<String>,
+    /// Argument vector, for `guest_exec`.
+    ///
+    /// Held as a list rather than a string so the words an approver reviewed
+    /// are the words that run. Joining and re-splitting would let an argument
+    /// containing a space become two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
     /// Node the storage lives on, for the volume operations.
     ///
     /// Recorded rather than derived from the guest at apply. `local` is
