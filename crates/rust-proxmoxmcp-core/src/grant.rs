@@ -58,6 +58,26 @@ impl ProxmoxGrant {
         })
     }
 
+    /// Whether this grant carries `action`.
+    #[must_use]
+    pub fn allows_action(&self, action: ProxmoxAction) -> bool {
+        self.actions.contains(&action)
+    }
+
+    /// Whether the guest scope is unrestricted.
+    ///
+    /// Storage-addressed operations -- downloading an ISO, for instance -- name
+    /// no guest, so there is nothing for [`Self::allows_guest`] to match and no
+    /// selector here can narrow them. They therefore require a grant that was
+    /// not narrowed in the first place: a token scoped to `vmid:600-699` has no
+    /// business writing to storage that every guest shares.
+    ///
+    /// This stands in for a storage selector the grant does not yet carry.
+    #[must_use]
+    pub fn is_unrestricted_guest_scope(&self) -> bool {
+        self.guests.iter().any(|term| term.trim() == "*")
+    }
+
     /// Whether this grant admits a VMID that does not exist yet.
     ///
     /// For a creation destination — a clone's `newid`, or a `create_vm` target.

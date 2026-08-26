@@ -218,14 +218,15 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "approve_proxmox_change_set",
     "clone_vm",
     "create_backup",
+    "create_container",
     "create_snapshot",
-    // AUTHORIZATION_ONLY_TOOLS: see below. Sorted in with the rest so the
-    // sortedness invariant still holds.
+    "create_vm",
     "delete_backup",
     "delete_container",
     "delete_iso",
     "delete_snapshot",
     "delete_vm",
+    "download_iso",
     "get_cluster_status",
     "get_container_config",
     "get_container_ip",
@@ -304,6 +305,73 @@ pub struct CloneArgs {
     /// option should be asked for, not assumed.
     #[serde(default = "default_true")]
     pub full: bool,
+}
+
+/// Config keys that reach the hypervisor host rather than the guest.
+///
+/// `create_guest` forwards arbitrary key/value pairs to Proxmox, which is what
+/// makes it usable for both QEMU and LXC without modelling either. Two of those
+/// keys escape the guest entirely:
+///
+/// - `hookscript` names a script Proxmox executes **on the node** at guest
+///   lifecycle events.
+/// - `args` is appended to the `kvm` command line on the node.
+///
+/// Either turns "may create a guest" into "may run code on the hypervisor",
+/// which is not a privilege the `low` tier grants. They are refused rather than
+/// filtered out, so a caller is told their config was not applied as written.
+const HOST_ESCAPING_CONFIG_KEYS: &[&str] = &["hookscript", "args"];
+
+/// Arguments for creating a guest from scratch.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateGuestArgs {
+    /// Inventory name of the cluster.
+    pub cluster: String,
+    /// Node to create the guest on. Required: there is no guest to resolve.
+    pub node: String,
+    /// VMID for the new guest. Must be free and within the token's scope.
+    pub vmid: u32,
+    /// Proxmox config keys, forwarded as given.
+    ///
+    /// QEMU and LXC diverge enough that a shared type would be a union of two
+    /// half-populated things, so this stays untyped. `hookscript` and `args`
+    /// are refused: both execute on the node rather than in the guest.
+    #[serde(default)]
+    pub config: std::collections::BTreeMap<String, String>,
+}
+
+/// Arguments for downloading an image to a storage.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DownloadIsoArgs {
+    /// Inventory name of the cluster.
+    pub cluster: String,
+    /// Node whose storage receives the file. `local` is node-local, so the
+    /// same storage name on two nodes is two different places.
+    pub node: String,
+    /// Storage identifier.
+    pub storage: String,
+    /// Filename to write.
+    pub filename: String,
+    /// Source URL.
+    pub url: String,
+    /// Content type. `iso` or `vztmpl`.
+    #[serde(default = "default_download_content")]
+    pub content: String,
+    /// Checksum algorithm, e.g. `sha256`.
+    ///
+    /// Proxmox verifies only when the algorithm and value are both present and
+    /// silently ignores one without the other, so this server refuses a lone
+    /// half rather than letting a caller believe a checksum was checked.
+    #[serde(default)]
+    pub checksum_algorithm: Option<String>,
+    /// Checksum value. Travels with `checksum_algorithm`.
+    #[serde(default)]
+    pub checksum: Option<String>,
+}
+
+/// Images are the overwhelmingly common case.
+fn default_download_content() -> String {
+    "iso".to_owned()
 }
 
 /// Arguments for resizing one guest disk.
@@ -1013,6 +1081,79 @@ impl ProxmoxServer {
     /// lifecycle verbs but no verb dispatch. Interruption is derived from the
     /// tool name inside `Intent::low`, so an additive tool cannot accidentally
     /// be treated as interrupting or vice versa.
+    /// Authorize an operation that names a VMID which does not exist yet.
+    ///
+    /// [`Self::authorize_low`] cannot serve this: it resolves the guest, and
+    /// there is no guest. The protection union is likewise guest-derived, so
+    /// [`creation_allowed`] answers the pinned-VMID question instead.
+    ///
+    /// Returns the client on success.
+    ///
+    /// [`creation_allowed`]: rust_proxmoxmcp_core::protect::creation_allowed
+    fn authorize_creation(
+        &self,
+        tool: &'static str,
+        cluster: &str,
+        vmid: u32,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<&ProxmoxClient, Box<CallToolResult>> {
+        use rust_proxmoxmcp_core::grant::ProxmoxAction;
+        use rust_proxmoxmcp_core::protect::creation_allowed;
+
+        let caller = Self::caller(context);
+        if let Err(error) = authorize_call(caller.as_ref(), tool, Some(cluster), WRITE_TOOLS) {
+            return Err(Box::new(tool_error(error)));
+        }
+
+        let client = self.client_for(cluster)?;
+        let grant = resolve_grant(caller.as_ref())?;
+
+        if !grant.allows_action(ProxmoxAction::Low) {
+            return Err(Box::new(tool_error(
+                "creation requires the 'low' action tier, which this token does not carry",
+            )));
+        }
+
+        // The guest scope has to admit the *destination*. Nothing else looks at
+        // it, because there is no source guest whose scope could stand in.
+        if !grant.allows_new_vmid(vmid) {
+            return Err(Box::new(tool_error(format!(
+                "vmid {vmid} is outside this token's guest scope, so it may not be created"
+            ))));
+        }
+
+        // A pinned VMID is pinned because something important is expected to
+        // live there. Letting a create claim it strands the real guest.
+        if !creation_allowed(client.cluster(), vmid) {
+            return Err(Box::new(tool_error(format!(
+                "vmid {vmid} is a protected pin on cluster {cluster} and must not be created"
+            ))));
+        }
+
+        Ok(client)
+    }
+
+    /// Refuse config keys that execute on the node rather than in the guest.
+    fn reject_host_escaping_config(
+        config: &std::collections::BTreeMap<String, String>,
+    ) -> Option<CallToolResult> {
+        let offending: Vec<&str> = HOST_ESCAPING_CONFIG_KEYS
+            .iter()
+            .copied()
+            .filter(|key| config.contains_key(*key))
+            .collect();
+        if offending.is_empty() {
+            return None;
+        }
+        Some(tool_error(format!(
+            "config key(s) {} run on the hypervisor node rather than inside the guest, so this \
+             server will not set them: creating a guest is a 'low' operation and must not become \
+             code execution on the host. Remove them and create the guest, then set them from the \
+             Proxmox UI if you genuinely need them.",
+            offending.join(", ")
+        )))
+    }
+
     async fn authorize_low(
         &self,
         tool: &'static str,
@@ -1738,6 +1879,204 @@ impl ProxmoxServer {
 
         tool_result::<_, String>(
             Ok(serde_json::json!({ "upid": upid, "vmid": args.newid, "node": guest.node })),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
+    }
+
+    /// Shared body for `create_vm` and `create_container`.
+    ///
+    /// The two differ only in the path segment Proxmox wants, but they stay
+    /// separate tools: a caller asking for a container should not have to know
+    /// that a `kind` flag exists, and the tool name is what the token scope
+    /// names.
+    async fn create_guest_inner(
+        &self,
+        tool: &'static str,
+        kind: GuestType,
+        args: CreateGuestArgs,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        if let Some(refusal) = Self::reject_host_escaping_config(&args.config) {
+            return refusal;
+        }
+
+        let client = match self.authorize_creation(tool, &args.cluster, args.vmid, &context) {
+            Ok(client) => client,
+            Err(result) => return *result,
+        };
+
+        let config: Vec<(&str, &str)> = args
+            .config
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+
+        let upid = match rust_proxmoxmcp_core::guests::create_guest(
+            client, &args.node, kind, args.vmid, &config,
+        )
+        .await
+        {
+            Ok(upid) => upid,
+            Err(error) => return tool_error(error),
+        };
+
+        // The new guest is not in the cached `/cluster/resources` snapshot, and
+        // a caller that creates then immediately reads would be told it does
+        // not exist for as long as the TTL holds.
+        self.index.invalidate_cluster(&args.cluster);
+
+        tracing::info!(
+            target: "audit",
+            tool = tool,
+            cluster = args.cluster,
+            vmid = args.vmid,
+            node = %args.node,
+            kind = %kind.path_segment(),
+            config_keys = %args.config.keys().cloned().collect::<Vec<_>>().join(","),
+            tier = "low",
+            interrupts = false,
+            upid = %upid,
+            "proxmox guest created"
+        );
+
+        tool_result::<_, String>(
+            Ok(serde_json::json!({
+                "upid": upid,
+                "vmid": args.vmid,
+                "node": args.node,
+                "kind": kind.path_segment(),
+            })),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
+    }
+
+    #[tool(
+        name = "create_vm",
+        description = "Create a QEMU guest at a free VMID. Config keys are forwarded to Proxmox as given; 'hookscript' and 'args' are refused because they execute on the node."
+    )]
+    async fn create_vm(
+        &self,
+        Parameters(args): Parameters<CreateGuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.create_guest_inner("create_vm", GuestType::Qemu, args, context)
+            .await
+    }
+
+    #[tool(
+        name = "create_container",
+        description = "Create an LXC guest at a free VMID. Config keys are forwarded to Proxmox as given; 'hookscript' and 'args' are refused because they execute on the node."
+    )]
+    async fn create_container(
+        &self,
+        Parameters(args): Parameters<CreateGuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.create_guest_inner("create_container", GuestType::Lxc, args, context)
+            .await
+    }
+
+    #[tool(
+        name = "download_iso",
+        description = "Download an image to a node's storage. Requires an unrestricted guest scope, because a storage is shared and no guest selector can narrow it."
+    )]
+    async fn download_iso(
+        &self,
+        Parameters(args): Parameters<DownloadIsoArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        use rust_proxmoxmcp_core::grant::ProxmoxAction;
+
+        let caller = Self::caller(&context);
+        if let Err(error) = authorize_call(
+            caller.as_ref(),
+            "download_iso",
+            Some(&args.cluster),
+            WRITE_TOOLS,
+        ) {
+            return tool_error(error);
+        }
+
+        let client = match self.client_for(&args.cluster) {
+            Ok(client) => client,
+            Err(result) => return *result,
+        };
+        let grant = match resolve_grant(caller.as_ref()) {
+            Ok(grant) => grant,
+            Err(result) => return *result,
+        };
+
+        if !grant.allows_action(ProxmoxAction::Low) {
+            return tool_error("download_iso requires the 'low' action tier");
+        }
+
+        // A storage names no guest, so `allows_guest` has nothing to match and
+        // no selector this grant carries can narrow the call. A narrowed token
+        // is therefore refused outright rather than silently granted the run of
+        // storage every guest shares. See `is_unrestricted_guest_scope`.
+        if !grant.is_unrestricted_guest_scope() {
+            return tool_error(
+                "download_iso writes to storage that is not scoped to any guest, so it requires a \
+                 token whose guest scope is '*'. This token is narrowed to specific guests and \
+                 cannot be checked against a storage.",
+            );
+        }
+
+        // Proxmox verifies only when both halves are present and ignores one
+        // without the other, which would leave a caller believing a checksum
+        // was checked when it was not.
+        let checksum = match (args.checksum_algorithm.as_deref(), args.checksum.as_deref()) {
+            (Some(algorithm), Some(value)) => Some((algorithm, value)),
+            (None, None) => None,
+            _ => {
+                return tool_error(
+                    "checksum and checksum_algorithm travel together: Proxmox ignores one without \
+                     the other, so supplying a single half would report a verified download that \
+                     was never verified. Give both, or neither.",
+                );
+            }
+        };
+
+        let upid = match rust_proxmoxmcp_core::guests::download_url(
+            client,
+            &args.node,
+            &args.storage,
+            &args.content,
+            &args.filename,
+            &args.url,
+            checksum,
+        )
+        .await
+        {
+            Ok(upid) => upid,
+            Err(error) => return tool_error(error),
+        };
+
+        tracing::info!(
+            target: "audit",
+            tool = "download_iso",
+            cluster = args.cluster,
+            node = %args.node,
+            storage = %args.storage,
+            filename = %args.filename,
+            url = %args.url,
+            checksum_verified = checksum.is_some(),
+            tier = "low",
+            interrupts = false,
+            upid = %upid,
+            "proxmox image download started"
+        );
+
+        tool_result::<_, String>(
+            Ok(serde_json::json!({
+                "upid": upid,
+                "node": args.node,
+                "storage": args.storage,
+                "filename": args.filename,
+                "checksum_verified": checksum.is_some(),
+            })),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
         )
@@ -2794,7 +3133,10 @@ mod tests {
         let low_tools = [
             "clone_vm",
             "create_backup",
+            "create_container",
             "create_snapshot",
+            "create_vm",
+            "download_iso",
             "reset_vm",
             "resize_disk",
             "restart_container",
