@@ -26,6 +26,16 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// Principal recorded on a receipt written by startup recovery.
+///
+/// The executor of an apply is the token that called
+/// `apply_proxmox_change_set`, which is not the approver — two-person control
+/// exists so those differ. When the process that knew the executor dies before
+/// writing the receipt, that identity is simply gone, and no field on the
+/// change set carries it. An explicit marker says so; reusing the approver
+/// would put a name on a destructive execution that person did not perform.
+const RECOVERED_EXECUTOR: &str = "unknown:recovered-at-startup";
+
 /// Result size limits for MCP tool responses.
 const RESULT_LIMITS: ResultLimits = ResultLimits {
     max_text_bytes: 512 * 1024,
@@ -643,9 +653,22 @@ impl ProxmoxServer {
                     &record.id,
                     &record.id,
                     &record.device,
-                    record.approver.as_deref().unwrap_or("recovered-at-startup"),
+                    // Not `record.approver`. The approver is who authorised the
+                    // change set; the executor is whichever token called
+                    // `apply_proxmox_change_set`, and two-person control exists
+                    // precisely so those differ. Naming the approver here would
+                    // attribute a destructive execution to someone who did not
+                    // perform it — a worse defect in an audit trail than
+                    // admitting the executor is unknown, which is the honest
+                    // answer: the process that knew it died, and nothing
+                    // persisted it.
+                    RECOVERED_EXECUTOR,
                     succeeded,
-                    exitstatus,
+                    // Matches the normal path: a nonempty value is serialised
+                    // into `error`, so passing the exit status on success
+                    // produces a receipt reading `outcome: success` alongside
+                    // `error: "OK"`.
+                    if succeeded { "" } else { exitstatus },
                 )
             {
                 tracing::error!(
