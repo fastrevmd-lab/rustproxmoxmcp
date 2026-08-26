@@ -2303,6 +2303,21 @@ impl ProxmoxServer {
             Err(error) => return *error,
         };
 
+        // Drop the cached `/cluster/resources` snapshot before re-resolving.
+        //
+        // The fingerprint re-check below exists to refuse an apply against a
+        // guest that moved since the plan. `GuestIndex` caches that snapshot
+        // for `resource_cache_ttl_secs`, so without this the plan and the
+        // apply read the *same* cached response and the comparison could not
+        // fail -- inside the TTL the whole check was a no-op, and a rename,
+        // migration, status change or a newly added `protected` tag would all
+        // compare equal.
+        //
+        // The existing test only caught a move because its harness invalidates
+        // the cache itself; production never did. One extra fetch on a
+        // destructive apply is not a cost worth trading this for.
+        self.index.invalidate();
+
         // Resolve guest and compute protection to determine override.
         let guest = match self.index.resolve(client, &args.cluster, args.vmid).await {
             Ok(guest) => guest,

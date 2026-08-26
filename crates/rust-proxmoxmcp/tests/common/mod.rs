@@ -563,4 +563,23 @@ impl TestServer {
         // Invalidate the cache so the next resolve fetches the updated data.
         self.index.invalidate();
     }
+
+    /// Move a guest **without** invalidating the index.
+    ///
+    /// This is what production looks like: Proxmox changes underneath a cached
+    /// `/cluster/resources` snapshot and nothing tells the server. A handler
+    /// that relies on the cache expiring cannot notice within the TTL, so any
+    /// guarantee resting on a re-resolve has to drop the cache itself.
+    pub fn move_guest_to_node_leaving_cache_stale(&self, vmid: u32, new_node: &str) {
+        let body = format!(
+            r#"{{"data":[{{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"}},{{"id":"lxc/{}","type":"lxc","vmid":{},"name":"test-guest-{}","node":"{}","status":"running","tags":"test"}}]}}"#,
+            vmid, vmid, vmid, new_node
+        );
+
+        self.mock.replace_route(Route {
+            path: "/api2/json/cluster/resources",
+            status: 200,
+            body: Box::leak(body.into_boxed_str()).as_bytes(),
+        });
+    }
 }

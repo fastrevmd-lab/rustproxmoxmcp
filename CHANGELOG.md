@@ -22,6 +22,20 @@ Versioned as a patch on the operator-facing view, where nothing changed.
 Consumers of the `rust-proxmoxmcp-core` **library** do see an additive public
 function, which by strict semver would be a minor bump.
 
+### Security
+
+- **The fingerprint re-check at apply was a no-op inside the resource-cache
+  window.** `GuestIndex` caches `/cluster/resources` for
+  `resource_cache_ttl_secs` (default 10s), and the apply handler never dropped
+  it. Plan and apply therefore read the *same* cached snapshot and the
+  comparison could not fail: a guest renamed, migrated, stopped, started, or
+  newly tagged `protected` between approval and apply compared equal and was
+  acted on. Apply now invalidates the snapshot before re-resolving.
+
+  The existing test passed only because its harness invalidated the cache
+  itself. A second test now moves the guest **without** invalidating -- what
+  Proxmox actually does -- and it fails against the old handler.
+
 ### Added
 
 - `guests::guest_exec` -- run a command inside a QEMU guest through the guest
@@ -51,7 +65,13 @@ function, which by strict semver would be a minor bump.
   - Options that silently vanished with a same-named tool are now listed:
     `graceful` on stop, `vmstate` on snapshot, clone placement.
   - Every parity gap is now named in the guide, with a plain instruction not
-    to cut over until #57 closes.
+    to cut over until #57 closes -- including `restore_backup`, whose target
+    semantics are the **opposite** of the incumbent's: it overwrites an
+    existing guest with `force=true` rather than restoring to a new VMID.
+  - `shutdown_vm` is QEMU-only, so containers have no graceful stop at all;
+    the guide said otherwise.
+  - `clone_vm` silently ignores `snapname`, cloning current state rather than
+    the requested snapshot, and renames `source_vmid`/`target_vmid`.
 - The approval does not bind the preview text (#56), stated in the guide
   rather than implied.
 

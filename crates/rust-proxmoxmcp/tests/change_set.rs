@@ -404,3 +404,41 @@ async fn a_change_set_without_a_stored_preview_cannot_be_applied() {
         .count();
     assert_eq!(destroys, 0, "the guest must not be touched");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_guest_that_moved_is_refused_even_while_the_resource_cache_is_warm() {
+    let h = common::handler_with_guest(617, false).await;
+    let planned = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect("plan");
+    let id = planned["change_set_id"].as_str().expect("id").to_owned();
+    common::approve_as_second_principal(&h, &id).await;
+
+    // Move the guest the way Proxmox does: without telling the server. The
+    // sibling helper invalidates the index, which is what let the original
+    // fingerprint test pass against a handler that never dropped the cache.
+    h.move_guest_to_node_leaving_cache_stale(617, "pve3");
+
+    let err = common::call(
+        &h,
+        "apply_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect_err("a guest that moved must not be destroyed on an approval bound to its old state");
+    assert!(
+        err.to_string().to_lowercase().contains("fingerprint"),
+        "the refusal must name the fingerprint: {err}"
+    );
+
+    let destroys = h
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "DELETE")
+        .count();
+    assert_eq!(destroys, 0, "the guest must not be touched");
+}

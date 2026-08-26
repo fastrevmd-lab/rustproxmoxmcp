@@ -92,6 +92,7 @@ need in the token scope, not just the two handlers.
 | `create_vm`, `create_container` | **none.** `guests::create_guest` exists in core with no tool calling it — same gap, same issue |
 | `download_iso` | **none.** `guests::download_url` exists in core with no tool calling it |
 | `update_container_resources` | **none.** Not implemented at any layer |
+| `restore_backup` to a new VMID | **none.** The mapping above overwrites an existing guest; see the semantics note below |
 
 These are genuine gaps, not oversights. A caller that depends on them has to
 change rather than be shimmed. **Do not cut over from the third-party server
@@ -135,9 +136,20 @@ either fails to parse or silently does something else:
 
 | tool | option that is gone | what happens instead |
 |---|---|---|
-| `stop_container`, `stop_vm` | `graceful` | always an immediate stop; use `shutdown_vm` for the graceful path |
+| `stop_vm` | `graceful` | always an immediate stop. `shutdown_vm` is the graceful path and it is **QEMU only** |
+| `stop_container` | `graceful` | always an immediate stop, and **there is no graceful LXC path at all** — `shutdown_vm` refuses a container |
 | `create_snapshot` | `vmstate` | the snapshot never includes RAM state |
-| `clone_vm` | target storage and node placement | the clone lands where Proxmox defaults it; `full` is the only copy control |
+| `clone_vm` | `pool`, `snapname`, target storage and node placement | `snapname` being ignored means the clone takes **current state, not the requested snapshot**. The clone lands where Proxmox defaults it; `full` is the only copy control |
+
+`clone_vm` also renames its arguments: the third-party `source_vmid` and
+`target_vmid` are `vmid` and `newid` here.
+
+`restore_backup` has **opposite target semantics**. The third-party tool treats
+`vmid` as a *new* restore target and exposes `storage` and `unique`; here the
+plan resolves an **existing** guest by that VMID and the apply always passes
+`force=true`, overwriting it. Restore-to-a-new-VMID is not available, and a
+caller expecting the incumbent's behaviour would overwrite a live guest instead
+of creating one.
 
 ## Two behaviours that will surprise a 970 caller
 
