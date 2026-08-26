@@ -398,3 +398,200 @@ pub async fn restore_backup(
     let data = client.post_form(path_template, params, form).await?;
     upid_from(data)
 }
+
+/// Whether a disk resize destroys data.
+///
+/// Proxmox takes the size as a delta (`+8G`) or an absolute value (`32G`).
+/// A grow adds capacity; a **shrink discards whatever lived beyond the new
+/// end**, which is data loss and therefore destructive rather than low tier.
+///
+/// `tier::tier_of` reports `resize_disk` as `Low` because a tool's tier cannot
+/// depend on an argument. The re-classification happens here, at the one place
+/// that has the argument to look at.
+///
+/// A value this cannot classify is treated as **shrinking**. Guessing "grow"
+/// on an unparseable size would let a possible shrink through; guessing
+/// "shrink" only costs a refusal the caller can retry as an explicit `+N`.
+/// Shrinking is not offered by any tool on this server -- there is no
+/// change-set path to it -- so a false "shrink" is never a data-loss risk.
+#[must_use]
+pub fn resize_shrinks(size: &str) -> bool {
+    let trimmed = size.trim();
+    // A leading `+` is Proxmox's delta form and is the only unambiguous grow.
+    // Everything else — an absolute value, a negative delta, an empty or
+    // malformed string — is treated as a shrink.
+    let Some(delta) = trimmed.strip_prefix('+') else {
+        return true;
+    };
+    // The `+` alone does not make it a grow. `+banana`, `++8G` and `+-8G` all
+    // start with one and none of them names an amount to add; a length check
+    // admitted every one of them to the low tier, which is the opposite of
+    // what the contract above promises.
+    !names_a_positive_amount(delta)
+}
+
+/// Whether `value` is a positive Proxmox size: digits, an optional decimal
+/// fraction, and an optional `K`/`M`/`G`/`T` unit in either case.
+///
+/// Zero is not a positive amount. `+0G` adds nothing, so admitting it to the
+/// low tier would spend an authorisation on a call that cannot grow anything.
+fn names_a_positive_amount(value: &str) -> bool {
+    let digits = match value.chars().last() {
+        Some(unit) if matches!(unit, 'K' | 'M' | 'G' | 'T' | 'k' | 'm' | 'g' | 't') => {
+            &value[..value.len() - unit.len_utf8()]
+        }
+        _ => value,
+    };
+
+    let mut parts = digits.splitn(2, '.');
+    let whole = parts.next().unwrap_or_default();
+    if whole.is_empty() || !whole.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    if let Some(fraction) = parts.next()
+        && (fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return false;
+    }
+
+    digits
+        .bytes()
+        .any(|byte| byte.is_ascii_digit() && byte != b'0')
+}
+
+/// Clone a guest into a new VMID and return the UPID.
+///
+/// `full` selects a full copy over a linked clone. A linked clone shares base
+/// storage with its source, so deleting the source later breaks the clone —
+/// which is why the choice is the caller's rather than a default here.
+///
+/// # Errors
+///
+/// As [`lifecycle`].
+pub async fn clone_guest(
+    client: &ProxmoxClient,
+    node: &str,
+    kind: crate::selector::GuestType,
+    source_vmid: u32,
+    new_vmid: u32,
+    name: Option<&str>,
+    full: bool,
+) -> Result<String, ProxmoxError> {
+    let path_template = "/api2/json/nodes/{node}/{kind}/{vmid}/clone";
+    let source_string = source_vmid.to_string();
+    let params = &[
+        ("node", node),
+        ("kind", kind.path_segment()),
+        ("vmid", source_string.as_str()),
+    ];
+
+    let new_string = new_vmid.to_string();
+    let full_value = if full { "1" } else { "0" };
+    let mut form: Vec<(&str, &str)> = vec![("newid", new_string.as_str()), ("full", full_value)];
+    // `hostname` for a container, `name` for a VM: the same concept under two
+    // spellings, and sending the wrong one is silently ignored by Proxmox.
+    if let Some(name) = name.filter(|value| !value.is_empty()) {
+        form.push((
+            match kind {
+                crate::selector::GuestType::Lxc => "hostname",
+                crate::selector::GuestType::Qemu => "name",
+            },
+            name,
+        ));
+    }
+
+    let data = client.post_form(path_template, params, &form).await?;
+    upid_from(data)
+}
+
+/// Resize a guest disk and return the UPID.
+///
+/// `size` is Proxmox's form: `+8G` to grow by, or an absolute value. See
+/// [`resize_shrinks`] for why the two are not interchangeable to the
+/// authorization spine.
+///
+/// Answers synchronously on some storage types, so the returned handle may be
+/// empty rather than a UPID.
+///
+/// # Errors
+///
+/// As [`lifecycle`], minus the UPID parse when the answer is synchronous.
+pub async fn resize_disk(
+    client: &ProxmoxClient,
+    node: &str,
+    kind: crate::selector::GuestType,
+    vmid: u32,
+    disk: &str,
+    size: &str,
+) -> Result<String, ProxmoxError> {
+    let path_template = "/api2/json/nodes/{node}/{kind}/{vmid}/resize";
+    let vmid_string = vmid.to_string();
+    let params = &[
+        ("node", node),
+        ("kind", kind.path_segment()),
+        ("vmid", vmid_string.as_str()),
+    ];
+    let form = &[("disk", disk), ("size", size)];
+
+    let data = client.post_form(path_template, params, form).await?;
+    // A synchronous answer is `null`, not a UPID. Returning an empty handle
+    // rather than failing keeps a completed resize from reading as an error.
+    Ok(data.as_str().unwrap_or_default().to_owned())
+}
+
+/// Create a guest and return the UPID.
+///
+/// `config` carries the guest's whole definition, which differs enough between
+/// QEMU and LXC that this function does not model it: the caller passes the
+/// form fields Proxmox documents for the type it is creating.
+///
+/// # Errors
+///
+/// As [`lifecycle`].
+pub async fn create_guest(
+    client: &ProxmoxClient,
+    node: &str,
+    kind: crate::selector::GuestType,
+    vmid: u32,
+    config: &[(&str, &str)],
+) -> Result<String, ProxmoxError> {
+    let path_template = "/api2/json/nodes/{node}/{kind}";
+    let params = &[("node", node), ("kind", kind.path_segment())];
+
+    let vmid_string = vmid.to_string();
+    let mut form: Vec<(&str, &str)> = vec![("vmid", vmid_string.as_str())];
+    form.extend_from_slice(config);
+
+    let data = client.post_form(path_template, params, &form).await?;
+    upid_from(data)
+}
+
+/// Download an ISO or container template onto a storage backend.
+///
+/// # Errors
+///
+/// As [`lifecycle`].
+pub async fn download_url(
+    client: &ProxmoxClient,
+    node: &str,
+    storage: &str,
+    content: &str,
+    filename: &str,
+    url: &str,
+    checksum: Option<(&str, &str)>,
+) -> Result<String, ProxmoxError> {
+    let path_template = "/api2/json/nodes/{node}/storage/{storage}/download-url";
+    let params = &[("node", node), ("storage", storage)];
+
+    let mut form: Vec<(&str, &str)> =
+        vec![("content", content), ("filename", filename), ("url", url)];
+    // Proxmox verifies the download when both are given. Sending one without
+    // the other is silently ignored, so they travel together or not at all.
+    if let Some((algorithm, value)) = checksum {
+        form.push(("checksum-algorithm", algorithm));
+        form.push(("checksum", value));
+    }
+
+    let data = client.post_form(path_template, params, &form).await?;
+    upid_from(data)
+}

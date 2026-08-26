@@ -57,6 +57,29 @@ impl ProxmoxGrant {
                 .unwrap_or(false)
         })
     }
+
+    /// Whether this grant admits a VMID that does not exist yet.
+    ///
+    /// For a creation destination — a clone's `newid`, or a `create_vm` target.
+    /// Only the terms a bare number can answer participate: `*` and `vmid:`.
+    /// A guest that does not exist carries no tags and belongs to no pool, so a
+    /// `tag:` or `pool:` grant cannot admit it.
+    ///
+    /// That asymmetry is deliberate rather than an omission. A token granted
+    /// `tag:ci` was granted reach over guests someone else labelled; letting it
+    /// *create* one would let it choose its own scope, because the new guest's
+    /// tags are whatever the caller sets.
+    #[must_use]
+    pub fn allows_new_vmid(&self, vmid: u32) -> bool {
+        self.guests.iter().any(|term| match Selector::parse(term) {
+            Ok(Selector::Any) => true,
+            Ok(Selector::Vmid(other)) => other == vmid,
+            Ok(Selector::VmidRange { low, high }) => vmid >= low && vmid <= high,
+            // A tag, pool or node selector cannot speak for a guest that does
+            // not exist, and a malformed term admits nothing.
+            _ => false,
+        })
+    }
 }
 
 impl Grant for ProxmoxGrant {
@@ -163,5 +186,51 @@ mod tests {
             r#"{"guests":["*"],"actions":["read"],"max_targets":3}"#,
         );
         assert!(error.is_err());
+    }
+}
+
+#[cfg(test)]
+mod new_vmid_tests {
+    use super::{ProxmoxAction, ProxmoxGrant};
+
+    fn grant(terms: &[&str]) -> ProxmoxGrant {
+        ProxmoxGrant {
+            guests: terms.iter().map(|t| (*t).to_owned()).collect(),
+            actions: vec![ProxmoxAction::Read, ProxmoxAction::Low],
+        }
+    }
+
+    #[test]
+    fn a_range_admits_a_destination_inside_it() {
+        assert!(grant(&["vmid:600-699"]).allows_new_vmid(650));
+    }
+
+    /// The case the check exists for: a token scoped to one band must not
+    /// create outside it.
+    #[test]
+    fn a_range_refuses_a_destination_outside_it() {
+        assert!(!grant(&["vmid:600-699"]).allows_new_vmid(800));
+    }
+
+    #[test]
+    fn a_wildcard_admits_anything() {
+        assert!(grant(&["*"]).allows_new_vmid(800));
+    }
+
+    /// A guest that does not exist carries no tags and belongs to no pool, so
+    /// those selectors cannot admit it. Deliberate, not an omission: a token
+    /// granted `tag:ci` was granted reach over guests someone else labelled,
+    /// and letting it create one would let it choose its own scope, because the
+    /// new guest's tags are whatever the caller sets.
+    #[test]
+    fn a_tag_or_pool_grant_cannot_create() {
+        assert!(!grant(&["tag:ci"]).allows_new_vmid(650));
+        assert!(!grant(&["pool:lab"]).allows_new_vmid(650));
+        assert!(!grant(&["node:pve2"]).allows_new_vmid(650));
+    }
+
+    #[test]
+    fn a_malformed_term_admits_nothing() {
+        assert!(!grant(&["nonsense:zzz"]).allows_new_vmid(650));
     }
 }

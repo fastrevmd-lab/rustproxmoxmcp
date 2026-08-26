@@ -2253,7 +2253,7 @@ dependencies = [
 
 [[package]]
 name = "rust-proxmoxmcp"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2285,7 +2285,7 @@ dependencies = [
 
 [[package]]
 name = "rust-proxmoxmcp-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "mecmcp-auth",
