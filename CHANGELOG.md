@@ -5,6 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-08-26
+
+Completes the destructive tier. 0.3 built the change-set machinery and wired
+**one** of the eight destructive tools through it; the remaining six now go
+through the same plan -> approve -> apply path rather than beside it.
+
+### Added
+
+- **`plan_proxmox_destroy` takes an `op`** — `destroy_guest` (the default),
+  `delete_snapshot`, `rollback_snapshot`, `delete_backup`, `delete_iso`,
+  `restore_backup` — with the parameters each needs. Required at **plan** time,
+  because the action is what the digest covers: anything left undecided then is
+  something the approver cannot review.
+- `destroy_vm`, `delete_snapshot`, `rollback_snapshot`, `delete_volume` and
+  `restore_backup` primitives.
+
+### Security
+
+- **Each operation authorises against its own tool name.** A token allowlisted
+  for `plan_proxmox_destroy` and `apply_proxmox_change_set` could previously
+  select any operation, which made `WRITE_TOOLS` naming each destructive tool
+  separately meaningless. Checked at plan **and** at apply, because a scope can
+  be narrowed between the two and the apply is the call that acts.
+- **The preview describes the operation that will run.** It previously rendered
+  a guest destroy for every operation, so an approver reviewing a rollback,
+  restore or volume deletion was shown `DESTROY <guest>`. The two that *replace*
+  state now say so: a rollback and a restore both warn that everything written
+  since the snapshot is lost.
+- **A volume is addressed on its own node.** `local` is node-local storage, so
+  `local:backup/x` on two nodes names two different volumes; the node is now
+  part of the action rather than derived from whichever guest the vmid names.
+
+### Fixed
+
+- **A synchronous deletion no longer fails after succeeding.** Some storage
+  types delete without a task and return no handle; parsing that as a UPID
+  reported failure for a volume already gone, wrote no receipt, and left the
+  record retryable against something that no longer existed.
+
+### What the approval actually binds
+
+Stated plainly, because the 0.3 README overstated it. The plan digest covers
+`(owner, device, expected fingerprint, actions)` and the approval binds that
+digest. **The preview is not hashed into it.** It is stored with its own digest,
+so the text an approver read cannot be edited afterwards without the store
+refusing it — but what an approver commits to is the operation and its
+parameters, not the prose describing them.
+
+### Backward compatibility
+
+`op` defaults to `destroy_guest`, so a caller written against 0.5 keeps working.
+A change set planned under 0.3 recorded `op: "destroy"`, and that spelling still
+dispatches: a plan made then must not become unexecutable because the name
+changed.
+
 ## [0.5.0] - 2026-08-25
 
 The daily driver. **`KNOWN_TOOLS` goes 20 -> 29**, and change-set state is
