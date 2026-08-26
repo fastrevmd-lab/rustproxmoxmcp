@@ -2331,23 +2331,45 @@ impl ProxmoxServer {
             return tool_error(error);
         }
 
-        tracing::info!(
-            target: "audit",
-            tool = "stop_task",
-            cluster = args.cluster,
-            node = %node,
-            tier = "low",
-            interrupts = true,
-            upid = %args.upid,
-            // Present for guest-addressed work, absent for node jobs. A
-            // protected guest allowed through a waiver or lab mode has to leave
-            // that verdict in the record, or the trail says a protected guest's
-            // operation was interrupted with no evidence of why it was allowed.
-            vmid = ?authorized.as_ref().map(|a| a.guest().vmid),
-            guest = ?authorized.as_ref().map(|a| a.guest().name.clone()),
-            protection = ?authorized.as_ref().map(|a| a.protection().summary()),
-            "proxmox task stop requested"
-        );
+        // Two call sites rather than one with optional fields. A tracing field
+        // is fixed per site, so an `Option` would serialise as the string
+        // "Some(617)" or "None" in the JSON audit stream -- neither omitted nor
+        // the same type as every other event's `vmid`, which breaks correlation
+        // for exactly the queries an audit log exists to answer.
+        match authorized.as_ref() {
+            Some(authorized) => {
+                let guest = authorized.guest();
+                tracing::info!(
+                    target: "audit",
+                    tool = "stop_task",
+                    cluster = args.cluster,
+                    node = %node,
+                    tier = "low",
+                    interrupts = true,
+                    upid = %args.upid,
+                    vmid = guest.vmid,
+                    guest = %guest.name,
+                    // A protected guest allowed through a waiver or lab mode
+                    // has to leave that verdict here, or the trail shows its
+                    // operation interrupted with no evidence of why.
+                    protection = %authorized.protection().summary(),
+                    "proxmox task stop requested"
+                );
+            }
+            None => {
+                tracing::info!(
+                    target: "audit",
+                    tool = "stop_task",
+                    cluster = args.cluster,
+                    node = %node,
+                    tier = "low",
+                    interrupts = true,
+                    upid = %args.upid,
+                    scope = "node",
+                    "proxmox task stop requested"
+                );
+            }
+        }
 
         tool_result::<_, String>(
             Ok(serde_json::json!({
