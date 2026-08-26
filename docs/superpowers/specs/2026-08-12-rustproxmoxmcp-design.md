@@ -212,6 +212,13 @@ never a value a caller passes.
 | `low` | `start_vm`, `stop_vm`, `shutdown_vm`, `reset_vm`, `start_container`, `stop_container`, `restart_container`, `create_snapshot`, `create_backup`, `create_vm`, `create_container`, `clone_vm`, `download_iso`, `update_container_resources`, `resize_disk` (grow) | scope + protection reported + audit |
 | `destructive` | `delete_vm`, `delete_container`, `restore_backup`, `rollback_snapshot`, `delete_snapshot`, `delete_backup`, `delete_iso`, `resize_disk` (shrink) | change set: plan → fingerprint → approve → apply |
 
+> **Not implemented as designed.** Shrinking is refused outright rather than
+> routed through a change set: the only destructive plan tool is
+> `plan_proxmox_destroy`, which destroys the whole guest, so sending a shrink
+> "through the change-set flow" would have meant destroying the VM. Callers are
+> directed to the Proxmox UI or CLI instead. The rest of this section describes
+> the original design.
+
 `resize_disk` is the single tier-split-on-argument case: grow is `low`, shrink is
 `destructive`. A shrink destroys data and a grow does not, and splitting them
 into two tools would let a caller reach the destructive path through the benign

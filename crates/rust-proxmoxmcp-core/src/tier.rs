@@ -269,9 +269,9 @@ mod resize_tests {
     }
 
     /// An absolute value may be smaller than the current disk, and this
-    /// function cannot know the current size. Treating it as a shrink routes it
-    /// through the change-set flow, which costs an approval; treating it as a
-    /// grow would let a shrink past the gate entirely.
+    /// function cannot know the current size. Treating it as a shrink gets the
+    /// call refused, which the caller can retry as an explicit `+N`; treating
+    /// it as a grow would let a shrink past the gate entirely.
     #[test]
     fn an_absolute_size_is_treated_as_shrinking() {
         for size in ["32G", "8G", "1024M"] {

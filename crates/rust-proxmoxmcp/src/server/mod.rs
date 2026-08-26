@@ -315,11 +315,12 @@ pub struct ResizeArgs {
     pub vmid: u32,
     /// Disk to resize, e.g. `rootfs`, `scsi0`.
     pub disk: String,
-    /// New size: `+8G` to grow by, or an absolute value.
+    /// New size: `+8G` to grow by.
     ///
     /// Only the `+` form is treated as growing. An absolute value may be
-    /// smaller than the current disk, which destroys data, so it is refused
-    /// here and must go through the change-set flow.
+    /// smaller than the current disk, which destroys data, so it is refused.
+    /// Shrinking is not supported by any tool on this server; use the Proxmox
+    /// UI or CLI, where the consequences are visible.
     pub size: String,
 }
 
@@ -1744,7 +1745,7 @@ impl ProxmoxServer {
 
     #[tool(
         name = "resize_disk",
-        description = "Grow a guest disk. A shrink is refused here and must go through the change-set flow."
+        description = "Grow a guest disk. Only the '+N' form is accepted. Shrinking is not supported by any tool on this server -- do it from the Proxmox UI or CLI."
     )]
     async fn resize_disk(
         &self,

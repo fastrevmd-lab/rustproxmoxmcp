@@ -410,8 +410,10 @@ pub async fn restore_backup(
 /// that has the argument to look at.
 ///
 /// A value this cannot classify is treated as **shrinking**. Guessing "grow"
-/// on an unparseable size would route a possible shrink around the change-set
-/// flow; guessing "shrink" only costs an approval.
+/// on an unparseable size would let a possible shrink through; guessing
+/// "shrink" only costs a refusal the caller can retry as an explicit `+N`.
+/// Shrinking is not offered by any tool on this server -- there is no
+/// change-set path to it -- so a false "shrink" is never a data-loss risk.
 #[must_use]
 pub fn resize_shrinks(size: &str) -> bool {
     let trimmed = size.trim();
