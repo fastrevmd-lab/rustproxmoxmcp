@@ -523,6 +523,13 @@ async fn serve_stdio(
     )
     .context("build server")?;
 
+    // Before serving: settle any apply that was in flight when this process
+    // last stopped. Proxmox kept running it, so the answer exists and only has
+    // to be asked for. Doing it before the first request means a caller never
+    // sees a change set stuck in `Applying` that this server could have
+    // resolved.
+    handler.recover_in_flight().await;
+
     if lab_mode {
         tracing::warn!(
             target: "audit",
@@ -662,6 +669,13 @@ async fn serve_http(
         clusters, clients, index, waivers, lab_mode, evidence,
     )
     .context("build server")?;
+
+    // Before serving: settle any apply that was in flight when this process
+    // last stopped. Proxmox kept running it, so the answer exists and only has
+    // to be asked for. Doing it before the first request means a caller never
+    // sees a change set stuck in `Applying` that this server could have
+    // resolved.
+    handler.recover_in_flight().await;
 
     if lab_mode {
         tracing::warn!(

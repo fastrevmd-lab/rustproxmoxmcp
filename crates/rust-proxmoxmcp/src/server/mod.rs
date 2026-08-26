@@ -491,6 +491,131 @@ impl ProxmoxServer {
         .await
     }
 
+    /// Re-probe every apply that was in flight when this process last stopped.
+    ///
+    /// Called once at startup. A change set left in `Applying` with a
+    /// `task_id` means the previous process started a destructive operation
+    /// and died before observing its result. Proxmox kept running it, so the
+    /// answer exists — it just has to be asked for.
+    ///
+    /// Without this the record stays `Applying` forever and an operator has to
+    /// read the device to find out what happened. That is the "detectable but
+    /// not recoverable" limitation the 0.3 README documented.
+    ///
+    /// Failures here are logged, never fatal: a server that refuses to start
+    /// because one historical task cannot be re-probed is worse than one that
+    /// starts and says which change set is still unresolved.
+    pub async fn recover_in_flight(&self) {
+        let records = self.coordinator.change_sets().await;
+        for mut record in records {
+            if record.state != mecmcp_changeset::ChangeSetState::Applying {
+                // A handle on a settled record means the process died between
+                // finishing and clearing it. Nothing to re-probe, but say so:
+                // it is evidence about a crash, not noise.
+                if record.task_id.is_some() {
+                    tracing::warn!(
+                        target: "audit",
+                        change_set = %record.id,
+                        state = ?record.state,
+                        "a settled change set still carries a task handle; \
+                         the previous process died after finishing"
+                    );
+                }
+                continue;
+            }
+            let Some(task_id) = record.task_id.clone() else {
+                tracing::error!(
+                    target: "audit",
+                    change_set = %record.id,
+                    device = %record.device,
+                    "an apply is stuck in Applying with no task handle; it predates \
+                     handle persistence and must be resolved against the device by hand"
+                );
+                continue;
+            };
+
+            let Ok(upid) = rust_proxmoxmcp_core::task::Upid::parse(&task_id) else {
+                tracing::error!(
+                    target: "audit",
+                    change_set = %record.id,
+                    %task_id,
+                    "the stored task handle does not parse; cannot re-probe"
+                );
+                continue;
+            };
+
+            // The cluster is not on the record, so try each configured client
+            // until one recognises the task. A UPID names its node, not its
+            // cluster, and two clusters can both have a node of that name.
+            let mut resolved = None;
+            for (cluster, client) in self.clients.iter() {
+                let upid_encoded = task_id.replace(':', "%3A");
+                let path = format!(
+                    "/api2/json/nodes/{}/tasks/{upid_encoded}/status",
+                    upid.node()
+                );
+                if let Ok(data) = client.get_json(&path, &[], &[]).await {
+                    resolved = Some((cluster.clone(), data));
+                    break;
+                }
+            }
+
+            let Some((cluster, data)) = resolved else {
+                tracing::error!(
+                    target: "audit",
+                    change_set = %record.id,
+                    %task_id,
+                    "no configured cluster could answer for this task; leaving it Applying"
+                );
+                continue;
+            };
+
+            let status = data.get("status").and_then(serde_json::Value::as_str);
+            if status == Some("running") {
+                // Still going. Leave it alone — this process did not start it
+                // and must not adopt a poll loop for it, but the operator can
+                // now see which task it is.
+                tracing::warn!(
+                    target: "audit",
+                    change_set = %record.id,
+                    %cluster,
+                    %task_id,
+                    "an apply from a previous process is still running"
+                );
+                continue;
+            }
+
+            let exitstatus = data
+                .get("exitstatus")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let outcome = rust_proxmoxmcp_core::task::classify_exit_status(exitstatus);
+            record.state = match outcome {
+                rust_proxmoxmcp_core::task::TaskOutcome::Ok => {
+                    mecmcp_changeset::ChangeSetState::Applied
+                }
+                rust_proxmoxmcp_core::task::TaskOutcome::Failed(_) => {
+                    mecmcp_changeset::ChangeSetState::Failed
+                }
+            };
+            record.task_id = None;
+
+            tracing::warn!(
+                target: "audit",
+                change_set = %record.id,
+                %cluster,
+                %task_id,
+                state = ?record.state,
+                %exitstatus,
+                "recovered an apply that was in flight at shutdown"
+            );
+
+            if let Err(error) = self.coordinator.update_change_set(record).await {
+                tracing::error!(%error, "could not persist the recovered outcome");
+            }
+        }
+    }
+
     /// Stage 1 + stage 2 authorization for a low-tier guest call.
     ///
     /// Shared by the additive tools, which need the same gate as the
@@ -1661,11 +1786,33 @@ impl ProxmoxServer {
             Err(error) => return tool_error(error),
         };
 
-        // Note: The UPID should be persisted into the operation record BEFORE
-        // polling (spec §8), but mecmcp-changeset doesn't yet expose a method
-        // to update a change set with the task ID. For now, we proceed without
-        // persistence, which means a crashed apply is detectable but not
-        // recoverable. This will be addressed in a follow-up task.
+        // Persist the UPID BEFORE polling (spec §8).
+        //
+        // The window this closes is between Proxmox accepting the operation and
+        // this process observing its result. A crash in that window used to
+        // leave the record in `Applying` with nothing recorded about which
+        // vendor operation to ask after — detectable, but resolvable only by a
+        // human reading the device. With the handle on disk, `recover_in_flight`
+        // can re-probe it at startup.
+        //
+        // A failure to persist is logged rather than fatal: the destructive
+        // operation has already been accepted by Proxmox, so refusing here
+        // would abandon a running task *and* report failure for something that
+        // is going to happen anyway. Losing the handle is worse than the write
+        // failing quietly, so it is said loudly instead.
+        {
+            let mut in_flight = record.clone();
+            in_flight.task_id = Some(upid_str.clone());
+            if let Err(error) = self.coordinator.update_change_set(in_flight).await {
+                tracing::error!(
+                    target: "audit",
+                    %error,
+                    change_set = %record.id,
+                    upid = %upid_str,
+                    "task handle not persisted; a crash now leaves this apply unrecoverable"
+                );
+            }
+        }
 
         // Poll the task to completion using mecmcp_job.
         let token = tokio_util::sync::CancellationToken::new();
@@ -1755,6 +1902,10 @@ impl ProxmoxServer {
         match outcome {
             rust_proxmoxmcp_core::task::TaskOutcome::Ok => {
                 record.state = mecmcp_changeset::ChangeSetState::Applied;
+                // The outcome is known, so the handle has nothing left to
+                // recover. Leaving it set would make a finished apply look
+                // in-flight to `recover_in_flight` on the next start.
+                record.task_id = None;
                 if let Err(error) = self.coordinator.update_change_set(record).await {
                     tracing::error!(%error, "could not mark the change set applied");
                 }
@@ -1776,6 +1927,7 @@ impl ProxmoxServer {
                 // digest and principal, which is worse than refusing the retry.
                 // A fresh plan is the correct path after a failed destroy.
                 record.state = mecmcp_changeset::ChangeSetState::Failed;
+                record.task_id = None;
                 if let Err(error) = self.coordinator.update_change_set(record).await {
                     tracing::error!(%error, "could not mark the change set failed");
                 }
