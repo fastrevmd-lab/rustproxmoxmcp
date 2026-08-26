@@ -18,7 +18,14 @@ plan_proxmox_destroy → approve_proxmox_change_set → apply_proxmox_change_set
 The plan renders a server-generated preview and records the operation; the
 approval binds the **plan digest**, which covers `(owner, device, expected
 fingerprint, actions)`; and applying re-checks the guest's fingerprint.
-**A guest that changed after approval is refused rather than acted on.**
+
+**Know what the fingerprint covers before relying on it.** It is computed over
+`cluster`, `vmid`, `name`, `kind`, `node`, `status` and `tags`. `config_digest`
+and `disks` are sent **empty** at both plan and apply, so a configuration-only
+change does not move it: a guest can have its hardware or disks altered between
+approval and apply and still match. What the re-check reliably catches is a
+guest that was renamed, migrated, stopped or started, retagged, or replaced by
+one with different identity metadata -- not one that was reconfigured in place.
 
 `--lab-mode` waives the second principal for a single-operator lab, and
 `--waivers-file` carries time-boxed operator waivers — both originate outside
@@ -58,10 +65,9 @@ node is how a request addresses the wrong guest after a migration.
 | `delete_container` | `plan_proxmox_destroy` with `op: "destroy_guest"` |
 | `delete_snapshot` | `op: "delete_snapshot"`, `snapname` |
 | `rollback_snapshot` | `op: "rollback_snapshot"`, `snapname` |
-| `delete_backup` | `op: "delete_backup"`, `storage` + `volid` |
-| `delete_iso` | `op: "delete_iso"`, `storage` + `volid` |
+| `delete_backup` | `op: "delete_backup"`, `storage` + `volid` + `storage_node` |
+| `delete_iso` | `op: "delete_iso"`, `storage` + `volid` + `storage_node` |
 | `restore_backup` | `op: "restore_backup"`, `volid` |
-| `execute_vm_command` | `op: "guest_exec"`, `command` |
 
 Then `approve_proxmox_change_set` and `apply_proxmox_change_set`.
 
@@ -82,9 +88,16 @@ need in the token scope, not just the two handlers.
 | `poll_job` | applies follow their UPID to completion within the call; a crashed apply is re-probed at startup |
 | `cancel_job` | **none.** Proxmox tasks are not cancellable through this surface |
 | `retry_job` | **none.** A failed apply needs a fresh plan — the change set is terminal, and retrying one whose receipt is already written would carry an empty digest and principal |
+| `execute_vm_command` | **none.** The `guests::guest_exec` primitive exists in the core library as of 0.7.1, but no tool calls it, so there is nothing to reach from MCP. Wiring it behind the change-set flow is tracked in #57 |
+| `create_vm`, `create_container` | **none.** `guests::create_guest` exists in core with no tool calling it — same gap, same issue |
+| `download_iso` | **none.** `guests::download_url` exists in core with no tool calling it |
+| `update_container_resources` | **none.** Not implemented at any layer |
 
-The last two are genuine gaps, not oversights. A caller that depends on them
-has to change rather than be shimmed.
+These are genuine gaps, not oversights. A caller that depends on them has to
+change rather than be shimmed. **Do not cut over from the third-party server
+until #57 closes** unless you can give up all of the above: four of them have
+tested core functions sitting behind no tool, which is not the same as being
+available.
 
 ### Here but not there
 
@@ -98,14 +111,33 @@ has to change rather than be shimmed.
    **excludes** `WRITE_TOOLS`, so a wildcard token reaches no mutating tool.
    Use `token set-scopes --name N --tools ...` — it changes scopes without
    reissuing the secret.
-2. **Grant the action tiers you need.** `read`, `low`, `destructive`. A grant
+2. **Scope the destructive *operations*, not just the three change-set tools.**
+   Plan and apply authorise a second time against the selected operation's own
+   name -- `delete_vm`, `delete_container`, `delete_snapshot`,
+   `rollback_snapshot`, `delete_backup`, `delete_iso`, `restore_backup`. A
+   token holding only `plan_proxmox_destroy`, `approve_proxmox_change_set` and
+   `apply_proxmox_change_set` is refused at plan time. These names are
+   authorisation scopes, not callable tools: there is no `delete_vm` tool.
+3. **Grant the action tiers you need.** `read`, `low`, `destructive`. A grant
    carrying only `read` cannot call `start_vm` however its tool scope reads.
-3. **Pass `--state-file`.** Without it, change sets live in memory and every
+4. **Pass `--state-file`.** Without it, change sets live in memory and every
    approval is lost on restart. The packaged unit passes
    `${STATE_DIRECTORY}/changeset-state.json`.
-4. **Check `protected_vmids` and `protected_tags`.** A protected guest refuses
+5. **Check `protected_vmids` and `protected_tags`.** A protected guest refuses
    anything that would interrupt or destroy it without a waiver — including
    `stop_vm`. Snapshots and backups still work, which is deliberate.
+
+## Options the same-named tool no longer takes
+
+A tool with the same name is not always the same call. These options exist on
+the third-party server and have no equivalent here, so a request carrying them
+either fails to parse or silently does something else:
+
+| tool | option that is gone | what happens instead |
+|---|---|---|
+| `stop_container`, `stop_vm` | `graceful` | always an immediate stop; use `shutdown_vm` for the graceful path |
+| `create_snapshot` | `vmstate` | the snapshot never includes RAM state |
+| `clone_vm` | target storage and node placement | the clone lands where Proxmox defaults it; `full` is the only copy control |
 
 ## Two behaviours that will surprise a 970 caller
 
@@ -117,8 +149,12 @@ has to change rather than be shimmed.
   may be smaller than the current disk and this server cannot know the current
   size.
 
-  Shrink from the Proxmox UI or CLI. Do **not** reach for
-  `plan_proxmox_destroy` — it takes only a cluster and a vmid and deletes the
-  whole guest. An earlier draft of this guide suggested it, which would have
-  turned a disk-shrink request into a VM deletion for anyone following the
-  text literally.
+  There is no supported path anywhere. Proxmox rejects a reduction too --
+  `qm resize` and `pct resize` only grow -- so this guide names no alternative
+  rather than sending you somewhere that also refuses. Forcing it at the
+  volume layer is how the guest gets corrupted.
+
+  Do **not** reach for `plan_proxmox_destroy`: it takes only a cluster and a
+  vmid and deletes the whole guest. An earlier draft of this guide suggested
+  it, which would have turned a disk-shrink request into a VM deletion for
+  anyone following the text literally.

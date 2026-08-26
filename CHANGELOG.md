@@ -34,10 +34,26 @@ function, which by strict semver would be a minor bump.
 
 ### Fixed
 
-- Two claims in the migration guide that were not true when written: the
-  approval does not bind the preview text (#56), and shrinking a disk has no
-  supported path here or in Proxmox -- an earlier draft directed it at
-  `plan_proxmox_destroy`, which destroys the whole guest.
+- **Seven corrections to the migration guide**, three of them serious enough
+  to mislead an operator into damage or a failed cutover:
+  - It claimed `execute_vm_command` maps to `op: "guest_exec"` with a
+    `command` argument. No such mapping exists: `PlanDestroyArgs` has no
+    `command` field and `build_destroy_action` rejects `guest_exec`.
+  - It still told operators to shrink a disk "from the Proxmox UI or CLI".
+    Proxmox refuses a reduction too, so the guide now names no alternative.
+  - It promised "a guest that changed after approval is refused". The
+    fingerprint sends `config_digest` and `disks` **empty** at both plan and
+    apply, so a configuration-only change does not move it. The guarantee is
+    now stated as what it actually covers.
+  - `delete_backup` and `delete_iso` rows omitted the required `storage_node`.
+  - The token checklist omitted that plan and apply authorise a second time
+    against each destructive operation's own scope name.
+  - Options that silently vanished with a same-named tool are now listed:
+    `graceful` on stop, `vmstate` on snapshot, clone placement.
+  - Every parity gap is now named in the guide, with a plain instruction not
+    to cut over until #57 closes.
+- The approval does not bind the preview text (#56), stated in the guide
+  rather than implied.
 
 ## [0.7.0] - 2026-08-26
 
