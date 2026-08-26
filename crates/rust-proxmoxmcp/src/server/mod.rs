@@ -26,6 +26,175 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// Tool names that exist only as an authorization scope.
+///
+/// No `#[tool]` handler answers to these — the generic `plan_proxmox_destroy`
+/// and `apply_proxmox_change_set` handlers do the work. They are in
+/// `KNOWN_TOOLS` so the token CLI accepts them as a scope, and in `WRITE_TOOLS`
+/// so a wildcard token does not reach them.
+///
+/// Enumerated rather than left implicit because two invariants have to know
+/// about them: every other `KNOWN_TOOLS` entry must have a handler, and must
+/// fall into a known tier category. Naming the exception keeps both checks
+/// meaningful for everything else.
+#[cfg_attr(not(test), allow(dead_code))]
+const AUTHORIZATION_ONLY_TOOLS: &[&str] = &[
+    "delete_backup",
+    "delete_container",
+    "delete_iso",
+    "delete_snapshot",
+    "delete_vm",
+    "restore_backup",
+    "rollback_snapshot",
+];
+
+/// The concrete tool name a destructive operation authorises against.
+///
+/// `plan_proxmox_destroy` and `apply_proxmox_change_set` are generic handlers.
+/// Authorising only those would let a token allowlisted for them select any
+/// operation — `op: "delete_backup"` from a token never granted
+/// `delete_backup` — which defeats the point of `WRITE_TOOLS` naming each
+/// destructive tool separately.
+///
+/// So the operation maps to its own tool name and that scope is enforced too,
+/// at plan and again at apply. Both, because a scope can be narrowed between
+/// the two, and the apply is the call that acts.
+///
+/// `destroy_guest` maps by the *resolved* guest type, because `delete_vm` and
+/// `delete_container` are distinct scopes in `WRITE_TOOLS` and the dispatch
+/// calls a different primitive for each. Mapping both to `delete_vm` would
+/// deny a token granted `delete_container` its own containers, and let a token
+/// granted only `delete_vm` delete them.
+const fn tool_for_op(op: &str, kind: GuestType) -> Option<&'static str> {
+    match op.as_bytes() {
+        b"destroy_guest" | b"destroy" => Some(match kind {
+            GuestType::Lxc => "delete_container",
+            GuestType::Qemu => "delete_vm",
+        }),
+        b"delete_snapshot" => Some("delete_snapshot"),
+        b"rollback_snapshot" => Some("rollback_snapshot"),
+        b"delete_backup" => Some("delete_backup"),
+        b"delete_iso" => Some("delete_iso"),
+        b"restore_backup" => Some("restore_backup"),
+        _ => None,
+    }
+}
+
+/// Render the preview an approver reviews for one destructive action.
+///
+/// Operation-specific by necessity. `render_preview` produces a guest-destroy
+/// description, so reusing it showed `DESTROY` for a rollback, a restore and a
+/// volume deletion alike — an approver would have been asked to sign off on
+/// something other than what would run.
+fn render_destructive_preview(
+    action: &change_set::DestroyAction,
+    guest_name: &str,
+    node: &str,
+) -> String {
+    let target = format!(
+        "{} (vmid {}, {}, node {})",
+        guest_name, action.vmid, action.cluster, node
+    );
+    match action.op.as_str() {
+        "destroy_guest" | "destroy" => {
+            format!(
+                "DESTROY {target}\n  The guest and its disks are removed. This cannot be undone."
+            )
+        }
+        "delete_snapshot" => format!(
+            "DELETE SNAPSHOT '{}' of {target}\n  The snapshot is removed. The guest is untouched.",
+            action.snapname.as_deref().unwrap_or("?")
+        ),
+        "rollback_snapshot" => format!(
+            "ROLLBACK {target} to snapshot '{}'\n  \
+             OVERWRITES the guest's current state. Everything written since that \
+             snapshot is lost. This is not a deletion — it is a replacement.",
+            action.snapname.as_deref().unwrap_or("?")
+        ),
+        "delete_backup" => format!(
+            "DELETE BACKUP '{}' on storage '{}' at node '{}'\n  \
+             The archive is removed. A backup cannot be re-created from the guest \
+             as it was when the backup was taken.",
+            action.volid.as_deref().unwrap_or("?"),
+            action.storage.as_deref().unwrap_or("?"),
+            action.storage_node.as_deref().unwrap_or("?")
+        ),
+        "delete_iso" => format!(
+            "DELETE ISO '{}' on storage '{}' at node '{}'\n  \
+             The image is removed. It can be downloaded again.",
+            action.volid.as_deref().unwrap_or("?"),
+            action.storage.as_deref().unwrap_or("?"),
+            action.storage_node.as_deref().unwrap_or("?")
+        ),
+        "restore_backup" => format!(
+            "RESTORE {target} from '{}'\n  \
+             OVERWRITES the guest with the archive's contents. Unlike a rollback \
+             there is no snapshot of the pre-restore state unless one was taken.",
+            action.volid.as_deref().unwrap_or("?")
+        ),
+        other => format!("UNKNOWN OPERATION '{other}' on {target}"),
+    }
+}
+
+/// Build and validate the action a destructive plan will record.
+///
+/// Each operation names exactly the parameters it needs, and a missing one is
+/// refused here rather than defaulted at apply time. The action is what the
+/// change-set digest covers, so anything not decided now is something the
+/// approver cannot have reviewed.
+fn build_destroy_action(
+    args: &change_set::PlanDestroyArgs,
+) -> Result<change_set::DestroyAction, String> {
+    let require = |value: &Option<String>, name: &str| -> Result<String, String> {
+        value
+            .as_ref()
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .ok_or_else(|| format!("{} requires {name}", args.op))
+    };
+
+    let mut storage_node = None;
+    let (snapname, storage, volid) = match args.op.as_str() {
+        // What 0.3 planned, and still the default.
+        "destroy_guest" => (None, None, None),
+        "delete_snapshot" | "rollback_snapshot" => {
+            (Some(require(&args.snapname, "snapname")?), None, None)
+        }
+        "delete_backup" | "delete_iso" => {
+            // `local` is node-local storage, so the node is part of the
+            // volume's identity rather than a detail of where to send the
+            // request. Required at plan time and recorded in the action, so
+            // apply cannot derive it from whichever guest the vmid names.
+            storage_node = Some(require(&args.storage_node, "storage_node")?);
+            (
+                None,
+                Some(require(&args.storage, "storage")?),
+                Some(require(&args.volid, "volid")?),
+            )
+        }
+        // No storage: the archive volid names its own storage, and accepting a
+        // second one invites the two to disagree.
+        "restore_backup" => (None, None, Some(require(&args.volid, "volid")?)),
+        other => {
+            return Err(format!(
+                "unknown destructive operation '{other}'; expected one of \
+                 destroy_guest, delete_snapshot, rollback_snapshot, delete_backup, \
+                 delete_iso, restore_backup"
+            ));
+        }
+    };
+
+    Ok(change_set::DestroyAction {
+        op: args.op.clone(),
+        cluster: args.cluster.clone(),
+        vmid: args.vmid,
+        snapname,
+        storage,
+        volid,
+        storage_node,
+    })
+}
+
 /// Principal recorded on a receipt written by startup recovery.
 ///
 /// The executor of an apply is the token that called
@@ -49,6 +218,13 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "approve_proxmox_change_set",
     "create_backup",
     "create_snapshot",
+    // AUTHORIZATION_ONLY_TOOLS: see below. Sorted in with the rest so the
+    // sortedness invariant still holds.
+    "delete_backup",
+    "delete_container",
+    "delete_iso",
+    "delete_snapshot",
+    "delete_vm",
     "get_cluster_status",
     "get_container_config",
     "get_container_ip",
@@ -69,6 +245,8 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "plan_proxmox_destroy",
     "reset_vm",
     "restart_container",
+    "restore_backup",
+    "rollback_snapshot",
     "shutdown_vm",
     "start_container",
     "start_vm",
@@ -246,6 +424,19 @@ impl ProxmoxServer {
             lab_mode,
             evidence,
         ))
+    }
+
+    /// The change-set coordinator backing this server.
+    ///
+    /// Exposed so callers -- integration tests in particular -- can inspect or
+    /// construct store states the tool surface itself cannot produce, such as a
+    /// record whose preview is absent.
+    ///
+    /// Unused by the binary target, which is why it carries the allow: the
+    /// integration tests are separate crates and do not count as uses here.
+    #[allow(dead_code)]
+    pub fn coordinator(&self) -> &Arc<mecmcp_changeset::ChangesetCoordinator> {
+        &self.coordinator
     }
 
     /// Recover the caller's context, or `None` on the stdio path.
@@ -691,6 +882,82 @@ impl ProxmoxServer {
             if let Err(error) = self.coordinator.update_change_set(record).await {
                 tracing::error!(%error, "could not persist the recovered outcome");
             }
+        }
+    }
+
+    /// Run one recorded destructive action and return its task handle.
+    ///
+    /// Dispatches on the action the change set carries, so the work performed
+    /// is exactly the work the digest covered.
+    ///
+    /// `delete_backup` and `delete_iso` share `delete_volume` — Proxmox exposes
+    /// both through the same content endpoint — and answer synchronously on
+    /// some storage types, so they may have no task handle at all. An empty
+    /// handle is returned as `None` rather than as `Some("")`, which would
+    /// leave the change set looking recoverable against a task that never
+    /// existed.
+    async fn execute_destructive(
+        &self,
+        client: &ProxmoxClient,
+        action: &change_set::DestroyAction,
+        kind: GuestType,
+        node: &str,
+        vmid: u32,
+    ) -> Result<String, rust_proxmoxmcp_core::ProxmoxError> {
+        use rust_proxmoxmcp_core::guests;
+
+        let missing = |name: &str| {
+            rust_proxmoxmcp_core::ProxmoxError::Malformed(format!(
+                "{} action is missing {name}",
+                action.op
+            ))
+        };
+
+        match action.op.as_str() {
+            // 0.3 wrote `op: "destroy"`; a change set planned then and applied
+            // now must still work, so both spellings dispatch here.
+            "destroy_guest" | "destroy" => match kind {
+                GuestType::Lxc => guests::destroy_container(client, node, vmid, true).await,
+                GuestType::Qemu => guests::destroy_vm(client, node, vmid, true).await,
+            },
+            "delete_snapshot" => {
+                let snapname = action
+                    .snapname
+                    .as_deref()
+                    .ok_or_else(|| missing("snapname"))?;
+                guests::delete_snapshot(client, node, kind, vmid, snapname).await
+            }
+            "rollback_snapshot" => {
+                let snapname = action
+                    .snapname
+                    .as_deref()
+                    .ok_or_else(|| missing("snapname"))?;
+                guests::rollback_snapshot(client, node, kind, vmid, snapname).await
+            }
+            "delete_backup" | "delete_iso" => {
+                let storage = action
+                    .storage
+                    .as_deref()
+                    .ok_or_else(|| missing("storage"))?;
+                let volid = action.volid.as_deref().ok_or_else(|| missing("volid"))?;
+                // The node the action recorded, not the guest's. `local` is
+                // node-local storage, so `local:backup/x` on pve2 and on pve3
+                // are different volumes that share a name — using whichever
+                // node the vmid happens to sit on could delete the wrong one.
+                let storage_node = action
+                    .storage_node
+                    .as_deref()
+                    .ok_or_else(|| missing("storage_node"))?;
+                let data = guests::delete_volume(client, storage_node, storage, volid).await?;
+                Ok(data.as_str().unwrap_or_default().to_owned())
+            }
+            "restore_backup" => {
+                let volid = action.volid.as_deref().ok_or_else(|| missing("volid"))?;
+                guests::restore_backup(client, node, kind, vmid, volid, true).await
+            }
+            other => Err(rust_proxmoxmcp_core::ProxmoxError::Malformed(format!(
+                "unknown destructive operation '{other}'"
+            ))),
         }
     }
 
@@ -1346,7 +1613,7 @@ impl ProxmoxServer {
         Parameters(args): Parameters<change_set::PlanDestroyArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        use change_set::{ChangeSetResponse, DestroyAction};
+        use change_set::ChangeSetResponse;
         use mecmcp_changeset::WaiverKind;
         use rust_proxmoxmcp_core::{
             fingerprint::{GuestState, fingerprint},
@@ -1430,6 +1697,25 @@ impl ProxmoxServer {
 
         let expected_fingerprint = fingerprint(&state);
 
+        // Built before the preview, because the preview describes it.
+        let action = match build_destroy_action(&args) {
+            Ok(action) => action,
+            Err(error) => return tool_error(error),
+        };
+
+        // The operation's own tool scope, on top of `plan_proxmox_destroy`.
+        // Without this a token allowlisted for the generic handlers could
+        // select any operation, and `WRITE_TOOLS` naming each destructive tool
+        // separately would mean nothing.
+        let Some(op_tool) = tool_for_op(&action.op, guest.r#type) else {
+            return tool_error(format!("unknown destructive operation '{}'", action.op));
+        };
+        if let Err(error) =
+            authorize_call(caller.as_ref(), op_tool, Some(&args.cluster), WRITE_TOOLS)
+        {
+            return tool_error(error);
+        }
+
         // Render preview.
         let preview_input = PreviewInput {
             state: &state,
@@ -1442,7 +1728,16 @@ impl ProxmoxServer {
             purge_disks: true,
         };
 
-        let preview_text = render_preview(&preview_input);
+        // The generic renderer describes a guest destroy. For every other
+        // operation that is the wrong text, so the approver would be signing
+        // off on something other than what runs. The guest-destroy path keeps
+        // the richer renderer — it has snapshot and backup context this one
+        // does not — and every other operation gets a description of itself.
+        let preview_text = if matches!(action.op.as_str(), "destroy_guest" | "destroy") {
+            render_preview(&preview_input)
+        } else {
+            render_destructive_preview(&action, &guest.name, &guest.node)
+        };
 
         // Use the shared coordinator.
         let coordinator = self.coordinator.clone();
@@ -1453,11 +1748,11 @@ impl ProxmoxServer {
             .unwrap_or_else(|| "stdio".to_owned());
 
         let device = format!("{}/{}", args.cluster, args.vmid);
-        let action = DestroyAction {
-            op: "destroy".to_owned(),
-            cluster: args.cluster.clone(),
-            vmid: args.vmid,
-        };
+        // Validate the operation and its parameters before anything is
+        // recorded. A change set whose action names an operation the apply
+        // cannot dispatch is a change set an approver may sign and nobody can
+        // execute — worse, one whose parameters are missing would dispatch
+        // with defaults the approver never saw.
 
         // This server has no policy engine in 0.3.
         let policy_signature = "proxmox-no-policy-engine";
@@ -1477,6 +1772,62 @@ impl ProxmoxServer {
             Ok(output) => output,
             Err(error) => return tool_error(format!("create: {error}")),
         };
+
+        // Persist the preview the approver will read, with its own digest.
+        //
+        // `create_change_set` takes no preview, so this is a second write. What
+        // it buys is tamper evidence: `validate_preview` recomputes the digest
+        // on load, so the text an approver reviewed cannot be edited afterwards
+        // without the store refusing it.
+        //
+        // It does **not** make the approval cryptographically cover the
+        // preview: the plan digest is over (owner, device, fingerprint,
+        // actions), and the approval is over that digest. The action is what
+        // the approval binds, and the preview is rendered from the action —
+        // but nothing forces them to agree. Tracked separately; the README and
+        // migration guide now describe the binding that exists rather than the
+        // one that does not.
+        let Some(mut with_preview) = coordinator
+            .change_sets()
+            .await
+            .into_iter()
+            .find(|record| record.id == output.change_set_id)
+        else {
+            // The record was created a moment ago, so not finding it means the
+            // store dropped or evicted it. This used to be a silent skip that
+            // returned a *successful* plan for a change set with no preview.
+            tracing::error!(
+                change_set = %output.change_set_id,
+                "the change set could not be read back; the plan is refused"
+            );
+            return tool_error(
+                "plan refused: the change set could not be read back to store its \
+                 preview. It has no preview, so approve and apply will refuse it. \
+                 Plan the operation again.",
+            );
+        };
+
+        with_preview.preview = Some(mecmcp_changeset::PreviewRecord {
+            digest: mecmcp_changeset::preview_digest(&preview_text),
+            artifact: preview_text.clone(),
+            job_id: None,
+        });
+        if let Err(error) = coordinator.update_change_set(with_preview).await {
+            // Fail the plan rather than return one whose preview is not in the
+            // store. The record itself is left behind and expires on its own —
+            // there is no cancel tool — but `approve` and `apply` now refuse a
+            // previewless record, so it cannot be acted on in the meantime.
+            tracing::error!(
+                %error,
+                change_set = %output.change_set_id,
+                "the preview could not be persisted; the plan is refused"
+            );
+            return tool_error(format!(
+                "plan refused: the preview could not be persisted ({error}). The \
+                 change set has no stored preview, so approve and apply will refuse \
+                 it. Plan the operation again."
+            ));
+        }
 
         // Apply override.
         let output = match override_ {
@@ -1614,6 +1965,18 @@ impl ProxmoxServer {
             Err(error) => return tool_error(format!("get: {error}")),
         };
 
+        // A change set with no stored preview must never be approved. The
+        // approval digest covers (owner, device, fingerprint, actions) and not
+        // the preview, so nothing downstream would notice the absence: this
+        // handler used to substitute the literal string "(no preview)" and
+        // approve anyway, recording an approval over text no one could read.
+        let Some(preview) = record.preview.as_ref() else {
+            return tool_error(
+                "approval refused: this change set has no stored preview, so there is \
+                 nothing to review. Plan the operation again.",
+            );
+        };
+
         let output = match coordinator
             .approve_change_set(
                 args.change_set_id.clone(),
@@ -1636,11 +1999,7 @@ impl ProxmoxServer {
             }
         };
 
-        let preview_text = record
-            .preview
-            .as_ref()
-            .map(|p| p.artifact.clone())
-            .unwrap_or_else(|| "(no preview)".to_owned());
+        let preview_text = preview.artifact.clone();
 
         let response = ChangeSetResponse {
             change_set_id: output.change_set_id,
@@ -1705,6 +2064,16 @@ impl ProxmoxServer {
             Ok(record) => record,
             Err(error) => return tool_error(format!("get: {error}")),
         };
+
+        // Same invariant as `approve_change_set`, enforced again here because
+        // approval and apply are separate tools with separate scopes: a record
+        // approved by an older binary must still not execute without a preview.
+        if record.preview.is_none() {
+            return tool_error(
+                "apply refused: this change set has no stored preview, so the action it \
+                 would take was never recorded for review. Plan the operation again.",
+            );
+        }
 
         // Re-resolve and verify fingerprint.
         let grant = match resolve_grant(caller.as_ref()) {
@@ -1803,14 +2172,42 @@ impl ProxmoxServer {
             ));
         }
 
-        // Issue the DELETE and get the UPID string.
-        let upid_str = match rust_proxmoxmcp_core::guests::destroy_container(
-            client,
-            &state.node,
-            args.vmid,
-            true, // purge
-        )
-        .await
+        // Dispatch on the action the change set recorded, not on the tool
+        // name. The digest covers `actions`, so this is the only description of
+        // the work that the approver actually signed; reading the operation
+        // from anywhere else would let an apply do something the approval did
+        // not cover.
+        let action: change_set::DestroyAction = match record.actions.first() {
+            Some(value) => match serde_json::from_value(value.clone()) {
+                Ok(action) => action,
+                Err(error) => {
+                    return tool_error(format!(
+                        "the change set's action could not be read ({error}); \
+                         it cannot be applied"
+                    ));
+                }
+            },
+            None => return tool_error("the change set records no action".to_owned()),
+        };
+
+        // Again at apply. A scope can be narrowed between plan and apply, and
+        // the apply is the call that acts — checking only at plan would let a
+        // token whose authority was revoked still execute what it had planned.
+        let Some(op_tool) = tool_for_op(&action.op, guest.r#type) else {
+            return tool_error(format!(
+                "the change set names an unknown operation '{}'",
+                action.op
+            ));
+        };
+        if let Err(error) =
+            authorize_call(caller.as_ref(), op_tool, Some(&args.cluster), WRITE_TOOLS)
+        {
+            return tool_error(error);
+        }
+
+        let upid_str = match self
+            .execute_destructive(client, &action, guest.r#type, &state.node, args.vmid)
+            .await
         {
             Ok(upid) => upid,
             Err(error) => {
@@ -1855,6 +2252,46 @@ impl ProxmoxServer {
                 return tool_error(error);
             }
         };
+
+        // A storage that deleted synchronously returns no handle. That is a
+        // completed operation, not a failure — parsing the empty string as a
+        // UPID would report an error for a volume that is already gone, write
+        // no success receipt, and leave the record `Approved` and retryable
+        // against a volume that no longer exists.
+        if upid_str.is_empty() {
+            if let Some(recorder) = &self.evidence
+                && let Err(receipt_error) = recorder.result_receipt(
+                    &apply_request_id,
+                    &record.id,
+                    &record.device,
+                    &apply_principal,
+                    true,
+                    "",
+                )
+            {
+                tracing::error!(
+                    %receipt_error,
+                    change_set_id = %record.id,
+                    "the operation completed but its result receipt could not be persisted"
+                );
+            }
+
+            record.state = mecmcp_changeset::ChangeSetState::Applied;
+            record.task_id = None;
+            if let Err(error) = self.coordinator.update_change_set(record).await {
+                tracing::error!(%error, "could not mark the change set applied");
+            }
+
+            return tool_result::<_, String>(
+                Ok(serde_json::json!({
+                    "outcome": "ok",
+                    "synchronous": true,
+                    "upid": serde_json::Value::Null,
+                })),
+                ResultFormat::PrettyJson,
+                RESULT_LIMITS,
+            );
+        }
 
         // Parse the UPID to extract the node for polling.
         // Per spec §7, the node is authoritative: guests migrate, so we must
@@ -2127,8 +2564,10 @@ mod tests {
             assert!(
                 read_tools.contains(tool)
                     || changeset_tools.contains(tool)
-                    || low_tools.contains(tool),
-                "{tool} is in KNOWN_TOOLS but not in READ_TOOLS, changeset, or low-tier tools"
+                    || low_tools.contains(tool)
+                    || AUTHORIZATION_ONLY_TOOLS.contains(tool),
+                "{tool} is in KNOWN_TOOLS but not in READ_TOOLS, changeset, low-tier, \
+                 or authorization-only tools"
             );
         }
 
@@ -2187,14 +2626,27 @@ mod tests {
             .map(|tool| tool.name.into_owned())
             .collect();
         for name in KNOWN_TOOLS {
+            // The authorization-only names deliberately have no handler: the
+            // generic plan/apply handlers do the work, and these exist so a
+            // token can be scoped to one operation rather than all of them.
+            if AUTHORIZATION_ONLY_TOOLS.contains(name) {
+                continue;
+            }
             assert!(
                 registered.contains(*name),
                 "{name} is in KNOWN_TOOLS but has no #[tool] handler"
             );
         }
+        // Compare against the names that actually have handlers: the
+        // authorization-only entries are in KNOWN_TOOLS by design and the
+        // router will never list them.
+        let handler_names = KNOWN_TOOLS
+            .iter()
+            .filter(|name| !AUTHORIZATION_ONLY_TOOLS.contains(*name))
+            .count();
         assert_eq!(
             registered.len(),
-            KNOWN_TOOLS.len(),
+            handler_names,
             "router has tools absent from KNOWN_TOOLS"
         );
     }
@@ -2281,5 +2733,284 @@ mod tools_list_cache_tests {
         let listed = listed_tools(Vec::new(), false);
         assert_eq!(listed.ttl_ms, None);
         assert_eq!(listed.cache_scope, None);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod destructive_action_tests {
+    use super::build_destroy_action;
+    use crate::server::change_set::PlanDestroyArgs;
+
+    fn args(op: &str) -> PlanDestroyArgs {
+        PlanDestroyArgs {
+            cluster: "pve3".to_owned(),
+            vmid: 617,
+            op: op.to_owned(),
+            snapname: None,
+            storage: None,
+            volid: None,
+            storage_node: None,
+        }
+    }
+
+    /// A caller written against 0.3 passed no `op` and meant a destroy. Serde
+    /// fills the default, so that plan must still build the same action.
+    #[test]
+    fn the_default_operation_is_a_guest_destroy() {
+        let action = build_destroy_action(&args("destroy_guest")).unwrap();
+        assert_eq!(action.op, "destroy_guest");
+        assert_eq!(action.vmid, 617);
+        assert!(action.snapname.is_none());
+    }
+
+    /// Each operation names exactly what it needs, refused at plan time rather
+    /// than defaulted at apply time — the action is what the digest covers, so
+    /// anything undecided now is something the approver cannot review.
+    #[test]
+    fn a_missing_parameter_is_refused_at_plan_time() {
+        for (op, missing) in [
+            ("delete_snapshot", "snapname"),
+            ("rollback_snapshot", "snapname"),
+            ("delete_backup", "storage"),
+            ("restore_backup", "volid"),
+        ] {
+            let error = build_destroy_action(&args(op)).expect_err("must be refused");
+            assert!(
+                error.contains(missing),
+                "{op}: the refusal must name the missing parameter, got: {error}"
+            );
+        }
+    }
+
+    /// An empty string is not a parameter.
+    #[test]
+    fn an_empty_parameter_counts_as_missing() {
+        let mut a = args("delete_snapshot");
+        a.snapname = Some(String::new());
+        assert!(build_destroy_action(&a).is_err());
+    }
+
+    /// A typo must not become a change set nobody can execute.
+    #[test]
+    fn an_unknown_operation_is_refused_with_the_valid_set() {
+        let error = build_destroy_action(&args("delete_everything")).expect_err("refused");
+        assert!(error.contains("unknown destructive operation"), "{error}");
+        assert!(
+            error.contains("rollback_snapshot"),
+            "the refusal should list what is valid, got: {error}"
+        );
+    }
+
+    /// `restore_backup` takes no storage: the archive volid names its own, and
+    /// accepting a second one invites the two to disagree.
+    #[test]
+    fn restore_takes_the_volid_alone() {
+        let mut a = args("restore_backup");
+        a.volid = Some("local:backup/vzdump-lxc-617.tar.zst".to_owned());
+        a.storage = Some("ignored".to_owned());
+        let action = build_destroy_action(&a).unwrap();
+        assert!(
+            action.storage.is_none(),
+            "a storage passed to restore must not reach the action"
+        );
+        assert_eq!(
+            action.volid.as_deref(),
+            Some("local:backup/vzdump-lxc-617.tar.zst")
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod destructive_scope_tests {
+    use super::{build_destroy_action, render_destructive_preview, tool_for_op};
+    use crate::server::change_set::PlanDestroyArgs;
+    use rust_proxmoxmcp_core::selector::GuestType;
+
+    /// Every operation authorises against its own tool name, so a token
+    /// allowlisted only for the generic handlers cannot select any operation
+    /// it likes.
+    #[test]
+    fn every_operation_maps_to_its_own_tool() {
+        for (op, tool) in [
+            ("destroy_guest", "delete_vm"),
+            ("destroy", "delete_vm"),
+            ("delete_snapshot", "delete_snapshot"),
+            ("rollback_snapshot", "rollback_snapshot"),
+            ("delete_backup", "delete_backup"),
+            ("delete_iso", "delete_iso"),
+            ("restore_backup", "restore_backup"),
+        ] {
+            assert_eq!(tool_for_op(op, GuestType::Qemu), Some(tool), "{op}");
+        }
+        assert_eq!(tool_for_op("delete_everything", GuestType::Qemu), None);
+    }
+
+    /// Every mapped tool is in WRITE_TOOLS, or the scope check would be
+    /// authorising against a name a wildcard token already reaches.
+    #[test]
+    fn every_mapped_tool_is_excluded_from_the_wildcard() {
+        for op in [
+            "destroy_guest",
+            "delete_snapshot",
+            "rollback_snapshot",
+            "delete_backup",
+            "delete_iso",
+            "restore_backup",
+        ] {
+            let tool = tool_for_op(op, GuestType::Qemu).unwrap();
+            assert!(
+                rust_proxmoxmcp_core::tier::WRITE_TOOLS.contains(&tool),
+                "{tool} is not in WRITE_TOOLS, so a wildcard token would reach it"
+            );
+        }
+    }
+
+    fn action(
+        op: &str,
+        snapname: Option<&str>,
+        volid: Option<&str>,
+    ) -> super::change_set::DestroyAction {
+        super::change_set::DestroyAction {
+            op: op.to_owned(),
+            cluster: "pve3".to_owned(),
+            vmid: 617,
+            snapname: snapname.map(ToOwned::to_owned),
+            storage: Some("local".to_owned()),
+            volid: volid.map(ToOwned::to_owned),
+            storage_node: Some("pve2".to_owned()),
+        }
+    }
+
+    /// The preview must describe the operation that will run. Reusing the
+    /// guest-destroy renderer showed `DESTROY` for a rollback, a restore and a
+    /// volume delete alike — an approver would have signed off on a different
+    /// operation than the one recorded.
+    #[test]
+    fn each_operation_previews_as_itself() {
+        let cases = [
+            ("delete_snapshot", "DELETE SNAPSHOT"),
+            ("rollback_snapshot", "ROLLBACK"),
+            ("delete_backup", "DELETE BACKUP"),
+            ("delete_iso", "DELETE ISO"),
+            ("restore_backup", "RESTORE"),
+        ];
+        for (op, expected) in cases {
+            let text = render_destructive_preview(
+                &action(op, Some("snap"), Some("local:backup/x")),
+                "g",
+                "pve2",
+            );
+            assert!(text.starts_with(expected), "{op}: {text}");
+            assert!(
+                !text.starts_with("DESTROY"),
+                "{op} previewed as a guest destroy"
+            );
+        }
+    }
+
+    /// The two that replace state rather than remove an object must say so.
+    /// An approver reading "delete" for a rollback would not know that
+    /// everything written since the snapshot is lost.
+    #[test]
+    fn replacing_operations_warn_that_state_is_overwritten() {
+        let rollback =
+            render_destructive_preview(&action("rollback_snapshot", Some("s"), None), "g", "pve2");
+        assert!(rollback.contains("OVERWRITES"), "{rollback}");
+        let restore = render_destructive_preview(
+            &action("restore_backup", None, Some("local:backup/x")),
+            "g",
+            "pve2",
+        );
+        assert!(restore.contains("OVERWRITES"), "{restore}");
+    }
+
+    /// A volume's node is part of its identity, because `local` is node-local.
+    #[test]
+    fn a_volume_operation_requires_its_storage_node() {
+        let args = PlanDestroyArgs {
+            cluster: "pve3".to_owned(),
+            vmid: 617,
+            op: "delete_backup".to_owned(),
+            snapname: None,
+            storage: Some("local".to_owned()),
+            volid: Some("local:backup/x".to_owned()),
+            storage_node: None,
+        };
+        let error = build_destroy_action(&args).expect_err("storage_node is required");
+        assert!(error.contains("storage_node"), "{error}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod grantable_scope_tests {
+    use super::{KNOWN_TOOLS, tool_for_op};
+    use rust_proxmoxmcp_core::selector::GuestType;
+
+    /// Every name the scope check demands must be grantable through the token
+    /// CLI, which validates against `KNOWN_TOOLS`.
+    ///
+    /// This is the test that was missing. The check landed without it and made
+    /// the whole destructive tier unusable: `token add --tools delete_snapshot`
+    /// was refused as an unknown tool, and a wildcard excludes these by design,
+    /// so no token could plan or apply *any* destructive operation. The unit
+    /// tests passed throughout because they build tokens directly and never
+    /// cross the CLI's validation.
+    #[test]
+    fn every_operation_scope_is_grantable() {
+        for op in [
+            "destroy_guest",
+            "destroy",
+            "delete_snapshot",
+            "rollback_snapshot",
+            "delete_backup",
+            "delete_iso",
+            "restore_backup",
+        ] {
+            for kind in [GuestType::Lxc, GuestType::Qemu] {
+                let tool = tool_for_op(op, kind).unwrap();
+                assert!(
+                    KNOWN_TOOLS.contains(&tool),
+                    "{op} authorises against '{tool}', which the token CLI rejects as unknown"
+                );
+            }
+        }
+    }
+
+    /// ...and every one of them stays excluded from the tool wildcard, or
+    /// making them grantable would have handed them to every `*` token.
+    #[test]
+    fn grantable_does_not_mean_reachable_by_wildcard() {
+        for op in ["destroy_guest", "delete_snapshot", "restore_backup"] {
+            for kind in [GuestType::Lxc, GuestType::Qemu] {
+                let tool = tool_for_op(op, kind).unwrap();
+                assert!(
+                    rust_proxmoxmcp_core::tier::WRITE_TOOLS.contains(&tool),
+                    "{tool} became reachable by a wildcard token"
+                );
+            }
+        }
+    }
+
+    /// A container destroy and a VM destroy are different scopes. Mapping both
+    /// to `delete_vm` denied a `delete_container` token its own containers, and
+    /// let a `delete_vm` token delete them.
+    #[test]
+    fn a_guest_destroy_authorises_against_its_guest_type() {
+        assert_eq!(
+            tool_for_op("destroy_guest", GuestType::Lxc),
+            Some("delete_container")
+        );
+        assert_eq!(
+            tool_for_op("destroy_guest", GuestType::Qemu),
+            Some("delete_vm")
+        );
+        // The 0.3 spelling maps the same way.
+        assert_eq!(
+            tool_for_op("destroy", GuestType::Lxc),
+            Some("delete_container")
+        );
     }
 }

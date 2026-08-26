@@ -65,6 +65,9 @@ pub struct TestServer {
     index: Arc<GuestIndex>,
     /// Temp directory holding clusters.json and tokens.json.
     _temp_dir: tempfile::TempDir,
+    /// The server's change-set coordinator, for tests that need to build a
+    /// store state the tool surface cannot produce.
+    coordinator: Arc<mecmcp_changeset::ChangesetCoordinator>,
 }
 
 impl TestServer {
@@ -228,6 +231,7 @@ impl TestServer {
             None,
         )
         .expect("build server");
+        let coordinator = Arc::clone(handler.coordinator());
         let token_store_arc =
             Arc::new(TokenStoreFile::<ProxmoxGrant>::load(&tokens_path).expect("load tokens.json"));
         let shutdown = tokio_util::sync::CancellationToken::new();
@@ -254,7 +258,31 @@ impl TestServer {
             mock,
             index,
             _temp_dir: temp_dir,
+            coordinator,
         }
+    }
+
+    /// The server's change-set coordinator.
+    pub fn coordinator(&self) -> &Arc<mecmcp_changeset::ChangesetCoordinator> {
+        &self.coordinator
+    }
+
+    /// Drop the stored preview from a change set, reproducing the state a
+    /// failed preview write leaves behind. The tool surface cannot produce
+    /// this, which is precisely why the guards against it need a test.
+    pub async fn strip_preview(&self, change_set_id: &str) {
+        let mut record = self
+            .coordinator
+            .change_sets()
+            .await
+            .into_iter()
+            .find(|record| record.id == change_set_id)
+            .expect("the change set exists");
+        record.preview = None;
+        self.coordinator
+            .update_change_set(record)
+            .await
+            .expect("store the previewless record");
     }
 
     /// Start the test server with default routes.
@@ -374,6 +402,14 @@ pub async fn handler_with_guest(_vmid: u32, protected: bool) -> TestServer {
             "get_proxmox_change_set".to_owned(),
             "approve_proxmox_change_set".to_owned(),
             "apply_proxmox_change_set".to_owned(),
+            // The operation's own tool, not just the generic handlers. These
+            // tests planned a guest destroy while holding no `delete_vm`
+            // scope, which the per-operation check now refuses — correctly:
+            // that was the bypass it exists to close.
+            "delete_vm".to_owned(),
+            // The fixture guest is an LXC, and a guest destroy authorises
+            // against its own type: delete_container, not delete_vm.
+            "delete_container".to_owned(),
         ],
         guests: vec!["*".to_owned()],
     };

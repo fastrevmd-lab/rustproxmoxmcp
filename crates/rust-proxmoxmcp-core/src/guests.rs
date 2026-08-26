@@ -200,3 +200,201 @@ fn upid_from(data: serde_json::Value) -> Result<String, ProxmoxError> {
 
     Ok(upid_str)
 }
+
+/// Destroy a QEMU guest and return its UPID string.
+///
+/// The QEMU sibling of [`destroy_container`]. Kept separate rather than
+/// folded into one function taking a [`crate::selector::GuestType`], because
+/// the two carry different query parameters — `purge` means the same thing but
+/// `destroy-unreferenced-disks` exists only here — and a single function would
+/// have to accept parameters that are meaningless for half its callers.
+///
+/// This is the primitive operation. Calling it directly bypasses change-set
+/// control; production workflows must use the change-set apply handler.
+///
+/// # Errors
+///
+/// As [`destroy_container`].
+pub async fn destroy_vm(
+    client: &ProxmoxClient,
+    node: &str,
+    vmid: u32,
+    purge: bool,
+) -> Result<String, ProxmoxError> {
+    let purge_value = if purge { "1" } else { "0" };
+    let path_template = "/api2/json/nodes/{node}/qemu/{vmid}";
+    let vmid_string = vmid.to_string();
+    let params = &[("node", node), ("vmid", vmid_string.as_str())];
+    let query = &[
+        ("purge", purge_value),
+        ("destroy-unreferenced-disks", purge_value),
+    ];
+
+    let data = client.delete_json(path_template, params, query).await?;
+    upid_from(data)
+}
+
+/// Delete one snapshot of a guest and return the UPID.
+///
+/// # Errors
+///
+/// As [`destroy_container`].
+pub async fn delete_snapshot(
+    client: &ProxmoxClient,
+    node: &str,
+    kind: crate::selector::GuestType,
+    vmid: u32,
+    snapname: &str,
+) -> Result<String, ProxmoxError> {
+    let path_template = "/api2/json/nodes/{node}/{kind}/{vmid}/snapshot/{snapname}";
+    let vmid_string = vmid.to_string();
+    let params = &[
+        ("node", node),
+        ("kind", kind.path_segment()),
+        ("vmid", vmid_string.as_str()),
+        ("snapname", snapname),
+    ];
+
+    let data = client.delete_json(path_template, params, &[]).await?;
+    upid_from(data)
+}
+
+/// Roll a guest back to one of its snapshots and return the UPID.
+///
+/// Destructive in a way deletion is not: it *replaces* the guest's current
+/// state rather than removing a named object, so everything written since the
+/// snapshot is lost. A preview for this operation should say what is being
+/// overwritten, not merely what is being restored.
+///
+/// # Errors
+///
+/// As [`destroy_container`].
+pub async fn rollback_snapshot(
+    client: &ProxmoxClient,
+    node: &str,
+    kind: crate::selector::GuestType,
+    vmid: u32,
+    snapname: &str,
+) -> Result<String, ProxmoxError> {
+    let path_template = "/api2/json/nodes/{node}/{kind}/{vmid}/snapshot/{snapname}/rollback";
+    let vmid_string = vmid.to_string();
+    let params = &[
+        ("node", node),
+        ("kind", kind.path_segment()),
+        ("vmid", vmid_string.as_str()),
+        ("snapname", snapname),
+    ];
+
+    let data = client.post_form(path_template, params, &[]).await?;
+    upid_from(data)
+}
+
+/// Delete one volume from a storage backend.
+///
+/// Serves both `delete_backup` and `delete_iso`: Proxmox exposes archives and
+/// ISO images through the same `/storage/{storage}/content/{volid}` endpoint,
+/// and the volid carries which is which. The tools stay separate because their
+/// blast radius differs — an ISO can be re-downloaded, a backup cannot.
+///
+/// Returns the raw `data` member rather than a UPID: this endpoint answers
+/// synchronously with `null` on some storage types.
+///
+/// The volid is percent-encoded before expansion. A Proxmox volid legitimately
+/// contains a slash — `local:backup/vzdump-lxc-950.tar.zst` — and
+/// `mecmcp-openapi` refuses a parameter that would span a path segment rather
+/// than sanitising it. That guard is right: it cannot tell a real volid from a
+/// traversal attempt. Encoding here says which one this is, at the one call
+/// site that knows.
+///
+/// # Errors
+///
+/// As [`destroy_container`], minus the UPID parse.
+pub async fn delete_volume(
+    client: &ProxmoxClient,
+    node: &str,
+    storage: &str,
+    volid: &str,
+) -> Result<serde_json::Value, ProxmoxError> {
+    // A volid cannot go through `expand_path`. `mecmcp-openapi` refuses a
+    // parameter containing a literal `/` **or any percent-encoded form of
+    // one**, deliberately: it cannot tell a legitimate volid from a traversal
+    // attempt, and an extra segment addresses a different endpoint rather than
+    // decorating the request.
+    //
+    // A Proxmox volid genuinely contains one — `local:backup/vzdump-lxc-950
+    // .tar.zst` — so the guard and the API disagree, and this is the one call
+    // site that knows which is which.
+    //
+    // The resolution keeps the guard doing everything it still can: `node` and
+    // `storage` are expanded through it as normal, and only the volid is
+    // encoded and appended here, after being checked for the things the guard
+    // would have caught.
+    if volid.is_empty() {
+        return Err(ProxmoxError::Malformed("volid is empty".into()));
+    }
+    if volid.contains("..") {
+        return Err(ProxmoxError::Malformed(
+            "volid contains '..', which cannot name a Proxmox volume".into(),
+        ));
+    }
+    if volid.chars().any(char::is_control) {
+        return Err(ProxmoxError::Malformed(
+            "volid contains a control character".into(),
+        ));
+    }
+    // Proxmox volids are `storage:kind/name`. Requiring the colon keeps a bare
+    // path from being addressed as a volume.
+    if !volid.contains(':') {
+        return Err(ProxmoxError::Malformed(
+            "volid is not in storage:path form".into(),
+        ));
+    }
+
+    let prefix = mecmcp_openapi::expand_path(
+        "/api2/json/nodes/{node}/storage/{storage}/content",
+        &[("node", node), ("storage", storage)],
+    )
+    .map_err(|error| ProxmoxError::Malformed(error.to_string()))?;
+
+    // No placeholders left, so this passes through expansion untouched and the
+    // encoded volid reaches Proxmox as one segment.
+    let path = format!("{prefix}/{}", crate::client::percent_encode(volid));
+
+    client.delete_json(&path, &[], &[]).await
+}
+
+/// Restore a guest from a backup archive and return the UPID.
+///
+/// The most destructive operation in the surface. It overwrites the guest at
+/// `vmid` with the archive's contents, and unlike a rollback there is no
+/// snapshot of the pre-restore state unless someone took one.
+///
+/// `force` is required by Proxmox to overwrite an existing guest; passing it
+/// is the caller's decision, not this function's default.
+///
+/// # Errors
+///
+/// As [`destroy_container`].
+pub async fn restore_backup(
+    client: &ProxmoxClient,
+    node: &str,
+    kind: crate::selector::GuestType,
+    vmid: u32,
+    archive: &str,
+    force: bool,
+) -> Result<String, ProxmoxError> {
+    let path_template = "/api2/json/nodes/{node}/{kind}";
+    let params = &[("node", node), ("kind", kind.path_segment())];
+
+    let vmid_string = vmid.to_string();
+    let force_value = if force { "1" } else { "0" };
+    let form = &[
+        ("vmid", vmid_string.as_str()),
+        ("archive", archive),
+        ("force", force_value),
+        ("restore", "1"),
+    ];
+
+    let data = client.post_form(path_template, params, form).await?;
+    upid_from(data)
+}
