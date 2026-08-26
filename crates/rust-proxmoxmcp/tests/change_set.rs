@@ -153,7 +153,7 @@ async fn a_protected_guest_with_matching_waiver_can_be_applied() {
         common::Route {
             path: "/api2/json/cluster/resources",
             status: 200,
-            body: br#"{"data":[{"id":"lxc/618","type":"lxc","vmid":618,"name":"test-protected","node":"pve2","status":"running","tags":"protected"}]}"#,
+            body: br#"{"data":[{"id":"lxc/618","type":"lxc","vmid":618,"name":"test-protected","node":"pve2","status":"stopped","tags":"protected"}]}"#,
         },
         common::Route {
             path: "/api2/json/nodes/pve2/lxc/618",
@@ -234,7 +234,7 @@ async fn a_protected_guest_with_lab_mode_can_be_applied() {
         common::Route {
             path: "/api2/json/cluster/resources",
             status: 200,
-            body: br#"{"data":[{"id":"lxc/619","type":"lxc","vmid":619,"name":"test-protected","node":"pve2","status":"running","tags":"protected"}]}"#,
+            body: br#"{"data":[{"id":"lxc/619","type":"lxc","vmid":619,"name":"test-protected","node":"pve2","status":"stopped","tags":"protected"}]}"#,
         },
         common::Route {
             path: "/api2/json/nodes/pve2/lxc/619",
@@ -441,4 +441,112 @@ async fn a_guest_that_moved_is_refused_even_while_the_resource_cache_is_warm() {
         .filter(|request| request.method == "DELETE")
         .count();
     assert_eq!(destroys, 0, "the guest must not be touched");
+}
+
+/// Proxmox refuses to destroy a running guest, so planning one produces a
+/// change set that cannot succeed. Under two-person control that is expensive:
+/// the plan succeeds, a second person approves, and only then does it fail —
+/// spending an approval and requiring the same human to be asked again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn planning_a_destroy_of_a_running_guest_is_refused() {
+    let h = common::TestServer::start_with_routes(
+        common::TokenSpec {
+            clusters: vec!["pve3".to_owned()],
+            tools: vec![
+                "plan_proxmox_destroy".to_owned(),
+                "get_proxmox_change_set".to_owned(),
+                "approve_proxmox_change_set".to_owned(),
+                "apply_proxmox_change_set".to_owned(),
+                "delete_container".to_owned(),
+            ],
+            guests: vec!["*".to_owned()],
+        },
+        vec![
+            common::Route {
+                path: "/api2/json/nodes",
+                status: 200,
+                body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+            },
+            common::Route {
+                path: "/api2/json/cluster/resources",
+                status: 200,
+                body: br#"{"data":[{"id":"lxc/621","type":"lxc","vmid":621,"name":"still-running","node":"pve2","status":"running","tags":"test"}]}"#,
+            },
+        ],
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 621}),
+    )
+    .await
+    .expect_err("a running guest cannot be destroyed, so it must not be planned");
+
+    assert!(err.contains("running"), "the refusal must say why: {err}");
+    assert!(
+        err.to_lowercase().contains("stop"),
+        "the refusal must name the prerequisite: {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("approval"),
+        "the refusal should explain why it happens at plan time: {err}"
+    );
+}
+
+/// A plan builds the fingerprint that apply re-checks, so it must not build it
+/// from a cached read. Stopping a guest and planning immediately used to record
+/// `running` from a snapshot seconds old, and the apply then refused its own
+/// plan as changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plan_reads_through_a_stale_snapshot() {
+    let h = common::TestServer::start_with_routes(
+        common::TokenSpec {
+            clusters: vec!["pve3".to_owned()],
+            tools: vec![
+                "plan_proxmox_destroy".to_owned(),
+                "get_proxmox_change_set".to_owned(),
+                "get_container_config".to_owned(),
+                "delete_container".to_owned(),
+            ],
+            guests: vec!["*".to_owned()],
+        },
+        common::default_guest_routes(617, false),
+    )
+    .await;
+
+    // Warm the /cluster/resources snapshot -- the cache the plan reads through.
+    // This must succeed, or nothing is cached and the test proves nothing.
+    common::call(
+        &h,
+        "get_container_config",
+        json!({"cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect("the warming read must succeed or the cache is never populated");
+
+    // The world moves underneath, without telling the server.
+    h.move_guest_to_node_leaving_cache_stale(617, "pve3");
+
+    let planned = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect("plan");
+
+    // Assert on the `node` line, not on the string "pve3": the *cluster* is
+    // also called pve3, so a substring match passes no matter which node the
+    // plan read. That collision is exactly what makes this worth pinning.
+    let preview = planned["preview"].as_str().expect("preview");
+    let node_line = preview
+        .lines()
+        .find(|line| line.trim_start().starts_with("node "))
+        .expect("the preview names the node");
+    assert!(
+        node_line.contains("pve3"),
+        "the plan must reflect the guest's current node, not the cached one: {node_line:?}"
+    );
 }

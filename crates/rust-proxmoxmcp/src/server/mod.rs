@@ -195,6 +195,19 @@ fn build_destroy_action(
     })
 }
 
+/// Whether an operation needs the guest stopped before Proxmox will do it.
+///
+/// A destroy is refused outright by Proxmox while the guest runs, because this
+/// server sends `purge` and never `force` -- deliberately, since forcing would
+/// silently widen "destroy this" into "kill it first, then destroy it", which
+/// is not what an approver read.
+///
+/// The volume operations do not touch the guest, and a rollback or restore
+/// stops it as part of the operation, so neither is listed.
+fn destroy_requires_a_stopped_guest(op: &str) -> bool {
+    matches!(op, "destroy_guest" | "destroy")
+}
+
 /// Principal recorded on a receipt written by startup recovery.
 ///
 /// The executor of an apply is the token that called
@@ -764,7 +777,15 @@ impl ProxmoxServer {
             let guest = authorized.guest();
             params.push(("node", guest.node.clone()));
             params.push(("vmid", guest.vmid.to_string()));
-            params.push(("kind", guest.r#type.path_segment().to_owned()));
+            // Only when the template asks for it. `mecmcp-openapi` refuses a
+            // parameter with no placeholder, so pushing `kind` unconditionally
+            // broke every tool whose path names the guest type itself --
+            // get_vm_config and get_container_config hardcode `qemu` and `lxc`,
+            // and both failed on every call with "parameter 'kind' does not
+            // appear in the template". Neither had a test.
+            if entry.path.contains("{kind}") {
+                params.push(("kind", guest.r#type.path_segment().to_owned()));
+            }
 
             tracing::info!(
                 tool,
@@ -2669,6 +2690,17 @@ impl ProxmoxServer {
             Err(error) => return *error,
         };
 
+        // Drop the cached snapshot before resolving. The fingerprint computed
+        // below is what apply re-checks, so planning from a stale read produces
+        // a change set that records state the guest has already left -- and the
+        // apply then refuses it as changed.
+        //
+        // That is exactly what a caller does after stopping a guest to satisfy
+        // the precondition below: stop, plan immediately, and the plan records
+        // `running` because the snapshot is seconds old. Apply is correct to
+        // refuse; the plan should not have been built from stale state.
+        self.index.invalidate_cluster(&args.cluster);
+
         // Resolve guest and compute protection to determine override.
         let guest = match self.index.resolve(client, &args.cluster, args.vmid).await {
             Ok(guest) => guest,
@@ -2730,6 +2762,24 @@ impl ProxmoxServer {
             Ok(action) => action,
             Err(error) => return tool_error(error),
         };
+
+        // Refuse here rather than at apply. Proxmox will not destroy a running
+        // guest -- `destroy_vm`/`destroy_container` send `purge` and never
+        // `force` -- so planning one produces a change set that cannot succeed.
+        //
+        // Discovering that at apply is worse than it sounds under two-person
+        // control: the plan succeeds, a second person approves it, and only
+        // then does it fail. The approval is spent, the change set is terminal,
+        // and the same human has to be asked again for the same operation. The
+        // guest's state is known here, and the preview already prints it.
+        if destroy_requires_a_stopped_guest(&action.op) && guest.status == "running" {
+            return tool_error(format!(
+                "guest {} is running, and Proxmox refuses to {} a running guest. Stop it first \
+                 with stop_vm or stop_container, then plan again. Refused here rather than at \
+                 apply so no approval is spent on an operation that cannot succeed.",
+                guest.vmid, action.op
+            ));
+        }
 
         // The operation's own tool scope, on top of `plan_proxmox_destroy`.
         // Without this a token allowlisted for the generic handlers could
