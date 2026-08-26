@@ -195,6 +195,21 @@ fn build_destroy_action(
     })
 }
 
+/// The guest type a catalog path names, when it names one.
+///
+/// `/nodes/{node}/qemu/{vmid}/config` is a QEMU-only endpoint; the type is part
+/// of the path rather than a parameter. Paths that template `{kind}` serve both
+/// and return `None`.
+fn kind_named_in(path: &str) -> Option<&'static str> {
+    if path.contains("/qemu/") {
+        return Some("qemu");
+    }
+    if path.contains("/lxc/") {
+        return Some("lxc");
+    }
+    None
+}
+
 /// Whether an operation needs the guest stopped before Proxmox will do it.
 ///
 /// A destroy is refused outright by Proxmox while the guest runs, because this
@@ -785,6 +800,20 @@ impl ProxmoxServer {
             // appear in the template". Neither had a test.
             if entry.path.contains("{kind}") {
                 params.push(("kind", guest.r#type.path_segment().to_owned()));
+            } else if let Some(required) = kind_named_in(entry.path)
+                && required != guest.r#type.path_segment()
+            {
+                // The path names one guest type, so it may only be used for
+                // that type. Without this, no longer sending `kind` would let
+                // get_vm_config run against a container and address an endpoint
+                // that cannot exist -- an opaque Proxmox error where a plain
+                // mismatch message belongs.
+                return tool_error(format!(
+                    "vmid {} is a {} guest; {tool} reads {} guests only",
+                    guest.vmid,
+                    guest.r#type.path_segment(),
+                    required
+                ));
             }
 
             tracing::info!(
@@ -2772,12 +2801,17 @@ impl ProxmoxServer {
         // then does it fail. The approval is spent, the change set is terminal,
         // and the same human has to be asked again for the same operation. The
         // guest's state is known here, and the preview already prints it.
-        if destroy_requires_a_stopped_guest(&action.op) && guest.status == "running" {
+        if destroy_requires_a_stopped_guest(&action.op) && guest.status != "stopped" {
+            // Confirmed stopped, not merely "not running". `/cluster/resources`
+            // can report `unknown` for a guest it cannot read, and treating an
+            // unreadable status as good enough would hand out exactly the
+            // unusable plan this check exists to prevent.
             return tool_error(format!(
-                "guest {} is running, and Proxmox refuses to {} a running guest. Stop it first \
-                 with stop_vm or stop_container, then plan again. Refused here rather than at \
-                 apply so no approval is spent on an operation that cannot succeed.",
-                guest.vmid, action.op
+                "guest {} reports status '{}', and Proxmox destroys only a stopped guest. Stop it \
+                 with stop_vm or stop_container and confirm it reads 'stopped', then plan again. \
+                 Refused here rather than at apply so no approval is spent on an operation that \
+                 cannot succeed.",
+                guest.vmid, guest.status
             ));
         }
 

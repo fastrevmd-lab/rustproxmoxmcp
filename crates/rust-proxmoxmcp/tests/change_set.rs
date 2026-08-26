@@ -550,3 +550,48 @@ async fn a_plan_reads_through_a_stale_snapshot() {
         "the plan must reflect the guest's current node, not the cached one: {node_line:?}"
     );
 }
+
+/// `/cluster/resources` can report a status this server cannot interpret. A
+/// destroy needs a *confirmed* stopped guest, so anything else is refused —
+/// treating an unreadable status as good enough would hand out the unusable
+/// plan the check exists to prevent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn planning_a_destroy_needs_a_confirmed_stopped_guest() {
+    let h = common::TestServer::start_with_routes(
+        common::TokenSpec {
+            clusters: vec!["pve3".to_owned()],
+            tools: vec![
+                "plan_proxmox_destroy".to_owned(),
+                "get_proxmox_change_set".to_owned(),
+                "delete_container".to_owned(),
+            ],
+            guests: vec!["*".to_owned()],
+        },
+        vec![
+            common::Route {
+                path: "/api2/json/nodes",
+                status: 200,
+                body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+            },
+            common::Route {
+                path: "/api2/json/cluster/resources",
+                status: 200,
+                body: br#"{"data":[{"id":"lxc/622","type":"lxc","vmid":622,"name":"unreadable","node":"pve2","status":"unknown","tags":"test"}]}"#,
+            },
+        ],
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 622}),
+    )
+    .await
+    .expect_err("a guest that is not confirmed stopped must not be planned");
+    assert!(
+        err.contains("unknown"),
+        "the refusal must report the status seen: {err}"
+    );
+    assert!(err.contains("stopped"), "and name what is required: {err}");
+}
