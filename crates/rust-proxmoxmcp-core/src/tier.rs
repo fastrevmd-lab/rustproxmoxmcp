@@ -61,7 +61,9 @@ pub const INTERRUPTING_TOOLS: &[&str] = &[
     "restart_container",
     "shutdown_vm",
     "stop_container",
+    "stop_task",
     "stop_vm",
+    "update_container_resources",
 ];
 
 /// Whether a tool takes a running guest out of service.
@@ -90,6 +92,7 @@ pub const WRITE_TOOLS: &[&str] = &[
     "start_container",
     "start_vm",
     "stop_container",
+    "stop_task",
     "stop_vm",
     "update_container_resources",
     // low or destructive depending on direction; classified at call time
