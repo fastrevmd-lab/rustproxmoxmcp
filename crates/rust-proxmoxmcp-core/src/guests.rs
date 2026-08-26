@@ -645,3 +645,185 @@ pub async fn guest_exec(
         .and_then(serde_json::Value::as_i64)
         .ok_or_else(|| ProxmoxError::Malformed("agent exec returned no pid".into()))
 }
+
+/// Change an LXC guest's CPU, memory or swap allocation.
+///
+/// Proxmox applies `cores` to a running container immediately, but `memory`
+/// and `swap` take effect only at the next start — the container keeps its old
+/// allocation until then. This function reports what it sent, not what took
+/// effect, because the API does not distinguish them.
+///
+/// Returns the raw `data` member. Proxmox answers a config update
+/// synchronously with `null` rather than a UPID, so there is no task to follow
+/// and [`upid_from`] would reject the reply.
+///
+/// # Errors
+///
+/// As [`destroy_container`], minus the UPID parse.
+pub async fn update_container_resources(
+    client: &ProxmoxClient,
+    node: &str,
+    vmid: u32,
+    cores: Option<u32>,
+    memory_mb: Option<u32>,
+    swap_mb: Option<u32>,
+) -> Result<serde_json::Value, ProxmoxError> {
+    let path_template = "/api2/json/nodes/{node}/lxc/{vmid}/config";
+    let vmid_string = vmid.to_string();
+    let params = &[("node", node), ("vmid", vmid_string.as_str())];
+
+    // Held so the borrowed form entries below outlive the request.
+    let cores_string = cores.map(|value| value.to_string());
+    let memory_string = memory_mb.map(|value| value.to_string());
+    let swap_string = swap_mb.map(|value| value.to_string());
+
+    let mut form: Vec<(&str, &str)> = Vec::new();
+    if let Some(value) = cores_string.as_deref() {
+        form.push(("cores", value));
+    }
+    if let Some(value) = memory_string.as_deref() {
+        form.push(("memory", value));
+    }
+    if let Some(value) = swap_string.as_deref() {
+        form.push(("swap", value));
+    }
+
+    // An empty form would PUT nothing and return success, reporting a change
+    // that never happened.
+    if form.is_empty() {
+        return Err(ProxmoxError::Malformed(
+            "no resource fields given: set at least one of cores, memory or swap".into(),
+        ));
+    }
+
+    client.put_form(path_template, params, &form).await
+}
+
+/// Whether interrupting this task leaves the guest in a partial state.
+///
+/// A UPID carries its worker type: `UPID:node:pid:pstart:starttime:TYPE:id:user:`.
+/// Most tasks are safe to stop — a cancelled `vzdump` leaves an incomplete
+/// archive and nothing else. A restore or a destroy is different: both rewrite
+/// a guest in place, and stopping one half-way leaves something that is neither
+/// the old guest nor the new one.
+///
+/// Unparseable input is treated as unsafe. Guessing "safe" on a malformed UPID
+/// would let exactly the case this exists to catch through.
+#[must_use]
+pub fn stopping_task_leaves_partial_state(upid: &str) -> bool {
+    // Field 5, zero-indexed, after the literal `UPID` prefix.
+    let Some(worker_type) = upid.split(':').nth(5) else {
+        return true;
+    };
+    if worker_type.is_empty() {
+        return true;
+    }
+    matches!(
+        worker_type,
+        "qmrestore" | "vzrestore" | "qmdestroy" | "vzdestroy"
+    )
+}
+
+/// Ask Proxmox to stop a running task.
+///
+/// The task is asked to stop; it is not guaranteed to have stopped when this
+/// returns, and a task that has already finished is not an error. Callers that
+/// need to know the outcome read the task status afterwards.
+///
+/// # Errors
+///
+/// As [`destroy_container`], minus the UPID parse.
+pub async fn stop_task(
+    client: &ProxmoxClient,
+    node: &str,
+    upid: &str,
+) -> Result<serde_json::Value, ProxmoxError> {
+    // A UPID contains colons and slashes, so it cannot go through `expand_path`
+    // for the same reason a volid cannot — the guard cannot tell a legitimate
+    // UPID from a traversal attempt. Only `node` is expanded through it; the
+    // UPID is checked and encoded here, at the one call site that knows.
+    if upid.is_empty() {
+        return Err(ProxmoxError::Malformed("upid is empty".into()));
+    }
+    if !upid.starts_with("UPID:") {
+        return Err(ProxmoxError::Malformed(format!(
+            "'{upid}' is not a task handle: a UPID begins with 'UPID:'"
+        )));
+    }
+
+    if upid.contains("..") {
+        return Err(ProxmoxError::Malformed(
+            "upid contains '..', which cannot name a task".into(),
+        ));
+    }
+    if upid.chars().any(char::is_control) {
+        return Err(ProxmoxError::Malformed(
+            "upid contains a control character".into(),
+        ));
+    }
+
+    let prefix = mecmcp_openapi::expand_path("/api2/json/nodes/{node}/tasks", &[("node", node)])
+        .map_err(|error| ProxmoxError::Malformed(error.to_string()))?;
+
+    // No placeholders left, so this passes through expansion untouched and the
+    // encoded UPID reaches Proxmox as one segment.
+    let path = format!("{prefix}/{}", crate::client::percent_encode(upid));
+
+    client.delete_json(&path, &[], &[]).await
+}
+
+#[cfg(test)]
+mod task_cancellation_tests {
+    use super::stopping_task_leaves_partial_state;
+
+    /// A cancelled backup or migration leaves nothing half-written that the
+    /// guest depends on.
+    #[test]
+    fn ordinary_tasks_are_safe_to_stop() {
+        for upid in [
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdump:617:root@pam:",
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:qmigrate:617:root@pam:",
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:download:local:root@pam:",
+        ] {
+            assert!(
+                !stopping_task_leaves_partial_state(upid),
+                "{upid} is safe to interrupt"
+            );
+        }
+    }
+
+    /// A restore or destroy rewrites a guest in place. Stopping one half-way
+    /// leaves something that is neither the old guest nor the new one.
+    #[test]
+    fn restores_and_destroys_are_not() {
+        for upid in [
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:qmrestore:617:root@pam:",
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzrestore:617:root@pam:",
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:qmdestroy:617:root@pam:",
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:617:root@pam:",
+        ] {
+            assert!(
+                stopping_task_leaves_partial_state(upid),
+                "{upid} must not be interrupted"
+            );
+        }
+    }
+
+    /// Guessing "safe" on input this cannot read would admit exactly the case
+    /// the check exists to catch.
+    #[test]
+    fn unreadable_input_is_treated_as_unsafe() {
+        for upid in [
+            "",
+            "UPID:",
+            "not-a-upid",
+            "UPID:pve2:a:b:c",
+            "UPID:pve2:a:b:c::617:root:",
+        ] {
+            assert!(
+                stopping_task_leaves_partial_state(upid),
+                "{upid:?} cannot be classified and must be refused"
+            );
+        }
+    }
+}
