@@ -426,6 +426,19 @@ impl ProxmoxServer {
         ))
     }
 
+    /// The change-set coordinator backing this server.
+    ///
+    /// Exposed so callers -- integration tests in particular -- can inspect or
+    /// construct store states the tool surface itself cannot produce, such as a
+    /// record whose preview is absent.
+    ///
+    /// Unused by the binary target, which is why it carries the allow: the
+    /// integration tests are separate crates and do not count as uses here.
+    #[allow(dead_code)]
+    pub fn coordinator(&self) -> &Arc<mecmcp_changeset::ChangesetCoordinator> {
+        &self.coordinator
+    }
+
     /// Recover the caller's context, or `None` on the stdio path.
     fn caller(context: &RequestContext<RoleServer>) -> Option<CallerCtx<ProxmoxGrant>> {
         caller_from_extensions::<ProxmoxGrant>(&context.extensions).cloned()
@@ -1774,34 +1787,46 @@ impl ProxmoxServer {
         // but nothing forces them to agree. Tracked separately; the README and
         // migration guide now describe the binding that exists rather than the
         // one that does not.
-        if let Some(mut with_preview) = coordinator
+        let Some(mut with_preview) = coordinator
             .change_sets()
             .await
             .into_iter()
             .find(|record| record.id == output.change_set_id)
-        {
-            with_preview.preview = Some(mecmcp_changeset::PreviewRecord {
-                digest: mecmcp_changeset::preview_digest(&preview_text),
-                artifact: preview_text.clone(),
-                job_id: None,
-            });
-            if let Err(error) = coordinator.update_change_set(with_preview).await {
-                // Fail the plan rather than returning one whose preview is not
-                // in the store. Approval and apply never require a preview, so
-                // a change set created without one still executes — the
-                // operator would have approved text that no longer exists
-                // anywhere, and nothing downstream would notice.
-                tracing::error!(
-                    %error,
-                    change_set = %output.change_set_id,
-                    "the preview could not be persisted; the plan is refused"
-                );
-                return tool_error(format!(
-                    "plan refused: the preview could not be persisted ({error}). \
-                     The change set exists but has no stored preview, so it must not \
-                     be approved; cancel it and plan again."
-                ));
-            }
+        else {
+            // The record was created a moment ago, so not finding it means the
+            // store dropped or evicted it. This used to be a silent skip that
+            // returned a *successful* plan for a change set with no preview.
+            tracing::error!(
+                change_set = %output.change_set_id,
+                "the change set could not be read back; the plan is refused"
+            );
+            return tool_error(
+                "plan refused: the change set could not be read back to store its \
+                 preview. It has no preview, so approve and apply will refuse it. \
+                 Plan the operation again.",
+            );
+        };
+
+        with_preview.preview = Some(mecmcp_changeset::PreviewRecord {
+            digest: mecmcp_changeset::preview_digest(&preview_text),
+            artifact: preview_text.clone(),
+            job_id: None,
+        });
+        if let Err(error) = coordinator.update_change_set(with_preview).await {
+            // Fail the plan rather than return one whose preview is not in the
+            // store. The record itself is left behind and expires on its own —
+            // there is no cancel tool — but `approve` and `apply` now refuse a
+            // previewless record, so it cannot be acted on in the meantime.
+            tracing::error!(
+                %error,
+                change_set = %output.change_set_id,
+                "the preview could not be persisted; the plan is refused"
+            );
+            return tool_error(format!(
+                "plan refused: the preview could not be persisted ({error}). The \
+                 change set has no stored preview, so approve and apply will refuse \
+                 it. Plan the operation again."
+            ));
         }
 
         // Apply override.
@@ -1940,6 +1965,18 @@ impl ProxmoxServer {
             Err(error) => return tool_error(format!("get: {error}")),
         };
 
+        // A change set with no stored preview must never be approved. The
+        // approval digest covers (owner, device, fingerprint, actions) and not
+        // the preview, so nothing downstream would notice the absence: this
+        // handler used to substitute the literal string "(no preview)" and
+        // approve anyway, recording an approval over text no one could read.
+        let Some(preview) = record.preview.as_ref() else {
+            return tool_error(
+                "approval refused: this change set has no stored preview, so there is \
+                 nothing to review. Plan the operation again.",
+            );
+        };
+
         let output = match coordinator
             .approve_change_set(
                 args.change_set_id.clone(),
@@ -1962,11 +1999,7 @@ impl ProxmoxServer {
             }
         };
 
-        let preview_text = record
-            .preview
-            .as_ref()
-            .map(|p| p.artifact.clone())
-            .unwrap_or_else(|| "(no preview)".to_owned());
+        let preview_text = preview.artifact.clone();
 
         let response = ChangeSetResponse {
             change_set_id: output.change_set_id,
@@ -2031,6 +2064,16 @@ impl ProxmoxServer {
             Ok(record) => record,
             Err(error) => return tool_error(format!("get: {error}")),
         };
+
+        // Same invariant as `approve_change_set`, enforced again here because
+        // approval and apply are separate tools with separate scopes: a record
+        // approved by an older binary must still not execute without a preview.
+        if record.preview.is_none() {
+            return tool_error(
+                "apply refused: this change set has no stored preview, so the action it \
+                 would take was never recorded for review. Plan the operation again.",
+            );
+        }
 
         // Re-resolve and verify fingerprint.
         let grant = match resolve_grant(caller.as_ref()) {

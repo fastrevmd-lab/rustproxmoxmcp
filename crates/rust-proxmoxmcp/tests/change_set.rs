@@ -339,3 +339,68 @@ async fn a_protected_guest_with_expired_waiver_is_refused() {
         "error should mention protection: {err}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_set_without_a_stored_preview_cannot_be_approved() {
+    let h = common::handler_with_guest(617, false).await;
+    let planned = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect("plan");
+    let id = planned["change_set_id"].as_str().expect("id").to_owned();
+
+    // Reproduce the record a failed preview write leaves behind.
+    h.strip_preview(&id).await;
+
+    let err = common::call_with_token(
+        &h,
+        &h.second_token,
+        "approve_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect_err("a previewless change set must not be approvable");
+    assert!(
+        err.to_string().to_lowercase().contains("preview"),
+        "the refusal must name the missing preview: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_set_without_a_stored_preview_cannot_be_applied() {
+    let h = common::handler_with_guest(617, false).await;
+    let planned = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect("plan");
+    let id = planned["change_set_id"].as_str().expect("id").to_owned();
+
+    // Approve while the preview is still present, then lose it. Apply carries
+    // its own guard because it is a separate tool behind a separate scope.
+    common::approve_as_second_principal(&h, &id).await;
+    h.strip_preview(&id).await;
+
+    let err = common::call(
+        &h,
+        "apply_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect_err("a previewless change set must not apply");
+    assert!(
+        err.to_string().to_lowercase().contains("preview"),
+        "the refusal must name the missing preview: {err}"
+    );
+    let destroys = h
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "DELETE")
+        .count();
+    assert_eq!(destroys, 0, "the guest must not be touched");
+}
