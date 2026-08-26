@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] - 2026-08-26
+
+Three defects, two of them found by using 0.8.0 against live hardware rather
+than by testing it. No tool-surface change, so no token needs re-minting.
+
+### Fixed
+
+- **`get_vm_config` and `get_container_config` failed on every call.**
+  `serve_read` supplied `kind` unconditionally, and both paths name the guest
+  type themselves -- `/nodes/{node}/qemu/{vmid}/config` and the LXC equivalent
+  -- so `mecmcp-openapi` refused with *"parameter 'kind' does not appear in the
+  template"*. Neither tool had a test anywhere in the suite. `kind` now travels
+  only when the template asks for it, and a path naming one guest type refuses
+  the other by name instead of addressing an endpoint that cannot exist.
+- **A destroy plan succeeded for a guest that could never be destroyed.**
+  Proxmox destroys only a stopped guest, and this server sends `purge` without
+  `force`. The plan succeeded, a second principal approved it, and the apply
+  failed -- spending the approval and requiring the same person to be asked
+  again. Refused at plan time now, naming the prerequisite. A *confirmed*
+  `stopped` is required: `/cluster/resources` can report `unknown`, and treating
+  that as good enough would hand out the same unusable plan.
+- **A plan could be built from a stale snapshot.** The fingerprint a plan
+  records is what apply re-checks, so planning from a cached read produced a
+  change set describing state the guest had already left -- exactly what happens
+  when a caller stops a guest and plans immediately. The plan now invalidates
+  before resolving, as apply already did.
+
+### Notes
+
+`--lab-mode` is the *protection* override, not a blanket waiver: on a lab-mode
+server a **protected** guest is approved on creation with no second principal,
+while an **ordinary** guest still requires one and self-approval is refused.
+The README now says so, along with the real tool surface -- it had been claiming
+0.3 and a read-only server.
+
 ## [0.8.0] - 2026-08-26
 
 Five tools. **Two gaps against the third-party server remain** -- see below;
