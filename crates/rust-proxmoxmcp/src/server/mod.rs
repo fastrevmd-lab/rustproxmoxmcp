@@ -1674,8 +1674,26 @@ impl ProxmoxServer {
             Err(result) => return *result,
         };
 
-        // The destination does not exist, so the protection union has nothing
-        // to evaluate against it. A pinned VMID is pinned because something is
+        // The destination must be inside the caller's guest grant.
+        //
+        // `authorize_low` above checked the *source*; nothing has looked at
+        // `newid`. Without this a token scoped to `vmid:600-699` could clone
+        // 606 into 800 — creating a guest outside the range it was granted,
+        // and probing which VMIDs are free while doing it.
+        let grant = match resolve_grant(Self::caller(&context).as_ref()) {
+            Ok(grant) => grant,
+            Err(result) => return *result,
+        };
+        if !grant.allows_new_vmid(args.newid) {
+            return tool_error(format!(
+                "token scope does not admit vmid {} as a clone destination",
+                args.newid
+            ));
+        }
+
+        // And it must not be a protected pin. The protection union is evaluated
+        // against a resolved guest, so it has nothing to say about a VMID that
+        // does not exist yet. A pinned VMID is pinned because something is
         // expected to live there; letting a clone claim it means the real guest
         // has nowhere to go and the next delete against that number protects
         // the wrong thing.
@@ -1741,9 +1759,11 @@ impl ProxmoxServer {
         // `low` action tier the operator never intended for data loss.
         if resize_shrinks(&args.size) {
             return tool_error(format!(
-                "size '{}' is not an unambiguous grow. Only the '+N' form adds capacity; \
-                 an absolute size may be smaller than the current disk, which destroys \
-                 data. Plan a shrink through plan_proxmox_destroy instead.",
+                "size '{}' is not an unambiguous grow, so this server will not perform it. \
+                 Only the '+N' form adds capacity; an absolute size may be smaller than the \
+                 current disk, which destroys data. Shrinking a disk is not supported by any \
+                 tool here — do it from the Proxmox UI or CLI, where the consequences are \
+                 visible.",
                 args.size
             ));
         }
@@ -1791,6 +1811,10 @@ impl ProxmoxServer {
             disk = %args.disk,
             size = %args.size,
             protection = %authorized.protection().summary(),
+            // Empty when the storage answered synchronously. Present or not,
+            // it is the only handle correlating this event with the task, so
+            // it belongs in the record rather than only in the response.
+            upid = %upid,
             "proxmox disk resized"
         );
 
