@@ -254,7 +254,9 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "start_container",
     "start_vm",
     "stop_container",
+    "stop_task",
     "stop_vm",
+    "update_container_resources",
 ];
 
 /// Arguments for a cluster-scoped read.
@@ -375,6 +377,38 @@ const REFUSED_CONFIG_KEYS: &[&str] = &[
 /// Key prefixes refused for the same reasons, where Proxmox numbers the key.
 const REFUSED_CONFIG_PREFIXES: &[&str] =
     &["mp", "hostpci", "usb", "dev", "serial", "parallel", "lxc."];
+
+/// Arguments for changing an LXC guest's resource allocation.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ContainerResourceArgs {
+    /// Inventory name of the cluster.
+    pub cluster: String,
+    /// Numeric guest id.
+    pub vmid: u32,
+    /// CPU cores. Applied to a running container immediately.
+    #[serde(default)]
+    pub cores: Option<u32>,
+    /// Memory in MiB. Takes effect at the next start.
+    #[serde(default)]
+    pub memory_mb: Option<u32>,
+    /// Swap in MiB. Takes effect at the next start.
+    #[serde(default)]
+    pub swap_mb: Option<u32>,
+}
+
+/// Arguments for stopping a running task.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StopTaskArgs {
+    /// Inventory name of the cluster.
+    pub cluster: String,
+    /// Task handle, as returned by any tool that starts one.
+    ///
+    /// The node is read from the handle rather than accepted as an argument. A
+    /// UPID names the node that owns the task, and a caller-supplied node that
+    /// disagreed would address a path the task does not live at -- Proxmox
+    /// would answer cheerfully and stop nothing.
+    pub upid: String,
+}
 
 /// Arguments for creating a guest from scratch.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2111,6 +2145,248 @@ impl ProxmoxServer {
     }
 
     #[tool(
+        name = "update_container_resources",
+        description = "Change an LXC guest's cores, memory or swap. Memory and swap take effect at the next start, not immediately."
+    )]
+    async fn update_container_resources(
+        &self,
+        Parameters(args): Parameters<ContainerResourceArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        if args.cores.is_none() && args.memory_mb.is_none() && args.swap_mb.is_none() {
+            return tool_error(
+                "give at least one of cores, memory_mb or swap_mb: a call with none would report \
+                 a change that never happened.",
+            );
+        }
+
+        let guest_args = GuestArgs {
+            cluster: args.cluster.clone(),
+            vmid: args.vmid,
+        };
+        let authorized = match self
+            .authorize_low("update_container_resources", &guest_args, &context)
+            .await
+        {
+            Ok(authorized) => authorized,
+            Err(result) => return *result,
+        };
+
+        let client = match self.client_for(&args.cluster) {
+            Ok(client) => client,
+            Err(result) => return *result,
+        };
+        let guest = authorized.guest();
+
+        // The endpoint is LXC-only. A QEMU guest would 501 from Proxmox with a
+        // message about the path, which reads as a server fault rather than a
+        // guest-type mismatch.
+        if guest.r#type != GuestType::Lxc {
+            return tool_error(format!(
+                "vmid {} is a QEMU guest; this tool changes LXC allocations only. Resize a VM from \
+                 the Proxmox UI or CLI.",
+                guest.vmid
+            ));
+        }
+
+        if let Err(error) = rust_proxmoxmcp_core::guests::update_container_resources(
+            client,
+            &guest.node,
+            guest.vmid,
+            args.cores,
+            args.memory_mb,
+            args.swap_mb,
+        )
+        .await
+        {
+            return tool_error(error);
+        }
+
+        tracing::info!(
+            target: "audit",
+            tool = "update_container_resources",
+            cluster = args.cluster,
+            vmid = guest.vmid,
+            node = %guest.node,
+            tier = "low",
+            interrupts = true,
+            cores = ?args.cores,
+            memory_mb = ?args.memory_mb,
+            swap_mb = ?args.swap_mb,
+            protection = %authorized.protection().summary(),
+            "proxmox container resources changed"
+        );
+
+        tool_result::<_, String>(
+            Ok(serde_json::json!({
+                "vmid": guest.vmid,
+                "node": guest.node,
+                "cores": args.cores,
+                "memory_mb": args.memory_mb,
+                "swap_mb": args.swap_mb,
+                "note": "cores apply immediately; memory and swap take effect at the next start",
+            })),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
+    }
+
+    #[tool(
+        name = "stop_task",
+        description = "Ask Proxmox to stop a running task. Restores and destroys are refused: stopping one half-way leaves a guest that is neither its old self nor its new one."
+    )]
+    async fn stop_task(
+        &self,
+        Parameters(args): Parameters<StopTaskArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        use rust_proxmoxmcp_core::grant::ProxmoxAction;
+        use rust_proxmoxmcp_core::guests::stopping_task_leaves_partial_state;
+
+        // Checked before authorization, because the answer decides whether this
+        // call belongs to the low tier at all — the same reason `resize_disk`
+        // classifies its size argument first.
+        if stopping_task_leaves_partial_state(&args.upid) {
+            return tool_error(format!(
+                "task '{}' rewrites a guest in place, so stopping it half-way would leave \
+                 something that is neither the old guest nor the new one. Let it finish and \
+                 repair the result afterwards. Backups, migrations and downloads can be stopped.",
+                args.upid
+            ));
+        }
+
+        // The node comes from the handle, never the caller. Every other tool
+        // here follows that rule because guests migrate; it matters just as
+        // much for a task, where a mismatched node addresses a path the task
+        // does not live at and Proxmox answers that cheerfully.
+        let Some(node) = rust_proxmoxmcp_core::guests::upid_node(&args.upid).map(ToOwned::to_owned)
+        else {
+            return tool_error(format!(
+                "'{}' is not a task handle: a UPID is 'UPID:node:...:worker:id:user:'",
+                args.upid
+            ));
+        };
+
+        let caller = Self::caller(&context);
+        if let Err(error) = authorize_call(
+            caller.as_ref(),
+            "stop_task",
+            Some(&args.cluster),
+            WRITE_TOOLS,
+        ) {
+            return tool_error(error);
+        }
+
+        let client = match self.client_for(&args.cluster) {
+            Ok(client) => client,
+            Err(result) => return *result,
+        };
+        let grant = match resolve_grant(caller.as_ref()) {
+            Ok(grant) => grant,
+            Err(result) => return *result,
+        };
+
+        if !grant.allows_action(ProxmoxAction::Low) {
+            return tool_error("stop_task requires the 'low' action tier");
+        }
+
+        // A UPID's `id` names the guest for guest-addressed work: `vzdump:617`
+        // is a backup *of 617*. Interrupting it interrupts that guest's
+        // operation, so it goes through the same authorization every other
+        // interrupting tool does, protection gate included. Cancelling a
+        // migration of a protected guest is not a node-level act merely because
+        // the endpoint happens to be addressed by node.
+        // Guest-addressability comes from the worker kind, not from whether the
+        // id is a number: `cephdestroyosd:3` is OSD 3, and reading it as guest
+        // 3 would let a token scoped to guest 3 cancel node work.
+        let authorized = match rust_proxmoxmcp_core::guests::task_guest(&args.upid) {
+            Some(task_vmid) => {
+                let guest_args = GuestArgs {
+                    cluster: args.cluster.clone(),
+                    vmid: task_vmid,
+                };
+                match self.authorize_low("stop_task", &guest_args, &context).await {
+                    Ok(authorized) => Some(authorized),
+                    Err(result) => return *result,
+                }
+            }
+            None => {
+                // Node-level work names no guest, so no selector can narrow it
+                // and no protection gate applies. An unrestricted guest scope
+                // stands in, as it does for `download_iso`.
+                if !grant.is_unrestricted_guest_scope() {
+                    return tool_error(format!(
+                        "task '{}' is node-level rather than guest-addressed, so it requires a \
+                         token whose guest scope is '*'. This token is narrowed to specific \
+                         guests and cannot be checked against it.",
+                        args.upid
+                    ));
+                }
+                None
+            }
+        };
+
+        if let Err(error) = rust_proxmoxmcp_core::guests::stop_task(client, &node, &args.upid).await
+        {
+            return tool_error(error);
+        }
+
+        // Two call sites rather than one with optional fields. A tracing field
+        // is fixed per site, so an `Option` would serialise as the string
+        // "Some(617)" or "None" in the JSON audit stream -- neither omitted nor
+        // the same type as every other event's `vmid`, which breaks correlation
+        // for exactly the queries an audit log exists to answer.
+        match authorized.as_ref() {
+            Some(authorized) => {
+                let guest = authorized.guest();
+                tracing::info!(
+                    target: "audit",
+                    tool = "stop_task",
+                    cluster = args.cluster,
+                    node = %node,
+                    tier = "low",
+                    interrupts = true,
+                    upid = %args.upid,
+                    vmid = guest.vmid,
+                    guest = %guest.name,
+                    // A protected guest allowed through a waiver or lab mode
+                    // has to leave that verdict here, or the trail shows its
+                    // operation interrupted with no evidence of why.
+                    protection = %authorized.protection().summary(),
+                    "proxmox task stop requested"
+                );
+            }
+            None => {
+                tracing::info!(
+                    target: "audit",
+                    tool = "stop_task",
+                    cluster = args.cluster,
+                    node = %node,
+                    tier = "low",
+                    interrupts = true,
+                    upid = %args.upid,
+                    // Not `scope`: that key already carries the caller's
+                    // authorization scope elsewhere in this module, and reusing
+                    // it here would put a target kind into the field audit
+                    // queries group authorization by.
+                    task_scope = "node",
+                    "proxmox task stop requested"
+                );
+            }
+        }
+
+        tool_result::<_, String>(
+            Ok(serde_json::json!({
+                "upid": args.upid,
+                "node": node,
+                "note": "a stop was requested; read the task status to learn whether it stopped",
+            })),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
+    }
+
+    #[tool(
         name = "create_vm",
         description = "Create a QEMU guest at a free VMID. Config keys are forwarded to Proxmox as given; 'hookscript' and 'args' are refused because they execute on the node."
     )]
@@ -3302,12 +3578,14 @@ mod tests {
             "download_iso",
             "reset_vm",
             "resize_disk",
+            "stop_task",
             "restart_container",
             "shutdown_vm",
             "start_container",
             "start_vm",
             "stop_container",
             "stop_vm",
+            "update_container_resources",
         ];
 
         for tool in KNOWN_TOOLS {

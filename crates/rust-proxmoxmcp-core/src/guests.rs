@@ -645,3 +645,287 @@ pub async fn guest_exec(
         .and_then(serde_json::Value::as_i64)
         .ok_or_else(|| ProxmoxError::Malformed("agent exec returned no pid".into()))
 }
+
+/// Change an LXC guest's CPU, memory or swap allocation.
+///
+/// Proxmox applies `cores` to a running container immediately, but `memory`
+/// and `swap` take effect only at the next start — the container keeps its old
+/// allocation until then. This function reports what it sent, not what took
+/// effect, because the API does not distinguish them.
+///
+/// Returns the raw `data` member. Proxmox answers a config update
+/// synchronously with `null` rather than a UPID, so there is no task to follow
+/// and [`upid_from`] would reject the reply.
+///
+/// # Errors
+///
+/// As [`destroy_container`], minus the UPID parse.
+pub async fn update_container_resources(
+    client: &ProxmoxClient,
+    node: &str,
+    vmid: u32,
+    cores: Option<u32>,
+    memory_mb: Option<u32>,
+    swap_mb: Option<u32>,
+) -> Result<serde_json::Value, ProxmoxError> {
+    let path_template = "/api2/json/nodes/{node}/lxc/{vmid}/config";
+    let vmid_string = vmid.to_string();
+    let params = &[("node", node), ("vmid", vmid_string.as_str())];
+
+    // Held so the borrowed form entries below outlive the request.
+    let cores_string = cores.map(|value| value.to_string());
+    let memory_string = memory_mb.map(|value| value.to_string());
+    let swap_string = swap_mb.map(|value| value.to_string());
+
+    let mut form: Vec<(&str, &str)> = Vec::new();
+    if let Some(value) = cores_string.as_deref() {
+        form.push(("cores", value));
+    }
+    if let Some(value) = memory_string.as_deref() {
+        form.push(("memory", value));
+    }
+    if let Some(value) = swap_string.as_deref() {
+        form.push(("swap", value));
+    }
+
+    // An empty form would PUT nothing and return success, reporting a change
+    // that never happened.
+    if form.is_empty() {
+        return Err(ProxmoxError::Malformed(
+            "no resource fields given: set at least one of cores, memory or swap".into(),
+        ));
+    }
+
+    client.put_form(path_template, params, &form).await
+}
+
+/// Whether interrupting this task leaves the guest in a partial state.
+///
+/// A UPID carries its worker type: `UPID:node:pid:pstart:starttime:TYPE:id:user:`.
+/// Most tasks are safe to stop — a cancelled `vzdump` leaves an incomplete
+/// archive and nothing else. A restore or a destroy is different: both rewrite
+/// a guest in place, and stopping one half-way leaves something that is neither
+/// the old guest nor the new one.
+///
+/// Unparseable input is treated as unsafe. Guessing "safe" on a malformed UPID
+/// would let exactly the case this exists to catch through.
+#[must_use]
+pub fn stopping_task_leaves_partial_state(upid: &str) -> bool {
+    // Field 5, zero-indexed, after the literal `UPID` prefix.
+    let Some(worker_type) = upid.split(':').nth(5) else {
+        return true;
+    };
+    if worker_type.is_empty() {
+        return true;
+    }
+    matches!(
+        worker_type,
+        // Restores and destroys rewrite a guest in place...
+        "qmrestore" | "vzrestore" | "qmdestroy" | "vzdestroy"
+        // ...and so does a rollback, which is the same replacement with the
+        // source being a snapshot rather than an archive. Interrupting one
+        // leaves disks and configuration from different points in time.
+        | "qmrollback" | "vzrollback"
+    )
+}
+
+/// The node a task handle names, without requiring the rest to parse.
+///
+/// [`crate::task::Upid`] refuses a handle whose worker id is empty, which is
+/// legitimate for node jobs -- `UPID:pve2:...:aptupdate::root@pam:` has none.
+/// Cancelling those is exactly what a node-level stop is for, so the node is
+/// read directly rather than through a parse that rejects them.
+///
+/// Returns `None` when the handle is not a UPID at all.
+#[must_use]
+pub fn upid_node(upid: &str) -> Option<&str> {
+    let mut fields = upid.split(':');
+    if fields.next()? != "UPID" {
+        return None;
+    }
+    let node = fields.next()?;
+    if node.is_empty() || node.chars().any(|c| c.is_control() || c == '/') {
+        return None;
+    }
+    Some(node)
+}
+
+/// Whether a task handle names a guest, and which one.
+///
+/// Decided by the **worker kind**, not by whether the id happens to be a
+/// number. Proxmox emits node-level work with numeric ids too --
+/// `cephdestroyosd:<osdid>` is an OSD number, not a VMID -- so treating any
+/// digits as a guest would let a guest-scoped token cancel node work whenever
+/// the numbers coincided, and would reject an unrestricted caller whose OSD
+/// number does not resolve as a guest.
+///
+/// QEMU workers are `qm*` and container workers are `vz*`. Both still need a
+/// numeric id: a node-wide `vzdump` with no guest id is node-level work under
+/// a guest-shaped kind.
+#[must_use]
+pub fn task_guest(upid: &str) -> Option<u32> {
+    let mut fields = upid.split(':');
+    let kind = fields.nth(5)?;
+    if !(kind.starts_with("qm") || kind.starts_with("vz")) {
+        return None;
+    }
+    fields.next()?.parse::<u32>().ok()
+}
+
+/// Ask Proxmox to stop a running task.
+///
+/// The task is asked to stop; it is not guaranteed to have stopped when this
+/// returns, and a task that has already finished is not an error. Callers that
+/// need to know the outcome read the task status afterwards.
+///
+/// # Errors
+///
+/// As [`destroy_container`], minus the UPID parse.
+pub async fn stop_task(
+    client: &ProxmoxClient,
+    node: &str,
+    upid: &str,
+) -> Result<serde_json::Value, ProxmoxError> {
+    // A UPID contains colons and slashes, so it cannot go through `expand_path`
+    // for the same reason a volid cannot — the guard cannot tell a legitimate
+    // UPID from a traversal attempt. Only `node` is expanded through it; the
+    // UPID is checked and encoded here, at the one call site that knows.
+    if upid.is_empty() {
+        return Err(ProxmoxError::Malformed("upid is empty".into()));
+    }
+    if !upid.starts_with("UPID:") {
+        return Err(ProxmoxError::Malformed(format!(
+            "'{upid}' is not a task handle: a UPID begins with 'UPID:'"
+        )));
+    }
+
+    if upid.contains("..") {
+        return Err(ProxmoxError::Malformed(
+            "upid contains '..', which cannot name a task".into(),
+        ));
+    }
+    if upid.chars().any(char::is_control) {
+        return Err(ProxmoxError::Malformed(
+            "upid contains a control character".into(),
+        ));
+    }
+
+    let prefix = mecmcp_openapi::expand_path("/api2/json/nodes/{node}/tasks", &[("node", node)])
+        .map_err(|error| ProxmoxError::Malformed(error.to_string()))?;
+
+    // No placeholders left, so this passes through expansion untouched and the
+    // encoded UPID reaches Proxmox as one segment.
+    let path = format!("{prefix}/{}", crate::client::percent_encode(upid));
+
+    client.delete_json(&path, &[], &[]).await
+}
+
+#[cfg(test)]
+mod task_cancellation_tests {
+    use super::stopping_task_leaves_partial_state;
+
+    /// A cancelled backup or migration leaves nothing half-written that the
+    /// guest depends on.
+    #[test]
+    fn ordinary_tasks_are_safe_to_stop() {
+        for upid in [
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdump:617:root@pam:",
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:qmigrate:617:root@pam:",
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:download:local:root@pam:",
+        ] {
+            assert!(
+                !stopping_task_leaves_partial_state(upid),
+                "{upid} is safe to interrupt"
+            );
+        }
+    }
+
+    /// A restore or destroy rewrites a guest in place. Stopping one half-way
+    /// leaves something that is neither the old guest nor the new one.
+    #[test]
+    fn restores_and_destroys_are_not() {
+        for upid in [
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:qmrestore:617:root@pam:",
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzrestore:617:root@pam:",
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:qmdestroy:617:root@pam:",
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:617:root@pam:",
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:qmrollback:617:root@pam:",
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzrollback:617:root@pam:",
+        ] {
+            assert!(
+                stopping_task_leaves_partial_state(upid),
+                "{upid} must not be interrupted"
+            );
+        }
+    }
+
+    /// Guessing "safe" on input this cannot read would admit exactly the case
+    /// the check exists to catch.
+    #[test]
+    fn unreadable_input_is_treated_as_unsafe() {
+        for upid in [
+            "",
+            "UPID:",
+            "not-a-upid",
+            "UPID:pve2:a:b:c",
+            "UPID:pve2:a:b:c::617:root:",
+        ] {
+            assert!(
+                stopping_task_leaves_partial_state(upid),
+                "{upid:?} cannot be classified and must be refused"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod task_addressing_tests {
+    use super::{task_guest, upid_node};
+
+    #[test]
+    fn a_guest_worker_names_its_guest() {
+        for (upid, want) in [
+            (
+                "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:qmigrate:905:root@pam:",
+                Some(905),
+            ),
+            (
+                "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdump:617:root@pam:",
+                Some(617),
+            ),
+            (
+                "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:qmstart:100:root@pam:",
+                Some(100),
+            ),
+        ] {
+            assert_eq!(task_guest(upid), want, "{upid}");
+        }
+    }
+
+    /// Node-level work carries numeric ids too. `cephdestroyosd:3` is OSD 3,
+    /// and reading it as guest 3 would let a token scoped to guest 3 cancel it.
+    #[test]
+    fn node_work_with_a_numeric_id_is_not_a_guest() {
+        for upid in [
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:cephdestroyosd:3:root@pam:",
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:srvreload:pve2:root@pam:",
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:aptupdate::root@pam:",
+            // A node-wide backup under a guest-shaped kind, with no guest id.
+            "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdump::root@pam:",
+        ] {
+            assert_eq!(task_guest(upid), None, "{upid}");
+        }
+    }
+
+    /// A node job with no worker id is still cancellable, so its node must be
+    /// readable without the strict parse that rejects the empty field.
+    #[test]
+    fn the_node_is_readable_even_without_a_worker_id() {
+        assert_eq!(
+            upid_node("UPID:pve2:0000A1B2:00C3D4E5:66BC1234:aptupdate::root@pam:"),
+            Some("pve2")
+        );
+        assert_eq!(upid_node("not-a-upid"), None);
+        assert_eq!(upid_node("UPID::x:y:z:aptupdate::root@pam:"), None);
+    }
+}
