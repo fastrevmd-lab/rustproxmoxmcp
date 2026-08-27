@@ -45,6 +45,15 @@ pub struct PlanDestroyArgs {
     /// two nodes names two different volumes.
     #[serde(default)]
     pub storage_node: Option<String>,
+    /// Command and arguments, for `guest_exec`.
+    ///
+    /// A list, not a string. Proxmox takes the argv as repeated `command`
+    /// fields, which preserves the caller's word boundaries; joining into one
+    /// string would hand the guest's shell a line to re-split, and an argument
+    /// containing a space would become two — a different command than the
+    /// approver reviewed.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
 }
 
 /// What a plan means when the caller does not say.
@@ -112,6 +121,13 @@ pub(crate) struct DestroyAction {
     /// the wrong host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_node: Option<String>,
+    /// Command and arguments, for `guest_exec`.
+    ///
+    /// Part of the action, so the digest covers the exact argv. An apply that
+    /// rebuilt the command from anything else could run something the approver
+    /// never read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
 }
 
 /// Build a coordinator for change-set lifecycle operations.

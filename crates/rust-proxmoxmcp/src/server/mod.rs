@@ -76,6 +76,14 @@ const fn tool_for_op(op: &str, kind: GuestType) -> Option<&'static str> {
         b"delete_backup" => Some("delete_backup"),
         b"delete_iso" => Some("delete_iso"),
         b"restore_backup" => Some("restore_backup"),
+        // QEMU only: the endpoint is `/nodes/{node}/qemu/{vmid}/agent/exec`
+        // and runs through the guest agent, which LXC does not have. The
+        // scope was reserved in `WRITE_TOOLS` from 0.1 so a wildcard could
+        // never reach it before there was a tool.
+        b"guest_exec" => match kind {
+            GuestType::Qemu => Some("execute_vm_command"),
+            GuestType::Lxc => None,
+        },
         _ => None,
     }
 }
@@ -119,6 +127,26 @@ fn render_destructive_preview(
             action.storage.as_deref().unwrap_or("?"),
             action.storage_node.as_deref().unwrap_or("?")
         ),
+        "guest_exec" => format!(
+            "EXECUTE INSIDE {target}\n  \
+             argv: {}\n  \
+             Runs as root inside the guest, through its agent. This server \
+             cannot see what the command does, cannot undo it, and cannot \
+             report on it afterwards: the agent returns a PID inside the \
+             guest, not a Proxmox task, so the task endpoints know nothing \
+             about it. Read the argv word by word — it is executed exactly as \
+             listed, without a shell to re-split it.",
+            action
+                .command
+                .as_deref()
+                .map(|argv| {
+                    argv.iter()
+                        .map(|word| format!("{word:?}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_else(|| "?".to_owned())
+        ),
         "delete_iso" => format!(
             "DELETE ISO '{}' on storage '{}' at node '{}'\n  \
              The image is removed. It can be downloaded again.",
@@ -157,6 +185,22 @@ fn build_destroy_action(
     let (snapname, storage, volid) = match args.op.as_str() {
         // What 0.3 planned, and still the default.
         "destroy_guest" => (None, None, None),
+        "guest_exec" => {
+            let argv = args
+                .command
+                .as_deref()
+                .filter(|argv| !argv.is_empty())
+                .ok_or_else(|| "guest_exec requires a non-empty command".to_owned())?;
+            if argv.iter().any(|word| word.trim().is_empty()) {
+                return Err(
+                    "guest_exec command contains an empty argument; an argv word that \
+                     is blank is almost always a quoting mistake, and it would be \
+                     passed to the guest verbatim"
+                        .to_owned(),
+                );
+            }
+            (None, None, None)
+        }
         "delete_snapshot" | "rollback_snapshot" => {
             (Some(require(&args.snapname, "snapname")?), None, None)
         }
@@ -179,7 +223,7 @@ fn build_destroy_action(
             return Err(format!(
                 "unknown destructive operation '{other}'; expected one of \
                  destroy_guest, delete_snapshot, rollback_snapshot, delete_backup, \
-                 delete_iso, restore_backup"
+                 delete_iso, restore_backup, guest_exec"
             ));
         }
     };
@@ -192,6 +236,7 @@ fn build_destroy_action(
         storage,
         volid,
         storage_node,
+        command: args.command.clone(),
     })
 }
 
@@ -221,6 +266,17 @@ fn kind_named_in(path: &str) -> Option<&'static str> {
 /// stops it as part of the operation, so neither is listed.
 fn destroy_requires_a_stopped_guest(op: &str) -> bool {
     matches!(op, "destroy_guest" | "destroy")
+}
+
+/// Whether an operation needs the guest *running* before Proxmox will do it.
+///
+/// The exact inverse of the rule above, and it exists for the same reason.
+/// `guest_exec` reaches the QEMU guest agent, which only answers while the
+/// guest runs, so planning one against a stopped guest produces a change set
+/// that can never apply — and under two-person control that is discovered only
+/// after someone has approved it and the approval is spent.
+fn guest_exec_requires_a_running_guest(op: &str) -> bool {
+    matches!(op, "guest_exec")
 }
 
 /// Principal recorded on a receipt written by startup recovery.
@@ -1234,6 +1290,27 @@ impl ProxmoxServer {
             "restore_backup" => {
                 let volid = action.volid.as_deref().ok_or_else(|| missing("volid"))?;
                 guests::restore_backup(client, node, kind, vmid, volid, true).await
+            }
+            "guest_exec" => {
+                if kind != GuestType::Qemu {
+                    return Err(rust_proxmoxmcp_core::ProxmoxError::Malformed(
+                        "guest_exec runs through the QEMU guest agent; this vmid is a \
+                         container"
+                            .into(),
+                    ));
+                }
+                let command = action
+                    .command
+                    .as_deref()
+                    .filter(|argv| !argv.is_empty())
+                    .ok_or_else(|| missing("command"))?;
+                // A PID inside the guest, not a UPID. Proxmox's task system
+                // never sees this, so the string is prefixed rather than
+                // returned bare: every other arm here yields a UPID, and a
+                // caller that fed this to `get_task_status` would get a
+                // malformed-UPID error instead of an answer about the command.
+                let pid = guests::guest_exec(client, node, vmid, command).await?;
+                Ok(format!("guest-agent-pid:{pid}"))
             }
             other => Err(rust_proxmoxmcp_core::ProxmoxError::Malformed(format!(
                 "unknown destructive operation '{other}'"
@@ -2684,7 +2761,7 @@ impl ProxmoxServer {
 
     #[tool(
         name = "plan_proxmox_destroy",
-        description = "Plan a guest destroy operation for two-principal approval."
+        description = "Plan a destructive operation for two-principal approval: guest destroy, snapshot delete or rollback, backup delete or restore, ISO delete, or guest_exec."
     )]
     async fn plan_destroy(
         &self,
@@ -2812,6 +2889,33 @@ impl ProxmoxServer {
                  Refused here rather than at apply so no approval is spent on an operation that \
                  cannot succeed.",
                 guest.vmid, guest.status
+            ));
+        }
+
+        if guest_exec_requires_a_running_guest(&action.op) && guest.status != "running" {
+            // Confirmed running, for the same reason the destroy check demands
+            // a confirmed `stopped`: `/cluster/resources` can report `unknown`,
+            // and an unreadable status is not evidence that the agent will
+            // answer.
+            return tool_error(format!(
+                "guest {} reports status '{}', and the QEMU guest agent answers only while the \
+                 guest runs. Start it with start_vm and confirm it reads 'running', then plan \
+                 again. Refused here rather than at apply so no approval is spent on an \
+                 operation that cannot succeed.",
+                guest.vmid, guest.status
+            ));
+        }
+
+        if action.op == "guest_exec" && guest.r#type != GuestType::Qemu {
+            // `tool_for_op` returns None here, and its generic message would
+            // say "unknown destructive operation 'guest_exec'" — which is
+            // wrong twice: the operation is known, and the reason it cannot
+            // run is the guest type.
+            return tool_error(format!(
+                "guest {} is a container, and guest_exec runs through the QEMU guest agent, \
+                 which containers do not have. There is no container equivalent in this \
+                 server's surface.",
+                guest.vmid
             ));
         }
 
@@ -3891,6 +3995,7 @@ mod destructive_action_tests {
             storage: None,
             volid: None,
             storage_node: None,
+            command: None,
         }
     }
 
@@ -3929,6 +4034,96 @@ mod destructive_action_tests {
         let mut a = args("delete_snapshot");
         a.snapname = Some(String::new());
         assert!(build_destroy_action(&a).is_err());
+    }
+
+    /// The argv is what the approver reads and what apply runs, so a plan
+    /// without one must not exist.
+    #[test]
+    fn guest_exec_requires_a_command() {
+        let error = build_destroy_action(&args("guest_exec")).expect_err("refused");
+        assert!(error.contains("non-empty command"), "{error}");
+
+        let mut empty = args("guest_exec");
+        empty.command = Some(Vec::new());
+        assert!(
+            build_destroy_action(&empty).is_err(),
+            "an empty argv is not a command"
+        );
+    }
+
+    /// A blank argv word is almost always a quoting mistake, and it would reach
+    /// the guest verbatim.
+    #[test]
+    fn guest_exec_refuses_a_blank_argument() {
+        let mut a = args("guest_exec");
+        a.command = Some(vec!["/bin/echo".to_owned(), "   ".to_owned()]);
+        let error = build_destroy_action(&a).expect_err("refused");
+        assert!(error.contains("empty argument"), "{error}");
+    }
+
+    /// The argv must survive into the action unsplit and unjoined: the digest
+    /// covers it, and apply sends it as repeated fields.
+    #[test]
+    fn guest_exec_carries_the_argv_word_for_word() {
+        let mut a = args("guest_exec");
+        a.command = Some(vec![
+            "/usr/bin/systemctl".to_owned(),
+            "restart".to_owned(),
+            "some service".to_owned(),
+        ]);
+        let action = build_destroy_action(&a).unwrap();
+        assert_eq!(
+            action.command.as_deref(),
+            Some(
+                &[
+                    "/usr/bin/systemctl".to_owned(),
+                    "restart".to_owned(),
+                    "some service".to_owned(),
+                ][..]
+            ),
+            "an argument containing a space must stay one word"
+        );
+    }
+
+    /// The preview is the whole basis of consent for this operation.
+    #[test]
+    fn the_guest_exec_preview_shows_the_argv_and_says_it_cannot_be_undone() {
+        let mut a = args("guest_exec");
+        a.command = Some(vec![
+            "/bin/rm".to_owned(),
+            "-rf".to_owned(),
+            "/data".to_owned(),
+        ]);
+        let action = build_destroy_action(&a).unwrap();
+        let preview = super::render_destructive_preview(&action, "vsrx-ci", "pve2");
+        assert!(preview.contains("EXECUTE INSIDE"), "{preview}");
+        assert!(
+            preview.contains("\"/bin/rm\""),
+            "argv must be visible: {preview}"
+        );
+        assert!(preview.contains("-rf"), "{preview}");
+        assert!(preview.contains("cannot undo it"), "{preview}");
+    }
+
+    /// Containers have no QEMU guest agent, so the scope must not resolve.
+    #[test]
+    fn guest_exec_has_no_scope_for_a_container() {
+        use rust_proxmoxmcp_core::GuestType;
+        assert_eq!(
+            super::tool_for_op("guest_exec", GuestType::Qemu),
+            Some("execute_vm_command")
+        );
+        assert_eq!(super::tool_for_op("guest_exec", GuestType::Lxc), None);
+    }
+
+    /// The inverse of the destroy precondition, and it must not be confused
+    /// with it: one demands a stopped guest, the other a running one.
+    #[test]
+    fn guest_exec_needs_a_running_guest_and_destroy_needs_a_stopped_one() {
+        assert!(super::guest_exec_requires_a_running_guest("guest_exec"));
+        assert!(!super::guest_exec_requires_a_running_guest("destroy_guest"));
+        assert!(super::destroy_requires_a_stopped_guest("destroy_guest"));
+        assert!(!super::destroy_requires_a_stopped_guest("guest_exec"));
     }
 
     /// A typo must not become a change set nobody can execute.
@@ -4020,6 +4215,7 @@ mod destructive_scope_tests {
             storage: Some("local".to_owned()),
             volid: volid.map(ToOwned::to_owned),
             storage_node: Some("pve2".to_owned()),
+            command: None,
         }
     }
 
@@ -4077,6 +4273,7 @@ mod destructive_scope_tests {
             storage: Some("local".to_owned()),
             volid: Some("local:backup/x".to_owned()),
             storage_node: None,
+            command: None,
         };
         let error = build_destroy_action(&args).expect_err("storage_node is required");
         assert!(error.contains("storage_node"), "{error}");
