@@ -40,6 +40,7 @@ use std::sync::Arc;
 #[cfg_attr(not(test), allow(dead_code))]
 const AUTHORIZATION_ONLY_TOOLS: &[&str] = &[
     "delete_backup",
+    "execute_vm_command",
     "delete_container",
     "delete_iso",
     "delete_snapshot",
@@ -191,6 +192,14 @@ fn build_destroy_action(
                 .as_deref()
                 .filter(|argv| !argv.is_empty())
                 .ok_or_else(|| "guest_exec requires a non-empty command".to_owned())?;
+            if argv.iter().any(|word| word.contains('\0')) {
+                return Err(
+                    "guest_exec command contains an embedded NUL; a POSIX argv cannot \
+                     represent one, so the word would be truncated or rejected at the \
+                     execution boundary and what runs would not be what was approved"
+                        .to_owned(),
+                );
+            }
             if argv.iter().any(|word| word.trim().is_empty()) {
                 return Err(
                     "guest_exec command contains an empty argument; an argv word that \
@@ -289,6 +298,12 @@ fn guest_exec_requires_a_running_guest(op: &str) -> bool {
 /// would put a name on a destructive execution that person did not perform.
 const RECOVERED_EXECUTOR: &str = "unknown:recovered-at-startup";
 
+/// Marks an apply result that is a guest-agent PID rather than a UPID.
+///
+/// `guest_exec` is the only operation whose result is not a Proxmox task, and
+/// the apply path has to tell the two apart before it tries to parse one.
+const GUEST_AGENT_PID_PREFIX: &str = "guest-agent-pid:";
+
 /// Result size limits for MCP tool responses.
 const RESULT_LIMITS: ResultLimits = ResultLimits {
     max_text_bytes: 512 * 1024,
@@ -311,6 +326,7 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "delete_snapshot",
     "delete_vm",
     "download_iso",
+    "execute_vm_command",
     "get_cluster_status",
     "get_container_config",
     "get_container_ip",
@@ -1310,7 +1326,7 @@ impl ProxmoxServer {
                 // caller that fed this to `get_task_status` would get a
                 // malformed-UPID error instead of an answer about the command.
                 let pid = guests::guest_exec(client, node, vmid, command).await?;
-                Ok(format!("guest-agent-pid:{pid}"))
+                Ok(format!("{GUEST_AGENT_PID_PREFIX}{pid}"))
             }
             other => Err(rust_proxmoxmcp_core::ProxmoxError::Malformed(format!(
                 "unknown destructive operation '{other}'"
@@ -3442,6 +3458,37 @@ impl ProxmoxServer {
             return tool_error(error);
         }
 
+        // `guest_exec` is marked in flight BEFORE it is issued, which no other
+        // operation here needs.
+        //
+        // Every other arm ends in a UPID, and the window between Proxmox
+        // accepting the work and this process seeing the result is closed by
+        // persisting that handle. `guest_exec` has no handle until it returns,
+        // so if the response is lost — a transport failure, an unparseable
+        // reply — the record would still read `Approved` and the same approval
+        // could run the command a second time. A destroy replayed is close to
+        // idempotent; an arbitrary root command replayed is not.
+        //
+        // `Applying` with no handle is deliberately unrecoverable: mecmcp's
+        // contract is that such a record is detectable but not resolvable by
+        // the process, which is the truth here — nothing but the guest itself
+        // knows whether the command ran. That is a human's job, and the record
+        // now says so instead of quietly permitting a second execution.
+        if action.op == "guest_exec" {
+            let mut in_flight = record.clone();
+            in_flight.state = mecmcp_changeset::ChangeSetState::Applying;
+            if let Err(error) = self.coordinator.update_change_set(in_flight).await {
+                // Fatal here, unlike the post-UPID persist: nothing has been
+                // sent to the guest yet, so refusing costs an approval rather
+                // than abandoning work already in progress.
+                return tool_error(format!(
+                    "could not mark the change set in flight before executing, and a command \
+                     that cannot be recorded as started must not be started: {error}"
+                ));
+            }
+            record.state = mecmcp_changeset::ChangeSetState::Applying;
+        }
+
         let upid_str = match self
             .execute_destructive(client, &action, guest.r#type, &state.node, args.vmid)
             .await
@@ -3524,6 +3571,51 @@ impl ProxmoxServer {
                     "outcome": "ok",
                     "synchronous": true,
                     "upid": serde_json::Value::Null,
+                })),
+                ResultFormat::PrettyJson,
+                RESULT_LIMITS,
+            );
+        }
+
+        // `guest_exec` answers with a PID inside the guest, not a UPID: the
+        // command runs through the agent and Proxmox's task system never sees
+        // it, so there is nothing to poll and nothing to parse. Without this
+        // the generic path fed the prefixed string to `Upid::parse`, which
+        // always refused it — and because the refusal returned before the
+        // record was settled, the change set stayed `Approved` and the same
+        // approval could run the root command again.
+        if let Some(pid) = upid_str.strip_prefix(GUEST_AGENT_PID_PREFIX) {
+            let pid = pid.to_owned();
+            if let Some(recorder) = &self.evidence
+                && let Err(receipt_error) = recorder.result_receipt(
+                    &apply_request_id,
+                    &record.id,
+                    &record.device,
+                    &apply_principal,
+                    true,
+                    "",
+                )
+            {
+                tracing::error!(
+                    %receipt_error,
+                    change_set_id = %record.id,
+                    "the command was started but its result receipt could not be persisted"
+                );
+            }
+            record.state = mecmcp_changeset::ChangeSetState::Applied;
+            record.task_id = None;
+            if let Err(error) = self.coordinator.update_change_set(record).await {
+                tracing::error!(%error, "could not mark the change set applied");
+            }
+            return tool_result::<_, String>(
+                Ok(serde_json::json!({
+                    "outcome": "started",
+                    "synchronous": true,
+                    "upid": serde_json::Value::Null,
+                    "guest_agent_pid": pid,
+                    "note": "The command was started inside the guest. This server cannot \
+                             report whether it succeeded: the agent returns a PID, not a \
+                             Proxmox task, so the task endpoints know nothing about it.",
                 })),
                 ResultFormat::PrettyJson,
                 RESULT_LIMITS,
@@ -4126,6 +4218,41 @@ mod destructive_action_tests {
         assert!(!super::destroy_requires_a_stopped_guest("guest_exec"));
     }
 
+    /// A POSIX argv cannot carry an embedded NUL, so a word containing one
+    /// would be truncated or refused at the execution boundary — and what ran
+    /// would not be what was approved.
+    #[test]
+    fn guest_exec_refuses_an_embedded_nul() {
+        let mut a = args("guest_exec");
+        a.command = Some(vec!["/bin/echo".to_owned(), "safe\0rm -rf /".to_owned()]);
+        let error = build_destroy_action(&a).expect_err("refused");
+        assert!(error.contains("NUL"), "{error}");
+    }
+
+    /// The apply path must be able to tell a guest-agent PID from a UPID
+    /// before it tries to parse one.
+    ///
+    /// It could not, and the consequence was not a bad error message: the
+    /// parse failed, the handler returned before settling the record, the
+    /// change set stayed `Approved`, and the same approval could run the root
+    /// command again.
+    #[test]
+    fn a_guest_agent_pid_is_distinguishable_from_a_upid() {
+        let rendered = format!("{}{}", super::GUEST_AGENT_PID_PREFIX, 4321);
+        assert!(
+            rendered
+                .strip_prefix(super::GUEST_AGENT_PID_PREFIX)
+                .is_some()
+        );
+        assert!(
+            rust_proxmoxmcp_core::task::Upid::parse(&rendered).is_err(),
+            "if this ever parsed as a UPID the apply path would poll a task that does not exist"
+        );
+        // A real UPID must not be mistaken for one of ours.
+        let upid = "UPID:pve2:0000ABCD:00000000:00000000:qmdestroy:905:root@pam:";
+        assert!(upid.strip_prefix(super::GUEST_AGENT_PID_PREFIX).is_none());
+    }
+
     /// A typo must not become a change set nobody can execute.
     #[test]
     fn an_unknown_operation_is_refused_with_the_valid_set() {
@@ -4297,17 +4424,25 @@ mod grantable_scope_tests {
     /// cross the CLI's validation.
     #[test]
     fn every_operation_scope_is_grantable() {
-        for op in [
-            "destroy_guest",
-            "destroy",
-            "delete_snapshot",
-            "rollback_snapshot",
-            "delete_backup",
-            "delete_iso",
-            "restore_backup",
-        ] {
-            for kind in [GuestType::Lxc, GuestType::Qemu] {
-                let tool = tool_for_op(op, kind).unwrap();
+        // Ops are listed with the guest kinds they are valid for, rather than
+        // assuming every op serves both. `guest_exec` is QEMU-only, and the
+        // earlier `unwrap()` over both kinds would have panicked on it — the
+        // reason it was simply left out of this list, which put it right back
+        // in the hole this test exists to prevent.
+        let cases: &[(&str, &[GuestType])] = &[
+            ("destroy_guest", &[GuestType::Lxc, GuestType::Qemu]),
+            ("destroy", &[GuestType::Lxc, GuestType::Qemu]),
+            ("delete_snapshot", &[GuestType::Lxc, GuestType::Qemu]),
+            ("rollback_snapshot", &[GuestType::Lxc, GuestType::Qemu]),
+            ("delete_backup", &[GuestType::Lxc, GuestType::Qemu]),
+            ("delete_iso", &[GuestType::Lxc, GuestType::Qemu]),
+            ("restore_backup", &[GuestType::Lxc, GuestType::Qemu]),
+            ("guest_exec", &[GuestType::Qemu]),
+        ];
+        for (op, kinds) in cases {
+            for kind in *kinds {
+                let tool = tool_for_op(op, *kind)
+                    .unwrap_or_else(|| panic!("{op} must map to a scope for {kind:?}"));
                 assert!(
                     KNOWN_TOOLS.contains(&tool),
                     "{op} authorises against '{tool}', which the token CLI rejects as unknown"
