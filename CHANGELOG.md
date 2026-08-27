@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2] - 2026-08-27
+
+### Security
+
+- **Takes mecmcp 0.21.0, which stops `RUST_LOG` switching the audit trail off**
+  ([mecmcp#330](https://github.com/fastrevmd-lab/mecmcp/issues/330)). The
+  environment filter was attached to the tracing registry, where it decides
+  whether an event exists at all, so it gated the audit file and journald sinks
+  as well as the console. A `RUST_LOG` naming a target — the ordinary way to
+  turn up logging for one crate — produced a filter that did not enable the
+  `audit` target, and every `target: "audit"` event was discarded while the
+  operation it described still happened.
+
+  This server is where the defect was measured: widening a token's scope with
+  `token set-scopes --yes` wrote one audit line with `RUST_LOG` unset and
+  **zero** under `RUST_LOG=rust_proxmoxmcp=debug`. The token store was updated
+  both times and stderr stayed empty, so nothing recorded the widening.
+
+  No configuration change is needed. Anyone who has been debugging this server
+  with a target-specific `RUST_LOG` should assume the audit trail has gaps for
+  those periods.
+
 ## [0.8.1] - 2026-08-26
 
 Three defects, two of them found by using 0.8.0 against live hardware rather
