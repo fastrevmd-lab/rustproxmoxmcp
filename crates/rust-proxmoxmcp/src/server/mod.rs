@@ -1301,7 +1301,28 @@ impl ProxmoxServer {
                     .as_deref()
                     .ok_or_else(|| missing("storage_node"))?;
                 let data = guests::delete_volume(client, storage_node, storage, volid).await?;
-                Ok(data.as_str().unwrap_or_default().to_owned())
+                // `null` means the delete answered synchronously; a string is a
+                // UPID. Anything else is neither, and treating it as an empty
+                // handle recorded the change set `Applied` on a response this
+                // server did not understand.
+                match data {
+                    serde_json::Value::Null => Ok(String::new()),
+                    serde_json::Value::String(upid) => Ok(upid),
+                    other => Err(rust_proxmoxmcp_core::ProxmoxError::Malformed(
+                        format!(
+                            "volume delete answered with {}, which is neither a UPID nor the \
+                             null a synchronous delete returns",
+                            match other {
+                                serde_json::Value::Bool(_) => "a boolean",
+                                serde_json::Value::Number(_) => "a number",
+                                serde_json::Value::Array(_) => "an array",
+                                serde_json::Value::Object(_) => "an object",
+                                _ => "an unexpected value",
+                            }
+                        )
+                        .into(),
+                    )),
+                }
             }
             "restore_backup" => {
                 let volid = action.volid.as_deref().ok_or_else(|| missing("volid"))?;
@@ -3500,6 +3521,36 @@ impl ProxmoxServer {
             }
             if argv.iter().any(|word| word.trim().is_empty()) {
                 return tool_error("guest_exec command contains an empty argument".to_owned());
+            }
+        }
+
+        // The volume deletes need the same treatment, and for the same reason.
+        // `delete_volume` checks the volid immediately before its request —
+        // empty, `..`, control characters, missing colon — and those refusals
+        // are `Malformed` too. Claimed handleless, a record rejected by them
+        // would sit `Applying` forever for a DELETE that was never sent. Plan
+        // time only requires the fields to be non-empty, so a stored volid can
+        // still be malformed by the time it is applied.
+        if matches!(action.op.as_str(), "delete_backup" | "delete_iso") {
+            let volid = action.volid.as_deref().unwrap_or_default();
+            if let Err(error) = rust_proxmoxmcp_core::guests::validate_volid(volid) {
+                return tool_error(format!(
+                    "{} action carries an unusable volid: {error}",
+                    action.op
+                ));
+            }
+            if action.storage.as_deref().unwrap_or_default().is_empty()
+                || action
+                    .storage_node
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+            {
+                return tool_error(format!(
+                    "{} action is missing storage or storage_node; an older change set may \
+                     predate the field, and it cannot be applied without it",
+                    action.op
+                ));
             }
         }
 

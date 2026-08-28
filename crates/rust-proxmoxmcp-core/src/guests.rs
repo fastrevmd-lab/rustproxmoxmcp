@@ -289,6 +289,43 @@ pub async fn rollback_snapshot(
     upid_from(data)
 }
 
+/// The volid rules, callable before anything is claimed or sent.
+///
+/// `delete_volume` enforced these immediately before its request, which is too
+/// late once a change set has been claimed for apply: the refusal is
+/// `Malformed`, which the apply path treats as indeterminate — correctly, since
+/// the same error means "no PID came back" after a request has gone out. A
+/// record rejected here would have stayed `Applying` forever for an operation
+/// that never left the process. Callers validate first and claim second.
+///
+/// # Errors
+///
+/// Returns [`ProxmoxError::Malformed`] if the volid is empty, contains `..` or
+/// a control character, or is not in `storage:path` form.
+pub fn validate_volid(volid: &str) -> Result<(), ProxmoxError> {
+    if volid.is_empty() {
+        return Err(ProxmoxError::Malformed("volid is empty".into()));
+    }
+    if volid.contains("..") {
+        return Err(ProxmoxError::Malformed(
+            "volid contains '..', which cannot name a Proxmox volume".into(),
+        ));
+    }
+    if volid.chars().any(char::is_control) {
+        return Err(ProxmoxError::Malformed(
+            "volid contains a control character".into(),
+        ));
+    }
+    // Proxmox volids are `storage:kind/name`. Requiring the colon keeps a bare
+    // path from being addressed as a volume.
+    if !volid.contains(':') {
+        return Err(ProxmoxError::Malformed(
+            "volid is not in storage:path form".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Delete one volume from a storage backend.
 ///
 /// Serves both `delete_backup` and `delete_iso`: Proxmox exposes archives and
@@ -329,22 +366,8 @@ pub async fn delete_volume(
     // `storage` are expanded through it as normal, and only the volid is
     // encoded and appended here, after being checked for the things the guard
     // would have caught.
-    if volid.is_empty() {
-        return Err(ProxmoxError::Malformed("volid is empty".into()));
-    }
-    if volid.contains("..") {
-        return Err(ProxmoxError::Malformed(
-            "volid contains '..', which cannot name a Proxmox volume".into(),
-        ));
-    }
-    if volid.chars().any(char::is_control) {
-        return Err(ProxmoxError::Malformed(
-            "volid contains a control character".into(),
-        ));
-    }
-    // Proxmox volids are `storage:kind/name`. Requiring the colon keeps a bare
-    // path from being addressed as a volume.
-    if !volid.contains(':') {
+    validate_volid(volid)?;
+    if false {
         return Err(ProxmoxError::Malformed(
             "volid is not in storage:path form".into(),
         ));
