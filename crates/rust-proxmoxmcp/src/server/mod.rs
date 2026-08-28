@@ -1320,6 +1320,23 @@ impl ProxmoxServer {
                     .as_deref()
                     .filter(|argv| !argv.is_empty())
                     .ok_or_else(|| missing("command"))?;
+                // Re-checked here, not only at plan time. A change set planned
+                // and approved by an earlier build carries whatever that build
+                // accepted, and this one must not run an argv it would have
+                // refused. The core `guest_exec` checks only that the vector is
+                // non-empty, so this is the last place it can be caught.
+                if command.iter().any(|word| word.contains('\0')) {
+                    return Err(rust_proxmoxmcp_core::ProxmoxError::Malformed(
+                        "guest_exec command contains an embedded NUL; a POSIX argv cannot \
+                         represent one, so what runs would not be what was approved"
+                            .into(),
+                    ));
+                }
+                if command.iter().any(|word| word.trim().is_empty()) {
+                    return Err(rust_proxmoxmcp_core::ProxmoxError::Malformed(
+                        "guest_exec command contains an empty argument".into(),
+                    ));
+                }
                 // A PID inside the guest, not a UPID. Proxmox's task system
                 // never sees this, so the string is prefixed rather than
                 // returned bare: every other arm here yields a UPID, and a
@@ -3292,7 +3309,7 @@ impl ProxmoxServer {
         let coordinator = self.coordinator.clone();
 
         let device = format!("{}/{}", args.cluster, args.vmid);
-        let mut record = match coordinator.change_set(&args.change_set_id, &device).await {
+        let record = match coordinator.change_set(&args.change_set_id, &device).await {
             Ok(record) => record,
             Err(error) => return tool_error(format!("get: {error}")),
         };
@@ -3474,20 +3491,41 @@ impl ProxmoxServer {
         // the process, which is the truth here — nothing but the guest itself
         // knows whether the command ran. That is a human's job, and the record
         // now says so instead of quietly permitting a second execution.
-        if action.op == "guest_exec" {
-            let mut in_flight = record.clone();
-            in_flight.state = mecmcp_changeset::ChangeSetState::Applying;
-            if let Err(error) = self.coordinator.update_change_set(in_flight).await {
-                // Fatal here, unlike the post-UPID persist: nothing has been
-                // sent to the guest yet, so refusing costs an approval rather
-                // than abandoning work already in progress.
-                return tool_error(format!(
-                    "could not mark the change set in flight before executing, and a command \
-                     that cannot be recorded as started must not be started: {error}"
-                ));
+        // Claim the change set before anything reaches the device.
+        //
+        // The hand-rolled version of this wrote `Applying` with
+        // `update_change_set`, which mecmcp now refuses: reading `Approved` and
+        // writing `Applying` are two operations, and two applies could both
+        // pass the check and both execute. `claim_change_set_for_apply` does
+        // both under one lock, so exactly one gets through.
+        //
+        // `ApplyHandle::None` for `guest_exec`, and it is not a detail.
+        // Everything else here ends in a UPID, and the window between Proxmox
+        // accepting the work and this process seeing the result is closed by
+        // persisting that handle. `guest_exec` has no handle until it returns,
+        // so a lost response would otherwise leave the record claimable and the
+        // command re-runnable. Marked handleless, it stays `Applying` across a
+        // restart instead of being settled as `Failed` — the honest state, since
+        // only the guest knows whether the command ran, and the one that keeps
+        // the approval spent.
+        let handle = if action.op == "guest_exec" {
+            mecmcp_changeset::ApplyHandle::None
+        } else {
+            mecmcp_changeset::ApplyHandle::Expected
+        };
+        let mut record = match self
+            .coordinator
+            .claim_change_set_for_apply(&record.id, &record.device, handle)
+            .await
+        {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                // Losing the claim is not a failure of this apply; it means
+                // another one already has it, or the set is no longer
+                // approvable. Either way nothing has been sent to the guest.
+                return tool_error(format!("could not claim the change set for apply: {error}"));
             }
-            record.state = mecmcp_changeset::ChangeSetState::Applying;
-        }
+        };
 
         let upid_str = match self
             .execute_destructive(client, &action, guest.r#type, &state.node, args.vmid)
