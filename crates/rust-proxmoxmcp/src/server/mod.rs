@@ -1308,20 +1308,17 @@ impl ProxmoxServer {
                 match data {
                     serde_json::Value::Null => Ok(String::new()),
                     serde_json::Value::String(upid) => Ok(upid),
-                    other => Err(rust_proxmoxmcp_core::ProxmoxError::Malformed(
-                        format!(
-                            "volume delete answered with {}, which is neither a UPID nor the \
+                    other => Err(rust_proxmoxmcp_core::ProxmoxError::Malformed(format!(
+                        "volume delete answered with {}, which is neither a UPID nor the \
                              null a synchronous delete returns",
-                            match other {
-                                serde_json::Value::Bool(_) => "a boolean",
-                                serde_json::Value::Number(_) => "a number",
-                                serde_json::Value::Array(_) => "an array",
-                                serde_json::Value::Object(_) => "an object",
-                                _ => "an unexpected value",
-                            }
-                        )
-                        .into(),
-                    )),
+                        match other {
+                            serde_json::Value::Bool(_) => "a boolean",
+                            serde_json::Value::Number(_) => "a number",
+                            serde_json::Value::Array(_) => "an array",
+                            serde_json::Value::Object(_) => "an object",
+                            _ => "an unexpected value",
+                        }
+                    ))),
                 }
             }
             "restore_backup" => {
