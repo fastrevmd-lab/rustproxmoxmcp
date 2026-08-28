@@ -367,11 +367,6 @@ pub async fn delete_volume(
     // encoded and appended here, after being checked for the things the guard
     // would have caught.
     validate_volid(volid)?;
-    if false {
-        return Err(ProxmoxError::Malformed(
-            "volid is not in storage:path form".into(),
-        ));
-    }
 
     let prefix = mecmcp_openapi::expand_path(
         "/api2/json/nodes/{node}/storage/{storage}/content",
