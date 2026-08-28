@@ -1320,23 +1320,6 @@ impl ProxmoxServer {
                     .as_deref()
                     .filter(|argv| !argv.is_empty())
                     .ok_or_else(|| missing("command"))?;
-                // Re-checked here, not only at plan time. A change set planned
-                // and approved by an earlier build carries whatever that build
-                // accepted, and this one must not run an argv it would have
-                // refused. The core `guest_exec` checks only that the vector is
-                // non-empty, so this is the last place it can be caught.
-                if command.iter().any(|word| word.contains('\0')) {
-                    return Err(rust_proxmoxmcp_core::ProxmoxError::Malformed(
-                        "guest_exec command contains an embedded NUL; a POSIX argv cannot \
-                         represent one, so what runs would not be what was approved"
-                            .into(),
-                    ));
-                }
-                if command.iter().any(|word| word.trim().is_empty()) {
-                    return Err(rust_proxmoxmcp_core::ProxmoxError::Malformed(
-                        "guest_exec command contains an empty argument".into(),
-                    ));
-                }
                 // A PID inside the guest, not a UPID. Proxmox's task system
                 // never sees this, so the string is prefixed rather than
                 // returned bare: every other arm here yields a UPID, and a
@@ -3491,6 +3474,35 @@ impl ProxmoxServer {
         // the process, which is the truth here — nothing but the guest itself
         // knows whether the command ran. That is a human's job, and the record
         // now says so instead of quietly permitting a second execution.
+        // Re-validate a stored argv *before* claiming, not after.
+        //
+        // Not only at plan time, because a change set approved by an earlier
+        // build carries whatever that build accepted and this one must not run
+        // an argv it would have refused — `guests::guest_exec` checks only that
+        // the vector is non-empty.
+        //
+        // Before the claim, because after it the record is `Applying`, and for
+        // `guest_exec` that is `ApplyHandle::None`: it would then stay
+        // `Applying` across every restart, spending the approval and the
+        // pending slot on a command that is known never to have been sent. A
+        // refusal here costs nothing, since nothing has been claimed yet.
+        if action.op == "guest_exec" {
+            let argv = action.command.as_deref().unwrap_or_default();
+            if argv.is_empty() {
+                return tool_error("guest_exec change set carries no command".to_owned());
+            }
+            if argv.iter().any(|word| word.contains('\0')) {
+                return tool_error(
+                    "guest_exec command contains an embedded NUL; a POSIX argv cannot \
+                     represent one, so what runs would not be what was approved"
+                        .to_owned(),
+                );
+            }
+            if argv.iter().any(|word| word.trim().is_empty()) {
+                return tool_error("guest_exec command contains an empty argument".to_owned());
+            }
+        }
+
         // Claim the change set before anything reaches the device.
         //
         // The hand-rolled version of this wrote `Applying` with
@@ -3508,10 +3520,20 @@ impl ProxmoxServer {
         // restart instead of being settled as `Failed` — the honest state, since
         // only the guest knows whether the command ran, and the one that keeps
         // the approval spent.
-        let handle = if action.op == "guest_exec" {
-            mecmcp_changeset::ApplyHandle::None
-        } else {
-            mecmcp_changeset::ApplyHandle::Expected
+        // Which operations end in a handle this process can re-probe.
+        //
+        // `guest_exec` never does — the agent returns a PID inside the guest.
+        // `delete_backup` and `delete_iso` may not either: a synchronous delete
+        // answers with no UPID, which this server already converts to an empty
+        // handle. Claiming those as `Expected` would have restart recovery
+        // settle them `Failed` after a deletion that may well have happened.
+        //
+        // Marking an operation handleless costs nothing when a handle does turn
+        // up: the record is settled by the outcome either way, and the marker is
+        // cleared when it leaves `Applying`.
+        let handle = match action.op.as_str() {
+            "guest_exec" | "delete_backup" | "delete_iso" => mecmcp_changeset::ApplyHandle::None,
+            _ => mecmcp_changeset::ApplyHandle::Expected,
         };
         let mut record = match self
             .coordinator
