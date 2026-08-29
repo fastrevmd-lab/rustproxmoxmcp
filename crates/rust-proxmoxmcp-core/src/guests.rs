@@ -289,12 +289,158 @@ pub async fn rollback_snapshot(
     upid_from(data)
 }
 
+/// Validate only a volid's content kind, without storage binding.
+///
+/// A Proxmox volid is `storage:kind/name` (e.g., `local:backup/vzdump.tar.zst`).
+/// This validates the content kind only. Use this for operations where the volid
+/// names its own storage (like `restore_backup`) and there's no separate storage
+/// parameter to bind against.
+///
+/// For operations with a separate storage parameter, use
+/// [`validate_volid_for_operation`] instead.
+///
+/// # Errors
+///
+/// Returns `ProxmoxError::Malformed` if the volid is malformed or has the wrong
+/// content kind.
+pub fn validate_volid_kind(volid: &str, expected_kind: &str) -> Result<(), ProxmoxError> {
+    // Basic structure checks
+    if volid.is_empty() {
+        return Err(ProxmoxError::Malformed("volid is empty".into()));
+    }
+    if volid.contains("..") {
+        return Err(ProxmoxError::Malformed(
+            "volid contains '..', which cannot name a Proxmox volume".into(),
+        ));
+    }
+    if volid.chars().any(char::is_control) {
+        return Err(ProxmoxError::Malformed(
+            "volid contains a control character".into(),
+        ));
+    }
+
+    // Parse storage:kind/name
+    let Some((storage, kind_and_name)) = volid.split_once(':') else {
+        return Err(ProxmoxError::Malformed(
+            "volid is not in storage:kind/name form".into(),
+        ));
+    };
+    if storage.is_empty() {
+        return Err(ProxmoxError::Malformed(
+            "volid has an empty storage prefix".into(),
+        ));
+    }
+
+    // Extract and validate content kind
+    let Some((kind, name)) = kind_and_name.split_once('/') else {
+        return Err(ProxmoxError::Malformed(
+            "volid does not contain '/' separating kind from name".into(),
+        ));
+    };
+    if name.is_empty() {
+        return Err(ProxmoxError::Malformed(
+            "volid names no volume after its content kind".into(),
+        ));
+    }
+
+    if kind != expected_kind {
+        return Err(ProxmoxError::Malformed(format!(
+            "volid has content kind '{kind}' but operation expects '{expected_kind}'"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Validate a volid's content kind and storage prefix.
+///
+/// A Proxmox volid is `storage:kind/name` (e.g., `local:backup/vzdump.tar.zst`).
+/// This enforces that:
+/// 1. The content kind matches what the operation expects
+/// 2. The storage prefix in the volid matches the `storage` parameter
+///
+/// Called BEFORE the change-set apply claim, because a `Malformed` error after
+/// claiming leaves a record stuck in `Applying` forever.
+///
+/// # Errors
+///
+/// Returns `ProxmoxError::Malformed` if the volid is malformed, has the wrong
+/// content kind, or its storage prefix doesn't match the `storage` parameter.
+pub fn validate_volid_for_operation(
+    volid: &str,
+    storage: &str,
+    expected_kind: &str,
+) -> Result<(), ProxmoxError> {
+    // Basic structure checks
+    if volid.is_empty() {
+        return Err(ProxmoxError::Malformed("volid is empty".into()));
+    }
+    if volid.contains("..") {
+        return Err(ProxmoxError::Malformed(
+            "volid contains '..', which cannot name a Proxmox volume".into(),
+        ));
+    }
+    if volid.chars().any(char::is_control) {
+        return Err(ProxmoxError::Malformed(
+            "volid contains a control character".into(),
+        ));
+    }
+
+    // Parse storage:kind/name
+    let Some((volid_storage, kind_and_name)) = volid.split_once(':') else {
+        return Err(ProxmoxError::Malformed(
+            "volid is not in storage:kind/name form".into(),
+        ));
+    };
+
+    // An empty prefix is checked before the comparison below, because an empty
+    // `storage` argument would otherwise make `":iso/x"` bind successfully to
+    // nothing and read as a match.
+    if volid_storage.is_empty() {
+        return Err(ProxmoxError::Malformed(
+            "volid has an empty storage prefix".into(),
+        ));
+    }
+
+    // Storage prefix must match the storage parameter
+    if volid_storage != storage {
+        return Err(ProxmoxError::Malformed(format!(
+            "volid storage prefix '{volid_storage}' does not match storage parameter '{storage}'"
+        )));
+    }
+
+    // Extract and validate content kind
+    let Some((kind, name)) = kind_and_name.split_once('/') else {
+        return Err(ProxmoxError::Malformed(
+            "volid does not contain '/' separating kind from name".into(),
+        ));
+    };
+    if name.is_empty() {
+        return Err(ProxmoxError::Malformed(
+            "volid names no volume after its content kind".into(),
+        ));
+    }
+
+    if kind != expected_kind {
+        return Err(ProxmoxError::Malformed(format!(
+            "volid has content kind '{kind}' but operation expects '{expected_kind}'"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Delete one volume from a storage backend.
 ///
 /// Serves both `delete_backup` and `delete_iso`: Proxmox exposes archives and
 /// ISO images through the same `/storage/{storage}/content/{volid}` endpoint,
 /// and the volid carries which is which. The tools stay separate because their
 /// blast radius differs — an ISO can be re-downloaded, a backup cannot.
+///
+/// **Authorization bypass prevention:** The caller must validate the volid's
+/// content kind matches the operation via [`validate_volid_for_operation`]
+/// BEFORE calling this function. Without that check, a token scoped for
+/// `delete_iso` could delete backups by passing a `backup/` volid.
 ///
 /// Returns the raw `data` member rather than a UPID: this endpoint answers
 /// synchronously with `null` on some storage types.
@@ -329,6 +475,10 @@ pub async fn delete_volume(
     // `storage` are expanded through it as normal, and only the volid is
     // encoded and appended here, after being checked for the things the guard
     // would have caught.
+    //
+    // NOTE: Basic validation only. Content-kind validation happens at the call
+    // site via validate_volid_for_operation, which must run BEFORE the
+    // change-set apply claim to prevent stuck records.
     if volid.is_empty() {
         return Err(ProxmoxError::Malformed("volid is empty".into()));
     }

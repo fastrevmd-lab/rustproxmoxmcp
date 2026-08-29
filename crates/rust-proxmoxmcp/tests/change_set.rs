@@ -595,3 +595,182 @@ async fn planning_a_destroy_needs_a_confirmed_stopped_guest() {
     );
     assert!(err.contains("stopped"), "and name what is required: {err}");
 }
+
+/// delete_iso must refuse a backup/ volid at plan time to prevent authorization
+/// bypass (a token scoped only for delete_iso deleting backups).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_delete_iso_refuses_backup_volid() {
+    let h = common::TestServer::start_with_routes(
+        common::TokenSpec {
+            clusters: vec!["pve3".to_owned()],
+            tools: vec!["plan_proxmox_destroy".to_owned(), "delete_iso".to_owned()],
+            guests: vec!["*".to_owned()],
+        },
+        vec![
+            common::Route {
+                path: "/api2/json/nodes",
+                status: 200,
+                body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+            },
+            common::Route {
+                path: "/api2/json/cluster/resources",
+                status: 200,
+                body: br#"{"data":[{"id":"lxc/617","type":"lxc","vmid":617,"name":"test","node":"pve2","status":"stopped"}]}"#,
+            },
+        ],
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({
+            "cluster": "pve3",
+            "vmid": 617,
+            "op": "delete_iso",
+            "storage": "local",
+            "storage_node": "pve2",
+            "volid": "local:backup/vzdump-lxc-617.tar.zst"
+        }),
+    )
+    .await
+    .expect_err("delete_iso must refuse a backup/ volid");
+
+    assert!(
+        err.contains("backup") && err.contains("iso"),
+        "refusal must mention both content kinds: {err}"
+    );
+}
+
+/// delete_backup must refuse an iso/ volid at plan time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_delete_backup_refuses_iso_volid() {
+    let h = common::TestServer::start_with_routes(
+        common::TokenSpec {
+            clusters: vec!["pve3".to_owned()],
+            tools: vec!["plan_proxmox_destroy".to_owned(), "delete_backup".to_owned()],
+            guests: vec!["*".to_owned()],
+        },
+        vec![
+            common::Route {
+                path: "/api2/json/nodes",
+                status: 200,
+                body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+            },
+            common::Route {
+                path: "/api2/json/cluster/resources",
+                status: 200,
+                body: br#"{"data":[{"id":"lxc/617","type":"lxc","vmid":617,"name":"test","node":"pve2","status":"stopped"}]}"#,
+            },
+        ],
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({
+            "cluster": "pve3",
+            "vmid": 617,
+            "op": "delete_backup",
+            "storage": "local",
+            "storage_node": "pve2",
+            "volid": "local:iso/debian-13.iso"
+        }),
+    )
+    .await
+    .expect_err("delete_backup must refuse an iso/ volid");
+
+    assert!(
+        err.contains("iso") && err.contains("backup"),
+        "refusal must mention both content kinds: {err}"
+    );
+}
+
+/// Storage prefix in volid must match the storage parameter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_refuses_volid_storage_mismatch() {
+    let h = common::TestServer::start_with_routes(
+        common::TokenSpec {
+            clusters: vec!["pve3".to_owned()],
+            tools: vec!["plan_proxmox_destroy".to_owned(), "delete_backup".to_owned()],
+            guests: vec!["*".to_owned()],
+        },
+        vec![
+            common::Route {
+                path: "/api2/json/nodes",
+                status: 200,
+                body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+            },
+            common::Route {
+                path: "/api2/json/cluster/resources",
+                status: 200,
+                body: br#"{"data":[{"id":"lxc/617","type":"lxc","vmid":617,"name":"test","node":"pve2","status":"stopped"}]}"#,
+            },
+        ],
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({
+            "cluster": "pve3",
+            "vmid": 617,
+            "op": "delete_backup",
+            "storage": "nas-backup",
+            "storage_node": "pve2",
+            "volid": "local:backup/vzdump-lxc-617.tar.zst"
+        }),
+    )
+    .await
+    .expect_err("must refuse storage mismatch");
+
+    assert!(
+        err.contains("local") && err.contains("nas-backup"),
+        "refusal must mention both storage names: {err}"
+    );
+}
+
+/// restore_backup must refuse a non-backup volid at plan time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_restore_refuses_non_backup_volid() {
+    let h = common::TestServer::start_with_routes(
+        common::TokenSpec {
+            clusters: vec!["pve3".to_owned()],
+            tools: vec!["plan_proxmox_destroy".to_owned(), "restore_backup".to_owned()],
+            guests: vec!["*".to_owned()],
+        },
+        vec![
+            common::Route {
+                path: "/api2/json/nodes",
+                status: 200,
+                body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+            },
+            common::Route {
+                path: "/api2/json/cluster/resources",
+                status: 200,
+                body: br#"{"data":[{"id":"lxc/617","type":"lxc","vmid":617,"name":"test","node":"pve2","status":"stopped"}]}"#,
+            },
+        ],
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({
+            "cluster": "pve3",
+            "vmid": 617,
+            "op": "restore_backup",
+            "volid": "local:iso/debian-13.iso"
+        }),
+    )
+    .await
+    .expect_err("restore_backup must refuse an iso/ volid");
+
+    assert!(
+        err.contains("iso") && err.contains("backup"),
+        "refusal must mention both content kinds: {err}"
+    );
+}
