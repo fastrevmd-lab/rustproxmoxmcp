@@ -3706,12 +3706,25 @@ impl ProxmoxServer {
             let change_set_id = record.id.clone();
             record.state = mecmcp_changeset::ChangeSetState::Failed;
             if let Err(settle_error) = self.coordinator.update_change_set(record).await {
+                // Both writes failed, which usually means one unavailable
+                // filesystem underneath them. The record is still `Applying`,
+                // so telling the caller to plan again would send them at a
+                // request the pending record refuses -- say what is actually
+                // true instead.
                 tracing::error!(
                     %settle_error,
                     %change_set_id,
                     "the apply-intent record could not be persisted and the claim could not \
                      be settled; the change set is left Applying and needs an operator"
                 );
+                return tool_error(format!(
+                    "destroy refused: the apply-intent evidence record could not be persisted \
+                     ({error}), and the claim could not be settled afterwards \
+                     ({settle_error}). Nothing was sent to the cluster, but change set \
+                     {change_set_id} is left Applying and will refuse a new plan for this \
+                     guest. Both writes failed, so check that the state and evidence \
+                     storage is writable, then reconcile the record before retrying."
+                ));
             }
             return tool_error(format!(
                 "destroy refused: the apply-intent evidence record could not be persisted \
