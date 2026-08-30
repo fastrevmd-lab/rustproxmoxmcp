@@ -3687,6 +3687,14 @@ impl ProxmoxServer {
         // with proposal and approval on the record and no execution evidence at
         // all. A guest destroyed with no record that anyone tried is the exact
         // state this chain exists to rule out, and `purge` makes it permanent.
+        //
+        // The claim is already taken by the time this runs, so a refusal here
+        // must settle it. Returning while the record is `Applying` would strand
+        // it: for a handleless operation nothing later transitions it, so it
+        // holds the approval and the pending slot across every restart for work
+        // that was never sent. `Failed` is the honest terminal state -- the
+        // request did not leave this process -- and it is what the definitive
+        // error path below writes for the same reason.
         if let Some(recorder) = &self.evidence
             && let Err(error) = recorder.apply_intent(
                 &apply_request_id,
@@ -3695,9 +3703,20 @@ impl ProxmoxServer {
                 &apply_principal,
             )
         {
+            let change_set_id = record.id.clone();
+            record.state = mecmcp_changeset::ChangeSetState::Failed;
+            if let Err(settle_error) = self.coordinator.update_change_set(record).await {
+                tracing::error!(
+                    %settle_error,
+                    %change_set_id,
+                    "the apply-intent record could not be persisted and the claim could not \
+                     be settled; the change set is left Applying and needs an operator"
+                );
+            }
             return tool_error(format!(
                 "destroy refused: the apply-intent evidence record could not be persisted \
-                 ({error}); the change set is still approved and can be retried"
+                 ({error}); nothing was sent to the cluster and the change set is marked \
+                 Failed -- plan the operation again and have the new change set approved"
             ));
         }
 

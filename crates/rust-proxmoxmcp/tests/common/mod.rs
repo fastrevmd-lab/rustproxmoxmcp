@@ -99,6 +99,22 @@ impl TestServer {
         waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
         lab_mode: bool,
     ) -> Self {
+        Self::start_with_evidence(spec, routes, waivers, lab_mode, None).await
+    }
+
+    /// As [`start_with_config`], with an evidence recorder wired in.
+    ///
+    /// The apply path behaves differently when evidence is configured -- it
+    /// writes an intent record before touching the device and refuses if that
+    /// cannot be persisted -- so a test for that behaviour needs a recorder,
+    /// and one whose spool it controls.
+    pub async fn start_with_evidence(
+        spec: TokenSpec,
+        routes: Vec<Route>,
+        waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
+        lab_mode: bool,
+        evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
+    ) -> Self {
         // Install crypto provider once for the test binary.
         ensure_crypto_provider();
 
@@ -227,7 +243,7 @@ impl TestServer {
             Arc::clone(&index),
             waivers,
             lab_mode,
-            None,
+            evidence,
             None,
         )
         .expect("build server");

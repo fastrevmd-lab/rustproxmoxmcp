@@ -774,3 +774,123 @@ async fn plan_restore_refuses_non_backup_volid() {
         "refusal must mention both content kinds: {err}"
     );
 }
+
+/// A claim must not outlive a refusal to record it.
+///
+/// The apply path claims the change set (state -> `Applying`), then writes an
+/// apply-intent evidence record and refuses if that cannot be made durable.
+/// Returning at that point without settling the claim strands the record: for
+/// a handleless operation nothing later transitions it, so it holds the
+/// approval and the pending slot across every restart for work that was never
+/// sent -- and the refusal message would say it "is still approved and can be
+/// retried", which is false.
+///
+/// Driven through the real apply path with a recorder whose spool always
+/// fails, which is what `apply_intent` propagates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_claim_is_settled_when_the_intent_record_cannot_be_persisted() {
+    use rust_proxmoxmcp_core::waiver::{WaiverEntry, WaiverFile};
+    use std::sync::Arc;
+
+    let waiver = WaiverEntry::new(
+        "pve3".to_owned(),
+        618,
+        4102444800,
+        "test waiver".to_owned(),
+        Some("TEST-123".to_owned()),
+    );
+    let waivers = Arc::new(WaiverFile::with_entries(vec![waiver]));
+
+    let recorder = Arc::new(
+        mecmcp_audit::recorder::EvidenceRecorder::new(mecmcp_audit::recorder::RecorderConfig {
+            server_id: "test".to_owned(),
+            run_id: "test-run".to_owned(),
+            resume_from: None,
+            records_per_segment: 1,
+        })
+        .with_spool(|_segment| {
+            Err(mecmcp_audit::recorder::SpoolError::new(
+                "spool refused for this test",
+            ))
+        }),
+    );
+
+    let spec = common::TokenSpec {
+        clusters: vec!["pve3".to_owned()],
+        tools: vec![
+            "plan_proxmox_destroy".to_owned(),
+            "delete_vm".to_owned(),
+            "delete_container".to_owned(),
+            "approve_proxmox_change_set".to_owned(),
+            "apply_proxmox_change_set".to_owned(),
+            "get_proxmox_change_set".to_owned(),
+        ],
+        guests: vec!["*".to_owned()],
+    };
+
+    let routes = vec![
+        common::Route {
+            path: "/api2/json/nodes",
+            status: 200,
+            body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+        },
+        common::Route {
+            path: "/api2/json/cluster/resources",
+            status: 200,
+            body: br#"{"data":[{"id":"lxc/618","type":"lxc","vmid":618,"name":"test-protected","node":"pve2","status":"stopped","tags":"protected"}]}"#,
+        },
+        common::Route {
+            path: "/api2/json/nodes/pve2/lxc/618",
+            status: 200,
+            body: br#"{"data":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:618:root@pam:"}"#,
+        },
+    ];
+
+    let h =
+        common::TestServer::start_with_evidence(spec, routes, waivers, false, Some(recorder)).await;
+
+    let planned = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 618}),
+    )
+    .await
+    .expect("plan should succeed with matching waiver");
+
+    let id = planned["change_set_id"].as_str().expect("id").to_owned();
+    if planned["state"].as_str().expect("state") != "Approved" {
+        common::approve_as_second_principal_for(&h, &id, "pve3", 618).await;
+    }
+
+    let result = common::call(
+        &h,
+        "apply_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 618}),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "apply must refuse when the intent record cannot be persisted, got: {result:?}"
+    );
+
+    // The claim must not have been left behind. `Applying` here would mean the
+    // approval and the pending slot are spent on work that never left the
+    // process.
+    let after = common::call(
+        &h,
+        "get_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 618}),
+    )
+    .await
+    .expect("the change set should still be readable");
+
+    let state = after["state"].as_str().unwrap_or_default();
+    assert_ne!(
+        state, "Applying",
+        "the change set was left claimed after the intent write was refused"
+    );
+    assert_eq!(
+        state, "Failed",
+        "a refusal before anything was sent should settle the claim as Failed, got {state}"
+    );
+}
