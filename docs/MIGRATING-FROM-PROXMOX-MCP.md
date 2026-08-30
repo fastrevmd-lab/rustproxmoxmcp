@@ -31,13 +31,15 @@ one with different identity metadata -- not one that was reconfigured in place.
 `--waivers-file` carries time-boxed operator waivers — both originate outside
 the tool call, because an override a caller can pass is not an override.
 
-Be precise about what the approval covers, because an earlier draft of this
-guide was not. **The preview is not part of the digest.** It is stored with its
-own hash, so the text an approver read cannot be edited afterwards without the
-store refusing it — but the approval binds the *action*, and the preview is
-rendered from that action rather than hashed into it. What an approver is
-cryptographically committing to is the operation and its parameters, not the
-prose describing them.
+Be precise about what the approval covers, because earlier drafts of this guide
+have twice described it wrongly. **The preview is part of the digest.** Since
+mecmcp 0.23.0 the approval digest covers the stored preview's hash alongside the
+plan, so an approver is cryptographically committing to the exact text they were
+shown as well as to the operation and its parameters, and the coordinator
+refuses any later write that swaps or drops that preview.
+
+Before 0.23.0 that was not so: the preview was stored with its own hash, which
+stopped it being edited afterwards, but it was not hashed into the approval.
 
 That is the reason to migrate. Everything below is the mechanics.
 

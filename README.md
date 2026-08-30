@@ -48,10 +48,15 @@ re-checks the guest's fingerprint and refuses one that moved.
 
 Two things worth stating plainly, because both are easy to assume wrongly:
 
-- **The preview is not hashed into the digest.** It is stored with its own hash,
-  so the text an approver read cannot be edited afterwards without the store
-  refusing it --- but what an approver commits to is the operation and its
-  parameters, not the prose describing them (#56).
+- **The approval binds the preview.** Since mecmcp 0.23.0 the approval digest
+  covers the stored preview's hash alongside the plan, so an approver commits to
+  the exact text they were shown as well as to the operation and its parameters.
+  The coordinator refuses any later write that swaps or drops that preview once
+  an approval exists (#56).
+
+  This reverses what earlier revisions of this section said. Before 0.23.0 the
+  preview was stored with its own hash but was not part of the digest, so an
+  approver committed to the action and the preview was merely rendered from it.
 - **`--lab-mode` is the *protection* override, not a blanket waiver.** It
   supplies the override a protected guest needs, so on a lab-mode server a
   **protected** guest is approved on creation with no second principal, while an

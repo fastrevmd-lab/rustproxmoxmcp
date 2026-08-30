@@ -5,6 +5,95 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Re-pinned the `mecmcp-*` crates from `v0.21.0` to `v0.23.0`. 0.23.0 binds a
+  change set's preview digest into its approval digest, so an approval now
+  vouches for the exact preview a reviewer saw. The coordinator refuses any
+  write that would swap or drop a preview once an approval exists.
+
+### Fixed
+
+- `a_change_set_without_a_stored_preview_cannot_be_applied` was passing for the
+  wrong reason after the bump. mecmcp 0.23.0 refuses the preview strip the test
+  used for setup, so the test failed before it reached the behaviour it exists
+  to check. It now persists the state a pre-0.23.0 binary would have written --
+  approved, previewless, carrying a v4 approval digest -- and confirms apply
+  still refuses it. Verified by sabotage: with the guard disabled, the test
+  fails.
+
+### Fixed
+
+- **A second apply of the same approved change set could issue a second
+  destroy.** mecmcp 0.22.0 made `claim_change_set_for_apply` the only legal
+  `Approved -> Applying` transition, but `apply_proxmox_change_set` still sent
+  the destroy first and moved the record afterwards. On 0.23.0 that write is
+  refused, and because the refusal was logged rather than returned, the record
+  stayed `Approved` and re-appliable while the guest was already gone. The
+  apply now claims the change set before `execute_destructive`, so the approval
+  is spent before anything reaches the cluster and a losing claimant is refused
+  with nothing sent. The UPID write that follows is an `Applying -> Applying`
+  field update, so the handle still lands before polling.
+- The claim is taken **before** the apply-intent evidence record, so evidence is
+  only emitted by the caller that actually holds the approval. Written the other
+  way round, two callers racing would both durably record that execution began
+  while only one could proceed, leaving a receipt-less intent for the loser. If
+  the intent record then fails to persist, the claimed change set is settled to
+  `Failed` rather than described as still approved, which it no longer is.
+- **Every** operation is claimed with `ApplyHandle::None`, not just the
+  handleless ones. The claim necessarily precedes the request, so there is a
+  window where the DELETE has been accepted but its UPID is not yet persisted.
+  A record claimed as `Expected` sits in that window as `Applying` with no
+  `task_id` and `apply_without_handle = false` -- exactly the combination the
+  coordinator converts to `Failed` at startup, asserting that a destroy which
+  may well have succeeded did not. Handleless keeps it `Applying` instead:
+  detectable, not recoverable, a human goes and looks. Once the UPID is stored
+  the record carries a real handle, which recovery re-probes rather than
+  settling.
+- A path-segment field that cannot form a URL path segment is refused at plan
+  time, via a new `guests::validate_path_segment` that asks
+  `mecmcp_openapi::expand_path` rather than re-implementing its grammar. That
+  distinction matters: a hand-written byte check catches `/` and a backslash but
+  accepts `%2f`, `%252f`, `.` and `..`, all of which `expand_path` rejects. It
+  rejects them at apply, though -- by which point the change set is planned,
+  approved and claimed, and a local failure is indistinguishable from an
+  unparseable response, so the record was left claimed and the guest blocked.
+  `volid` is exempt: it is a query parameter, and `local:backup/vzdump-...` is
+  well formed.
+- The same fields are re-checked at apply, before the claim, for the same reason
+  the volids already were: a change set approved by the previous release was
+  planned before this validation existed and can still carry a snapshot named
+  `a/b` or a storage node of `..`. Caught after the claim it would strand the
+  record in `Applying` with nothing sent; caught before it, the change set is
+  simply refused.
+
+### Documentation
+
+- **The README and the migration guide said the opposite of what is now true.**
+  Both stated plainly that the preview is not hashed into the digest and that an
+  approver commits only to the action -- accurate before 0.23.0, and exactly
+  backwards after it. Both now say the approval binds the preview, and both keep
+  a sentence saying what the previous behaviour was, since operators who read
+  the old text were told something specific about what their approval covered.
+  The `TODO: implement preview binding` comment in the plan path is resolved and
+  replaced with a description of where the binding actually happens.
+- The apply-intent failure path reports the settlement that actually happened.
+  If the settle write also fails the record is still `Applying`, and telling the
+  caller to plan again would be wrong -- the claim is still held.
+
+### Added
+
+- `an_approval_is_spent_by_the_first_apply_and_cannot_destroy_twice`, which
+  applies the same approval twice and asserts exactly one DELETE reaches the
+  cluster. Verified by reverting the fix: without the claim, the second apply
+  succeeds. No existing test covered this -- the broken write was logged, not
+  returned, so the whole suite stayed green.
+- `an_approved_change_set_will_not_give_up_its_preview`, covering the new
+  coordinator-level binding directly, and asserting the refused write does not
+  partially apply.
+
 ## [0.8.2] - 2026-08-27
 
 ### Security
