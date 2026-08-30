@@ -99,6 +99,22 @@ impl TestServer {
         waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
         lab_mode: bool,
     ) -> Self {
+        Self::start_with_config_on_state(spec, routes, waivers, lab_mode, None).await
+    }
+
+    /// As [`Self::start_with_config`], but backing the change-set coordinator
+    /// with a caller-supplied state file instead of keeping state in memory.
+    ///
+    /// Lets a test hand-write a state file -- the only way to reach guards
+    /// that exist for records an older binary persisted, since the current
+    /// coordinator will not create those states itself.
+    pub async fn start_with_config_on_state(
+        spec: TokenSpec,
+        routes: Vec<Route>,
+        waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
+        lab_mode: bool,
+        state_path: Option<std::path::PathBuf>,
+    ) -> Self {
         // Install crypto provider once for the test binary.
         ensure_crypto_provider();
 
@@ -228,7 +244,7 @@ impl TestServer {
             waivers,
             lab_mode,
             None,
-            None,
+            state_path.as_deref(),
         )
         .expect("build server");
         let coordinator = Arc::clone(handler.coordinator());
@@ -270,7 +286,23 @@ impl TestServer {
     /// Drop the stored preview from a change set, reproducing the state a
     /// failed preview write leaves behind. The tool surface cannot produce
     /// this, which is precisely why the guards against it need a test.
+    ///
+    /// Only valid before an approval exists. Once a change set is approved,
+    /// mecmcp binds the preview to the approval digest and the coordinator
+    /// refuses the write; use [`Self::try_strip_preview`] to assert that.
     pub async fn strip_preview(&self, change_set_id: &str) {
+        self.try_strip_preview(change_set_id)
+            .await
+            .expect("store the previewless record");
+    }
+
+    /// Attempt to drop the stored preview, returning the coordinator's own
+    /// error instead of panicking. Lets a test assert that an approved
+    /// change set will not let its preview be taken away.
+    pub async fn try_strip_preview(
+        &self,
+        change_set_id: &str,
+    ) -> Result<(), mecmcp_changeset::CoordinatorError> {
         let mut record = self
             .coordinator
             .change_sets()
@@ -279,10 +311,7 @@ impl TestServer {
             .find(|record| record.id == change_set_id)
             .expect("the change set exists");
         record.preview = None;
-        self.coordinator
-            .update_change_set(record)
-            .await
-            .expect("store the previewless record");
+        self.coordinator.update_change_set(record).await
     }
 
     /// Start the test server with default routes.
@@ -433,6 +462,16 @@ pub fn default_guest_routes(_vmid: u32, protected: bool) -> Vec<Route> {
 /// - `_vmid`: The guest VMID to configure
 /// - `protected`: Whether the guest should be protected
 pub async fn handler_with_guest(_vmid: u32, protected: bool) -> TestServer {
+    handler_with_guest_on_state(_vmid, protected, None).await
+}
+
+/// As [`handler_with_guest`], but persisting change-set state to `state_path`
+/// so a test can inspect or hand-write the stored records.
+pub async fn handler_with_guest_on_state(
+    _vmid: u32,
+    protected: bool,
+    state_path: Option<std::path::PathBuf>,
+) -> TestServer {
     let _tags = if protected { "protected" } else { "test" };
     let spec = TokenSpec {
         clusters: vec!["pve3".to_owned()],
@@ -455,7 +494,14 @@ pub async fn handler_with_guest(_vmid: u32, protected: bool) -> TestServer {
 
     let routes = default_guest_routes(_vmid, protected);
 
-    TestServer::start_with_routes(spec, routes).await
+    TestServer::start_with_config_on_state(
+        spec,
+        routes,
+        Arc::new(rust_proxmoxmcp_core::waiver::WaiverFile::empty()),
+        false,
+        state_path,
+    )
+    .await
 }
 
 /// Make an MCP tool call.

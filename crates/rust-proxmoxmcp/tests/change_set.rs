@@ -371,21 +371,57 @@ async fn a_change_set_without_a_stored_preview_cannot_be_approved() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_change_set_without_a_stored_preview_cannot_be_applied() {
-    let h = common::handler_with_guest(617, false).await;
-    let planned = common::call(
-        &h,
-        "plan_proxmox_destroy",
-        json!({"cluster": "pve3", "vmid": 617}),
-    )
-    .await
-    .expect("plan");
-    let id = planned["change_set_id"].as_str().expect("id").to_owned();
+    // Since mecmcp 0.23.0 neither approve nor the coordinator will let an
+    // approved change set exist without a preview, so this state is only
+    // reachable the way the guard's own comment describes: a record an older
+    // binary persisted. Write that state file by hand, start a server on it,
+    // and confirm apply still refuses. Dropping this test because the tools can
+    // no longer produce the state would leave the guard untested on the exact
+    // upgrade path it was written for.
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let state_path = dir.path().join("changesets.json");
 
-    // Approve while the preview is still present, then lose it. Apply carries
-    // its own guard because it is a separate tool behind a separate scope.
-    common::approve_as_second_principal(&h, &id).await;
-    h.strip_preview(&id).await;
+    let id = {
+        let h = common::handler_with_guest_on_state(617, false, Some(state_path.clone())).await;
+        let planned = common::call(
+            &h,
+            "plan_proxmox_destroy",
+            json!({"cluster": "pve3", "vmid": 617}),
+        )
+        .await
+        .expect("plan");
+        let id = planned["change_set_id"].as_str().expect("id").to_owned();
+        common::approve_as_second_principal(&h, &id).await;
+        id
+    };
 
+    // Rewrite the persisted record into what a pre-0.23.0 binary would have
+    // left behind: approved, no preview, and an approval digest over the v4
+    // tuple, which has no preview field at all. Recomputing that digest is the
+    // point -- leave it as the v5 value and persistence rejects the file as
+    // tampered, so the test would pass without ever reaching apply.
+    let mut state = mecmcp_changeset::persistence::read_state(&state_path, 8 * 1024 * 1024)
+        .expect("read the stored state");
+    {
+        let record = state
+            .change_sets
+            .get_mut(&id)
+            .expect("the record is stored");
+        record.preview = None;
+        let approval = record.approval.as_mut().expect("it was approved");
+        approval.digest_version = 4;
+        approval.digest = mecmcp_changeset::digest::compute_approval_digest_v4(
+            &id,
+            &record.digest,
+            &record.owner,
+            approval.approver.as_deref().expect("an approver"),
+            approval.approved_at_unix,
+        );
+    }
+    mecmcp_changeset::persistence::write_state_for_test(&state_path, &state, 8 * 1024 * 1024)
+        .expect("persist the older-binary state");
+
+    let h = common::handler_with_guest_on_state(617, false, Some(state_path.clone())).await;
     let err = common::call(
         &h,
         "apply_proxmox_change_set",
@@ -402,7 +438,7 @@ async fn a_change_set_without_a_stored_preview_cannot_be_applied() {
         .into_iter()
         .filter(|request| request.method == "DELETE")
         .count();
-    assert_eq!(destroys, 0, "the guest must not be touched");
+    assert_eq!(destroys, 0, "a refused apply must not reach the cluster");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -772,5 +808,142 @@ async fn plan_restore_refuses_non_backup_volid() {
     assert!(
         err.contains("iso") && err.contains("backup"),
         "refusal must mention both content kinds: {err}"
+    );
+}
+
+#[tokio::test]
+async fn an_approved_change_set_will_not_give_up_its_preview() {
+    let h = common::handler_with_guest(617, false).await;
+    let planned = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect("plan");
+    let id = planned["change_set_id"].as_str().expect("id").to_owned();
+
+    common::approve_as_second_principal(&h, &id).await;
+
+    // mecmcp 0.23.0 binds the preview digest into the approval digest, so
+    // dropping the preview after approval is refused by the coordinator
+    // itself -- one layer earlier than the apply-time guard. Without this the
+    // approval would vouch for a preview that no longer exists.
+    let err = h
+        .try_strip_preview(&id)
+        .await
+        .expect_err("an approved change set must not lose its preview");
+    assert!(
+        err.to_string().to_lowercase().contains("preview"),
+        "the refusal must name the preview: {err}"
+    );
+
+    // And the preview is genuinely still there afterwards.
+    let record = h
+        .coordinator()
+        .change_sets()
+        .await
+        .into_iter()
+        .find(|record| record.id == id)
+        .expect("the change set exists");
+    assert!(
+        record.preview.is_some(),
+        "the refused write must not have partially applied"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_approval_is_spent_by_the_first_apply_and_cannot_destroy_twice() {
+    use rust_proxmoxmcp_core::waiver::WaiverFile;
+    use std::sync::Arc;
+
+    // The approval must be spent before the destroy is issued, not after it
+    // returns. mecmcp 0.22.0 makes `claim_change_set_for_apply` the only legal
+    // `Approved -> Applying` transition precisely so two applies cannot both
+    // read `Approved` and both send a DELETE. Nothing caught the regression
+    // when this server still settled the record after executing: the failing
+    // write was logged, not returned, so every existing test stayed green
+    // while the record sat re-appliable.
+    let spec = common::TokenSpec {
+        clusters: vec!["pve3".to_owned()],
+        tools: vec![
+            "plan_proxmox_destroy".to_owned(),
+            "delete_vm".to_owned(),
+            "delete_container".to_owned(),
+            "approve_proxmox_change_set".to_owned(),
+            "apply_proxmox_change_set".to_owned(),
+        ],
+        guests: vec!["*".to_owned()],
+    };
+    let routes = vec![
+        common::Route {
+            path: "/api2/json/nodes",
+            status: 200,
+            body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+        },
+        common::Route {
+            path: "/api2/json/cluster/resources",
+            status: 200,
+            body: br#"{"data":[{"id":"lxc/619","type":"lxc","vmid":619,"name":"test-protected","node":"pve2","status":"stopped","tags":"protected"}]}"#,
+        },
+        common::Route {
+            path: "/api2/json/nodes/pve2/lxc/619",
+            status: 200,
+            body: br#"{"data":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:619:root@pam:"}"#,
+        },
+    ];
+
+    let h =
+        common::TestServer::start_with_config(spec, routes, Arc::new(WaiverFile::empty()), true)
+            .await;
+    h.script_task_completion(
+        "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:619:root@pam:",
+        "OK",
+    );
+
+    let planned = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 619}),
+    )
+    .await
+    .expect("plan");
+    let id = planned["change_set_id"].as_str().expect("id").to_owned();
+    if planned["state"].as_str() != Some("Approved") {
+        common::approve_as_second_principal_for(&h, &id, "pve3", 619).await;
+    }
+
+    common::call(
+        &h,
+        "apply_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 619}),
+    )
+    .await
+    .expect("the first apply succeeds");
+
+    let after_first = h
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "DELETE")
+        .count();
+    assert_eq!(after_first, 1, "the first apply issues exactly one destroy");
+
+    // Same change set, same approval, second time.
+    let err = common::call(
+        &h,
+        "apply_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 619}),
+    )
+    .await
+    .expect_err("a spent approval must not apply again");
+
+    let after_second = h
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "DELETE")
+        .count();
+    assert_eq!(
+        after_second, 1,
+        "the second apply must not reach the cluster, but {after_second} destroys were sent: {err}"
     );
 }

@@ -303,6 +303,44 @@ pub async fn rollback_snapshot(
 ///
 /// Returns `ProxmoxError::Malformed` if the volid is malformed or has the wrong
 /// content kind.
+/// Reject a value that cannot be used as a URL path segment.
+///
+/// Asks `mecmcp_openapi::expand_path` rather than re-implementing its grammar.
+/// A hand-written check would be a second source of truth and would miss what
+/// it does not know about -- encoded separators such as `%2f` and `%252f`, and
+/// relative components such as `.` and `..` -- while looking thorough.
+/// Expanding a one-parameter template runs exactly the code the request path
+/// will run, so a value that passes here cannot fail there.
+///
+/// Called at plan time. `expand_path` would reject the same value at apply,
+/// but by then the change set is planned, approved and claimed, and a local
+/// failure is indistinguishable from an unparseable response -- so the record
+/// would be left claimed and the guest blocked.
+///
+/// # Errors
+///
+/// Returns [`ProxmoxError::Malformed`] if the value cannot form a path segment.
+pub fn validate_path_segment(value: &str, field: &str) -> Result<(), ProxmoxError> {
+    mecmcp_openapi::expand_path("{segment}", &[("segment", value)]).map_err(|error| {
+        ProxmoxError::Malformed(format!("{field} is not a usable path segment: {error}"))
+    })?;
+    Ok(())
+}
+
+/// Validate only a volid's content kind, without storage binding.
+///
+/// A Proxmox volid is `storage:kind/name` (e.g., `local:backup/vzdump.tar.zst`).
+/// This validates the content kind only. Use this for operations where the volid
+/// names its own storage (like `restore_backup`) and there's no separate storage
+/// parameter to bind against.
+///
+/// For operations with a separate storage parameter, use
+/// [`validate_volid_for_operation`] instead.
+///
+/// # Errors
+///
+/// Returns `ProxmoxError::Malformed` if the volid is malformed or has the wrong
+/// content kind.
 pub fn validate_volid_kind(volid: &str, expected_kind: &str) -> Result<(), ProxmoxError> {
     // Basic structure checks
     if volid.is_empty() {

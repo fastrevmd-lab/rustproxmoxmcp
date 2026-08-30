@@ -153,20 +153,41 @@ fn build_destroy_action(
             .ok_or_else(|| format!("{} requires {name}", args.op))
     };
 
+    // For the fields that become URL *path segments*, non-empty is not enough.
+    // `mecmcp_openapi::expand_path` refuses a segment carrying a structural
+    // byte, and it does so at apply time -- after the change set has been
+    // planned, approved and claimed. Rejecting it here keeps that state
+    // unreachable: the plan fails before anything is recorded, rather than an
+    // approved change set failing locally and leaving a claimed record whose
+    // outcome is, on its face, unknown.
+    //
+    // Not applied to `volid`, which is a query parameter and legitimately
+    // contains '/' -- `local:backup/vzdump-...` is a well-formed volid.
+    let require_segment = |value: &Option<String>, name: &str| -> Result<String, String> {
+        let value = require(value, name)?;
+        // Delegates to `expand_path`, so this is the same grammar the request
+        // path enforces rather than a second, weaker copy of it.
+        rust_proxmoxmcp_core::guests::validate_path_segment(&value, name)
+            .map_err(|error| format!("{} refuses {name}: {error}", args.op))?;
+        Ok(value)
+    };
+
     let mut storage_node = None;
     let (snapname, storage, volid) = match args.op.as_str() {
         // What 0.3 planned, and still the default.
         "destroy_guest" => (None, None, None),
-        "delete_snapshot" | "rollback_snapshot" => {
-            (Some(require(&args.snapname, "snapname")?), None, None)
-        }
+        "delete_snapshot" | "rollback_snapshot" => (
+            Some(require_segment(&args.snapname, "snapname")?),
+            None,
+            None,
+        ),
         "delete_backup" | "delete_iso" => {
             // `local` is node-local storage, so the node is part of the
             // volume's identity rather than a detail of where to send the
             // request. Required at plan time and recorded in the action, so
             // apply cannot derive it from whichever guest the vmid names.
-            storage_node = Some(require(&args.storage_node, "storage_node")?);
-            let storage_val = require(&args.storage, "storage")?;
+            storage_node = Some(require_segment(&args.storage_node, "storage_node")?);
+            let storage_val = require_segment(&args.storage, "storage")?;
             let volid_val = require(&args.volid, "volid")?;
 
             // Validate content kind matches operation at plan time, before any
@@ -2940,8 +2961,11 @@ impl ProxmoxServer {
         // This server has no policy engine in 0.3.
         let policy_signature = "proxmox-no-policy-engine";
 
-        // For now, create the change set without preview binding.
-        // TODO: implement preview binding properly once the coordinator API is clarified.
+        // Created without a preview, then given one by the `update_change_set`
+        // below. The binding happens at approve: mecmcp 0.23.0 hashes the
+        // stored preview's digest into the approval digest, so the coordinator
+        // -- not this call site -- is what ties the two together, and it then
+        // refuses any write that would swap or drop the preview afterwards.
         let output = match coordinator
             .create_change_set(
                 device.clone(),
@@ -3454,6 +3478,80 @@ impl ProxmoxServer {
             _ => {} // Other operations don't use volids
         }
 
+        // Re-check the path-segment fields, for the same reason the volids
+        // above are re-checked: a change set approved by the previous release
+        // was planned before that validation existed, so it can still carry a
+        // snapshot named `a/b` or a storage node of `..`. `expand_path` would
+        // refuse it inside `execute_destructive`, after the claim below has
+        // already moved the record to `Applying` -- and a local refusal is
+        // indistinguishable there from an unparseable response, so the record
+        // would stay claimed and block this guest with nothing having been sent.
+        // Checked here, before the claim, the change set is simply refused.
+        for (field, value) in [
+            ("snapname", action.snapname.as_deref()),
+            ("storage", action.storage.as_deref()),
+            ("storage_node", action.storage_node.as_deref()),
+        ] {
+            let Some(value) = value else { continue };
+            if let Err(error) = rust_proxmoxmcp_core::guests::validate_path_segment(value, field) {
+                return tool_error(format!(
+                    "apply refused: {error}. This change set was planned before that check \
+                     existed; plan the operation again."
+                ));
+            }
+        }
+
+        // Spend the approval BEFORE anything reaches the cluster.
+        //
+        // mecmcp 0.22.0 makes `claim_change_set_for_apply` the only legal
+        // `Approved -> Applying` transition, and it performs that read and
+        // write under one lock. Two concurrent applies can no longer both read
+        // `Approved` and both issue a destroy: the second loses the claim and
+        // is refused here, before `execute_destructive`.
+        //
+        // `None` for every operation, including the ones that do answer with a
+        // UPID.
+        //
+        // The claim necessarily happens before the request, so there is a
+        // window where the DELETE has been accepted but its UPID has not yet
+        // been persisted. A record claimed as `Expected` sits in that window as
+        // `Applying` with no `task_id` and `apply_without_handle = false`,
+        // which is exactly the combination `ChangesetCoordinator` converts to
+        // `Failed` at startup -- asserting that a destroy which may well have
+        // succeeded did not. `delete_backup` and `delete_iso` have no handle at
+        // all, since `delete_volume` answers synchronously on some storage
+        // types.
+        //
+        // Handleless keeps the record `Applying` instead: detectable, not
+        // recoverable, and a human goes and looks. Once the UPID is stored the
+        // record carries a real handle, which recovery re-probes rather than
+        // settling, so the marker costs nothing after that point.
+
+        // Claimed before the apply-intent record is written, so evidence is
+        // only ever emitted by the caller that actually holds the approval. If
+        // the intent were written first, two callers racing here would both
+        // durably record that execution began while only one could proceed,
+        // leaving a receipt-less intent for the loser.
+        //
+        // Nothing has been sent at this point, so a refusal is safe to report
+        // as such -- the guest is untouched.
+        record = match self
+            .coordinator
+            .claim_change_set_for_apply(
+                &record.id,
+                &record.device,
+                mecmcp_changeset::ApplyHandle::None,
+            )
+            .await
+        {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                return tool_error(format!(
+                    "apply refused: the change set could not be claimed for apply ({error}).                      Another apply may already hold it. Nothing was sent to the cluster."
+                ));
+            }
+        };
+
         // A guest is about to be destroyed. This is written -- and, with a spool
         // attached, persisted -- *before* the DELETE goes out, and refused if it
         // cannot be. The apply path does not go through `commit_operation`, so
@@ -3469,10 +3567,40 @@ impl ProxmoxServer {
                 &apply_principal,
             )
         {
-            return tool_error(format!(
-                "destroy refused: the apply-intent evidence record could not be persisted \
-                 ({error}); the change set is still approved and can be retried"
-            ));
+            // The claim above already moved this out of `Approved`, so it
+            // cannot honestly be described as retriable while it sits in
+            // `Applying`. Settle it before returning: nothing was sent, so
+            // `Failed` is the accurate outcome and it frees the operator to
+            // plan again.
+            let mut abandoned = record.clone();
+            abandoned.state = mecmcp_changeset::ChangeSetState::Failed;
+            // Report the settlement that actually happened. If this write fails
+            // too, `update_change_set` rolls back and the record is still
+            // `Applying`; telling the caller to plan again would be wrong,
+            // because the claim is still held and a new plan stays blocked.
+            let settled = self.coordinator.update_change_set(abandoned).await;
+            if let Err(settle_error) = &settled {
+                tracing::error!(
+                    target: "audit",
+                    %settle_error,
+                    change_set = %record.id,
+                    "claimed change set left in Applying after the intent record failed"
+                );
+            }
+            return tool_error(match settled {
+                Ok(()) => format!(
+                    "destroy refused: the apply-intent evidence record could not be persisted \
+                     ({error}); nothing was sent to the cluster and the change set is now \
+                     failed -- plan the operation again"
+                ),
+                Err(settle_error) => format!(
+                    "destroy refused: the apply-intent evidence record could not be persisted \
+                     ({error}), and the change set could not then be settled \
+                     ({settle_error}). Nothing was sent to the cluster, but the record is \
+                     still claimed and reads as applying -- it needs an operator before \
+                     this guest can be planned again"
+                ),
+            });
         }
 
         let upid_str = match self
@@ -3587,13 +3715,11 @@ impl ProxmoxServer {
         // failing quietly, so it is said loudly instead.
         {
             let mut in_flight = record.clone();
-            // `Applying`, not the `Approved` snapshot this was verified from.
-            // `recover_in_flight` looks for `Applying` plus a handle, so
-            // persisting `Approved + task_id` would store the handle somewhere
-            // recovery never looks — and would leave the set approved, so a
-            // retry could issue a second destroy against a guest the first one
-            // already removed.
-            in_flight.state = mecmcp_changeset::ChangeSetState::Applying;
+            // Already `Applying` -- the claim above moved it there before the
+            // destroy was issued, which is what keeps the approval from being
+            // spent twice. This write only attaches the handle, so it is an
+            // `Applying -> Applying` field update. `recover_in_flight` looks
+            // for `Applying` plus a handle, and both are now on disk.
             in_flight.task_id = Some(upid_str.clone());
             if let Err(error) = self.coordinator.update_change_set(in_flight).await {
                 tracing::error!(
@@ -4091,6 +4217,56 @@ mod destructive_action_tests {
             action.storage.is_none(),
             "a storage passed to restore must not reach the action"
         );
+        assert_eq!(
+            action.volid.as_deref(),
+            Some("local:backup/vzdump-lxc-617.tar.zst")
+        );
+    }
+
+    /// A path segment carrying '/' expands to a different URL than the one
+    /// approved, and `expand_path` refuses it -- but only at apply time, by
+    /// which point the change set is planned, approved and claimed. Refusing at
+    /// plan time keeps that state unreachable.
+    #[test]
+    fn an_unusable_path_segment_is_refused_at_plan_time() {
+        // Not just a raw '/': an encoded separator is one decode away from
+        // one, and a relative component walks the path somewhere else
+        // entirely. A hand-rolled byte check would have accepted all four of
+        // the latter cases, which is why this delegates to `expand_path`.
+        for (field, value) in [
+            ("storage_node", "pve2/bad"),
+            ("storage", "local/bad"),
+            ("storage", "%2f"),
+            ("storage", "%252f"),
+            ("storage_node", "."),
+            ("storage_node", ".."),
+        ] {
+            let mut a = args("delete_backup");
+            a.storage_node = Some("pve2".to_owned());
+            a.storage = Some("local".to_owned());
+            a.volid = Some("local:backup/vzdump-lxc-617.tar.zst".to_owned());
+            match field {
+                "storage_node" => a.storage_node = Some(value.to_owned()),
+                _ => a.storage = Some(value.to_owned()),
+            }
+            let error =
+                build_destroy_action(&a).expect_err("a path segment containing '/' must not plan");
+            assert!(
+                error.contains(field),
+                "the refusal must name the offending field: {error}"
+            );
+        }
+    }
+
+    /// The same rule must not reach `volid`, which is a query parameter and
+    /// legitimately contains '/'.
+    #[test]
+    fn a_volid_may_still_contain_a_separator() {
+        let mut a = args("delete_backup");
+        a.storage_node = Some("pve2".to_owned());
+        a.storage = Some("local".to_owned());
+        a.volid = Some("local:backup/vzdump-lxc-617.tar.zst".to_owned());
+        let action = build_destroy_action(&a).expect("a well-formed volid plans");
         assert_eq!(
             action.volid.as_deref(),
             Some("local:backup/vzdump-lxc-617.tar.zst")
