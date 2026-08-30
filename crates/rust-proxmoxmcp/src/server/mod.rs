@@ -219,15 +219,38 @@ fn build_destroy_action(
             // request. Required at plan time and recorded in the action, so
             // apply cannot derive it from whichever guest the vmid names.
             storage_node = Some(require(&args.storage_node, "storage_node")?);
-            (
-                None,
-                Some(require(&args.storage, "storage")?),
-                Some(require(&args.volid, "volid")?),
+            let storage_val = require(&args.storage, "storage")?;
+            let volid_val = require(&args.volid, "volid")?;
+
+            // Validate content kind matches operation at plan time, before any
+            // approval is issued. Without this, a token scoped for delete_iso
+            // could plan to delete backups by passing a backup/ volid.
+            let expected_kind = match args.op.as_str() {
+                "delete_backup" => "backup",
+                "delete_iso" => "iso",
+                _ => unreachable!("matched arm checks these exhaustively"),
+            };
+            rust_proxmoxmcp_core::guests::validate_volid_for_operation(
+                &volid_val,
+                &storage_val,
+                expected_kind,
             )
+            .map_err(|error| error.to_string())?;
+
+            (None, Some(storage_val), Some(volid_val))
         }
         // No storage: the archive volid names its own storage, and accepting a
         // second one invites the two to disagree.
-        "restore_backup" => (None, None, Some(require(&args.volid, "volid")?)),
+        "restore_backup" => {
+            let volid_val = require(&args.volid, "volid")?;
+            // Validate it's a backup volid. restore_backup uses the volid to
+            // name the archive, and the storage is embedded in the volid itself
+            // (e.g., local:backup/x), so there's no separate storage parameter
+            // to bind against. We validate only the content kind.
+            rust_proxmoxmcp_core::guests::validate_volid_kind(&volid_val, "backup")
+                .map_err(|error| error.to_string())?;
+            (None, None, Some(volid_val))
+        }
         other => {
             return Err(format!(
                 "unknown destructive operation '{other}'; expected one of \
@@ -247,6 +270,62 @@ fn build_destroy_action(
         storage_node,
         command: args.command.clone(),
     })
+}
+
+/// The operation-required fields an action does not carry.
+///
+/// Mirrors the `missing(...)` arms of `execute_destructive`, which is the only
+/// other place these requirements are written down. That function reports an
+/// absent field as `ProxmoxError::Malformed`, and `Malformed` is not in the
+/// `definitive` set -- so an incomplete record reaching it writes apply intent,
+/// fails, and emits no result receipt. The chain is then stranded at intent,
+/// which reads as "the request may have been sent, go and look", for an
+/// operation that never left the process.
+///
+/// `build_destroy_action` requires all of these at plan time, so a record
+/// planned by this version cannot be incomplete. The exposure is exactly the
+/// records the apply-time checks exist for: planned by an older version,
+/// imported, or hand-written.
+fn missing_required_fields(action: &change_set::DestroyAction) -> Vec<&'static str> {
+    // Present means non-empty, matching `build_destroy_action`, whose `require`
+    // closure filters empty strings out at plan time. Treating `""` as present
+    // here would send an action that planning would have refused on to
+    // `expand_path`, which rejects the empty segment as `Malformed` -- after
+    // the intent write, which is the state this whole check exists to avoid.
+    let present = |field: &Option<String>| field.as_ref().is_some_and(|v| !v.is_empty());
+
+    // Each arm declares what its operation needs, in the order
+    // `execute_destructive` asks for them, so the two can be read side by side.
+    let required: Vec<(&'static str, bool)> = match action.op.as_str() {
+        // `destroy_guest`/`destroy` name the guest and nothing else.
+        "destroy_guest" | "destroy" => Vec::new(),
+        // `execute_destructive` reports an absent or empty argv as
+        // `missing("command")`, so it belongs here with the rest. The argv
+        // checks above go further -- NUL bytes, blank words -- but presence is
+        // this function's job, and naming it here keeps the drift guard honest.
+        "guest_exec" => vec![(
+            "command",
+            action.command.as_ref().is_some_and(|argv| !argv.is_empty()),
+        )],
+        "delete_snapshot" | "rollback_snapshot" => {
+            vec![("snapname", present(&action.snapname))]
+        }
+        "delete_backup" | "delete_iso" => vec![
+            ("storage", present(&action.storage)),
+            ("volid", present(&action.volid)),
+            ("storage_node", present(&action.storage_node)),
+        ],
+        "restore_backup" => vec![("volid", present(&action.volid))],
+        // An unrecognised op is already refused by `tool_for_op` before this
+        // runs; naming fields for it here would be guesswork.
+        _ => Vec::new(),
+    };
+
+    required
+        .into_iter()
+        .filter(|(_, present)| !present)
+        .map(|(name, _)| name)
+        .collect()
 }
 
 /// The guest type a catalog path names, when it names one.
@@ -3422,27 +3501,6 @@ impl ProxmoxServer {
             ));
         }
 
-        // A guest is about to be destroyed. This is written -- and, with a spool
-        // attached, persisted -- *before* the DELETE goes out, and refused if it
-        // cannot be. The apply path does not go through `commit_operation`, so
-        // nothing else emits it: without this, an approved destroy completes
-        // with proposal and approval on the record and no execution evidence at
-        // all. A guest destroyed with no record that anyone tried is the exact
-        // state this chain exists to rule out, and `purge` makes it permanent.
-        if let Some(recorder) = &self.evidence
-            && let Err(error) = recorder.apply_intent(
-                &apply_request_id,
-                &record.id,
-                &record.device,
-                &apply_principal,
-            )
-        {
-            return tool_error(format!(
-                "destroy refused: the apply-intent evidence record could not be persisted \
-                 ({error}); the change set is still approved and can be retried"
-            ));
-        }
-
         // Dispatch on the action the change set recorded, not on the tool
         // name. The digest covers `actions`, so this is the only description of
         // the work that the approver actually signed; reading the operation
@@ -3521,53 +3579,78 @@ impl ProxmoxServer {
             }
         }
 
-        // The volume deletes need the same treatment, and for the same reason.
-        // `delete_volume` checks the volid immediately before its request —
-        // empty, `..`, control characters, missing colon — and those refusals
-        // are `Malformed` too. Claimed handleless, a record rejected by them
-        // would sit `Applying` forever for a DELETE that was never sent. Plan
-        // time only requires the fields to be non-empty, so a stored volid can
-        // still be malformed by the time it is applied.
-        if matches!(action.op.as_str(), "delete_backup" | "delete_iso") {
-            let volid = action.volid.as_deref().unwrap_or_default();
-            if let Err(error) = rust_proxmoxmcp_core::guests::validate_volid(volid) {
-                return tool_error(format!(
-                    "{} action carries an unusable volid: {error}",
-                    action.op
-                ));
-            }
-            if action.storage.as_deref().unwrap_or_default().is_empty()
-                || action
-                    .storage_node
-                    .as_deref()
-                    .unwrap_or_default()
-                    .is_empty()
-            {
-                return tool_error(format!(
-                    "{} action is missing storage or storage_node; an older change set may \
-                     predate the field, and it cannot be applied without it",
-                    action.op
-                ));
-            }
+        // Defense-in-depth: validate volid content kind again at apply time,
+        // BEFORE the apply-intent evidence write. Plan-time validation is the
+        // primary gate, but this catches any change-set record that bypassed it
+        // (imported, manually crafted, or created before the fix shipped).
+        // Returned via tool_error so this failure is definitive and writes a
+        // failure receipt, rather than being classified as indeterminate and
+        // leaving the chain at intent with no outcome.
+        // An incomplete record is refused here rather than inside
+        // `execute_destructive`, which reports a missing field as `Malformed`
+        // -- non-definitive, so it would write apply intent and then emit no
+        // outcome at all. Refusing before the intent write keeps the failure
+        // definitive and the trail honest. It also means the volid checks below
+        // cannot be silently skipped by an action that simply omits the fields
+        // they read.
+        let absent = missing_required_fields(&action);
+        if !absent.is_empty() {
+            return tool_error(format!(
+                "the change set records a '{}' action without {}; it cannot be applied. \
+                 This action predates the field being required, or was imported. \
+                 Plan the operation again with plan_proxmox_destroy and have the new \
+                 change set approved -- the incomplete record stays approved but \
+                 unapplied, and nothing was sent to the cluster.",
+                action.op,
+                absent.join(", ")
+            ));
         }
 
-        // Claim the change set before anything reaches the device.
-        //
-        // The hand-rolled version of this wrote `Applying` with
-        // `update_change_set`, which mecmcp now refuses: reading `Approved` and
-        // writing `Applying` are two operations, and two applies could both
-        // pass the check and both execute. `claim_change_set_for_apply` does
-        // both under one lock, so exactly one gets through.
-        //
-        // `ApplyHandle::None` for `guest_exec`, and it is not a detail.
-        // Everything else here ends in a UPID, and the window between Proxmox
-        // accepting the work and this process seeing the result is closed by
-        // persisting that handle. `guest_exec` has no handle until it returns,
-        // so a lost response would otherwise leave the record claimable and the
-        // command re-runnable. Marked handleless, it stays `Applying` across a
-        // restart instead of being settled as `Failed` — the honest state, since
-        // only the guest knows whether the command ran, and the one that keeps
-        // the approval spent.
+        match action.op.as_str() {
+            "delete_backup" | "delete_iso" => {
+                // Guaranteed present by the check above; matched rather than
+                // unwrapped so a future edit to that check cannot panic here.
+                let (Some(volid), Some(storage)) = (&action.volid, &action.storage) else {
+                    return tool_error(format!(
+                        "'{}' passed the required-field check without volid and storage",
+                        action.op
+                    ));
+                };
+                let expected_kind = match action.op.as_str() {
+                    "delete_backup" => "backup",
+                    "delete_iso" => "iso",
+                    _ => unreachable!(),
+                };
+                if let Err(error) = rust_proxmoxmcp_core::guests::validate_volid_for_operation(
+                    volid,
+                    storage,
+                    expected_kind,
+                ) {
+                    return tool_error(format!("volid validation failed at apply: {error}"));
+                }
+            }
+            "restore_backup" => {
+                let Some(volid) = &action.volid else {
+                    return tool_error(format!(
+                        "'{}' passed the required-field check without volid",
+                        action.op
+                    ));
+                };
+                if let Err(error) =
+                    rust_proxmoxmcp_core::guests::validate_volid_kind(volid, "backup")
+                {
+                    return tool_error(format!("volid validation failed at apply: {error}"));
+                }
+            }
+            _ => {} // Other operations don't use volids
+        }
+
+        // Both guards above run before the claim *and* before the intent
+        // write. #71 placed its checks ahead of the claim and #73 placed its
+        // ahead of the evidence intent, each guarding the irreversible step it
+        // knew about; ordering all validation first satisfies both, and neither
+        // has anything invested in being second.
+
         // Which operations end in a handle this process can re-probe.
         //
         // `guest_exec` never does — the agent returns a PID inside the guest.
@@ -3596,6 +3679,27 @@ impl ProxmoxServer {
                 return tool_error(format!("could not claim the change set for apply: {error}"));
             }
         };
+
+        // A guest is about to be destroyed. This is written -- and, with a spool
+        // attached, persisted -- *before* the DELETE goes out, and refused if it
+        // cannot be. The apply path does not go through `commit_operation`, so
+        // nothing else emits it: without this, an approved destroy completes
+        // with proposal and approval on the record and no execution evidence at
+        // all. A guest destroyed with no record that anyone tried is the exact
+        // state this chain exists to rule out, and `purge` makes it permanent.
+        if let Some(recorder) = &self.evidence
+            && let Err(error) = recorder.apply_intent(
+                &apply_request_id,
+                &record.id,
+                &record.device,
+                &apply_principal,
+            )
+        {
+            return tool_error(format!(
+                "destroy refused: the apply-intent evidence record could not be persisted \
+                 ({error}); the change set is still approved and can be retried"
+            ));
+        }
 
         let upid_str = match self
             .execute_destructive(client, &action, guest.r#type, &state.node, args.vmid)
@@ -4512,6 +4616,124 @@ mod destructive_scope_tests {
         };
         let error = build_destroy_action(&args).expect_err("storage_node is required");
         assert!(error.contains("storage_node"), "{error}");
+    }
+    /// An incomplete record must be named as incomplete, not carried past the
+    /// apply-intent write.
+    ///
+    /// `execute_destructive` reports an absent field as `ProxmoxError::Malformed`,
+    /// which is not in the `definitive` set, so reaching it means apply intent
+    /// is written and no result receipt ever follows -- the chain reads as
+    /// "may have been sent" for an operation that never left the process.
+    ///
+    /// This covers the classifier only. The apply path itself needs a
+    /// coordinator and a client, so the ordering against the intent write is
+    /// held by the call site rather than by this test.
+    #[test]
+    fn a_volume_action_without_its_storage_node_is_named_incomplete() {
+        let mut incomplete = action("delete_backup", None, Some("local:backup/x"));
+        incomplete.storage_node = None;
+        assert_eq!(
+            super::missing_required_fields(&incomplete),
+            vec!["storage_node"]
+        );
+    }
+
+    /// An empty string is not a value. `build_destroy_action` filters empty
+    /// strings out at plan time, so an action carrying one was never planned by
+    /// this version -- and treating it as present sends it to `expand_path`,
+    /// which rejects the empty segment as `Malformed` after the intent write.
+    ///
+    /// The `None`-only drift guard below did not catch this; empty and absent
+    /// have to be tested separately.
+    #[test]
+    fn an_empty_required_field_counts_as_missing() {
+        let mut empty = action("delete_snapshot", Some(""), None);
+        assert_eq!(super::missing_required_fields(&empty), vec!["snapname"]);
+
+        empty = action("delete_backup", None, Some("local:backup/x"));
+        empty.storage_node = Some(String::new());
+        assert_eq!(super::missing_required_fields(&empty), vec!["storage_node"]);
+    }
+
+    /// The same defect reaches every operation with a required field, not just
+    /// the volume ones the volid work was about.
+    #[test]
+    fn a_snapshot_action_without_its_snapname_is_named_incomplete() {
+        let incomplete = action("delete_snapshot", None, None);
+        assert_eq!(
+            super::missing_required_fields(&incomplete),
+            vec!["snapname"]
+        );
+
+        let incomplete = action("rollback_snapshot", None, None);
+        assert_eq!(
+            super::missing_required_fields(&incomplete),
+            vec!["snapname"]
+        );
+    }
+
+    /// Every absent field is reported at once, so an operator fixing a record
+    /// is not sent round the loop one field at a time.
+    #[test]
+    fn every_absent_field_is_reported_together() {
+        let mut incomplete = action("delete_iso", None, None);
+        incomplete.storage = None;
+        incomplete.storage_node = None;
+        assert_eq!(
+            super::missing_required_fields(&incomplete),
+            vec!["storage", "volid", "storage_node"]
+        );
+    }
+
+    /// A complete action, and one that needs no extra fields, must pass.
+    #[test]
+    fn a_complete_action_is_not_reported_as_incomplete() {
+        assert!(
+            super::missing_required_fields(&action("delete_backup", None, Some("local:backup/x")))
+                .is_empty()
+        );
+        assert!(
+            super::missing_required_fields(&action("restore_backup", None, Some("local:backup/x")))
+                .is_empty()
+        );
+        assert!(
+            super::missing_required_fields(&action("delete_snapshot", Some("s"), None)).is_empty()
+        );
+        // 0.3 spelled it `destroy`; both spellings name the guest and nothing else.
+        assert!(super::missing_required_fields(&action("destroy_guest", None, None)).is_empty());
+        assert!(super::missing_required_fields(&action("destroy", None, None)).is_empty());
+    }
+
+    /// Anything `build_destroy_action` requires at plan time, the apply-time
+    /// check must also require -- otherwise a record planned by a future
+    /// version could strand the chain the same way. Drift guard.
+    #[test]
+    fn the_apply_check_requires_what_planning_requires() {
+        for (op, required) in [
+            ("destroy_guest", &[][..]),
+            ("delete_snapshot", &["snapname"][..]),
+            ("rollback_snapshot", &["snapname"][..]),
+            ("delete_backup", &["storage", "volid", "storage_node"][..]),
+            ("delete_iso", &["storage", "volid", "storage_node"][..]),
+            ("restore_backup", &["volid"][..]),
+            ("guest_exec", &["command"][..]),
+        ] {
+            let stripped = super::change_set::DestroyAction {
+                op: op.to_owned(),
+                cluster: "pve3".to_owned(),
+                vmid: 617,
+                snapname: None,
+                storage: None,
+                volid: None,
+                storage_node: None,
+                command: None,
+            };
+            assert_eq!(
+                super::missing_required_fields(&stripped),
+                required.to_vec(),
+                "{op} disagrees with what planning requires"
+            );
+        }
     }
 }
 

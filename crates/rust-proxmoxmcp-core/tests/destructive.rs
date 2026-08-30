@@ -7,6 +7,7 @@
 use rust_proxmoxmcp_core::client::ProxmoxClient;
 use rust_proxmoxmcp_core::guests::{
     delete_snapshot, delete_volume, destroy_vm, restore_backup, rollback_snapshot,
+    validate_volid_for_operation, validate_volid_kind,
 };
 use rust_proxmoxmcp_core::selector::GuestType;
 use rust_proxmoxmcp_core::testing::{Route, TlsMockServer, cluster_for};
@@ -239,5 +240,180 @@ async fn a_restore_without_force_says_so() {
     assert!(
         recorded.last().expect("request").body.contains("force=0"),
         "force must be sent explicitly, not omitted and defaulted by Proxmox"
+    );
+}
+
+#[test]
+fn validate_volid_accepts_matching_backup_kind() {
+    let result =
+        validate_volid_for_operation("local:backup/vzdump-lxc-950.tar.zst", "local", "backup");
+    assert!(result.is_ok(), "valid backup volid should pass: {result:?}");
+}
+
+#[test]
+fn validate_volid_accepts_matching_iso_kind() {
+    let result = validate_volid_for_operation("local:iso/debian-13.iso", "local", "iso");
+    assert!(result.is_ok(), "valid iso volid should pass: {result:?}");
+}
+
+#[test]
+fn validate_volid_refuses_backup_when_expecting_iso() {
+    let result =
+        validate_volid_for_operation("local:backup/vzdump-lxc-950.tar.zst", "local", "iso");
+    assert!(
+        result.is_err(),
+        "backup volid should be refused when expecting iso"
+    );
+    let error = result.expect_err("expected error");
+    assert!(
+        matches!(
+            error,
+            rust_proxmoxmcp_core::error::ProxmoxError::Malformed(_)
+        ),
+        "expected Malformed, got {error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("backup") && message.contains("iso"),
+        "error should mention both kinds: {message}"
+    );
+}
+
+#[test]
+fn validate_volid_refuses_iso_when_expecting_backup() {
+    let result = validate_volid_for_operation("local:iso/debian-13.iso", "local", "backup");
+    assert!(
+        result.is_err(),
+        "iso volid should be refused when expecting backup"
+    );
+    let error = result.expect_err("expected error");
+    assert!(
+        matches!(
+            error,
+            rust_proxmoxmcp_core::error::ProxmoxError::Malformed(_)
+        ),
+        "expected Malformed, got {error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("iso") && message.contains("backup"),
+        "error should mention both kinds: {message}"
+    );
+}
+
+#[test]
+fn validate_volid_refuses_storage_prefix_mismatch() {
+    let result = validate_volid_for_operation(
+        "local:backup/vzdump-lxc-950.tar.zst",
+        "nas-backup",
+        "backup",
+    );
+    assert!(
+        result.is_err(),
+        "volid with mismatched storage prefix should be refused"
+    );
+    let error = result.expect_err("expected error");
+    assert!(
+        matches!(
+            error,
+            rust_proxmoxmcp_core::error::ProxmoxError::Malformed(_)
+        ),
+        "expected Malformed, got {error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("local") && message.contains("nas-backup"),
+        "error should mention both storage names: {message}"
+    );
+}
+
+#[test]
+fn validate_volid_refuses_malformed_volid_no_colon() {
+    let result = validate_volid_for_operation("backup/vzdump.tar.zst", "local", "backup");
+    assert!(result.is_err(), "volid without colon should be refused");
+    assert!(
+        matches!(
+            result.expect_err("expected error"),
+            rust_proxmoxmcp_core::error::ProxmoxError::Malformed(_)
+        ),
+        "expected Malformed"
+    );
+}
+
+#[test]
+fn validate_volid_refuses_malformed_volid_no_slash() {
+    let result = validate_volid_for_operation("local:vzdump.tar.zst", "local", "backup");
+    assert!(result.is_err(), "volid without slash should be refused");
+    let error = result.expect_err("expected error");
+    assert!(
+        matches!(
+            error,
+            rust_proxmoxmcp_core::error::ProxmoxError::Malformed(_)
+        ),
+        "expected Malformed, got {error:?}"
+    );
+}
+
+#[test]
+fn validate_volid_refuses_empty_volid() {
+    let result = validate_volid_for_operation("", "local", "backup");
+    assert!(result.is_err(), "empty volid should be refused");
+    assert!(
+        matches!(
+            result.expect_err("expected error"),
+            rust_proxmoxmcp_core::error::ProxmoxError::Malformed(_)
+        ),
+        "expected Malformed"
+    );
+}
+
+#[test]
+fn validate_volid_refuses_path_traversal() {
+    let result = validate_volid_for_operation("local:backup/../etc/passwd", "local", "backup");
+    assert!(
+        result.is_err(),
+        "volid with .. should be refused for traversal protection"
+    );
+    assert!(
+        matches!(
+            result.expect_err("expected error"),
+            rust_proxmoxmcp_core::error::ProxmoxError::Malformed(_)
+        ),
+        "expected Malformed"
+    );
+}
+
+/// A volid's storage and name components must actually name something.
+///
+/// `storage:kind/name` was parsed for its `kind` alone, and the other two
+/// components were discarded unchecked -- so `:backup/x` and `local:backup/`
+/// both validated. Planning would then record and solicit approval for an
+/// operation that cannot address a volume.
+#[test]
+fn a_volid_with_an_empty_component_is_refused() {
+    for volid in [":backup/x", "local:backup/", ":backup/"] {
+        assert!(
+            validate_volid_kind(volid, "backup").is_err(),
+            "{volid} validated as a well-formed backup volid"
+        );
+    }
+
+    for (volid, storage) in [("local:iso/", "local"), (":iso/x", "")] {
+        assert!(
+            validate_volid_for_operation(volid, storage, "iso").is_err(),
+            "{volid} validated against storage {storage:?}"
+        );
+    }
+}
+
+/// The well-formed cases must keep passing -- the emptiness checks must not
+/// have narrowed what a real volid looks like.
+#[test]
+fn a_well_formed_volid_still_passes() {
+    assert!(validate_volid_kind("local:backup/vzdump-lxc-950.tar.zst", "backup").is_ok());
+    assert!(validate_volid_for_operation("local:iso/debian.iso", "local", "iso").is_ok());
+    assert!(
+        validate_volid_for_operation("nas-backup:backup/vzdump.tar.zst", "nas-backup", "backup")
+            .is_ok()
     );
 }
