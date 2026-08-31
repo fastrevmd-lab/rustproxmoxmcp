@@ -31,7 +31,7 @@ RUN install -d -m 0750 -o 65532 -g 65532 /stage-etc/proxmoxmcp \
 # Digest resolved on 2026-08-24 from gcr.io/distroless/cc-debian13:nonroot.
 # This is newer than the 2026-08-07 digest junos/mist share; they should be
 # updated to this digest to avoid drift.
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:a77defd6fedbb3392b175ba8ea3d1c22be963c1597c248c3ba987ddd80bfb512
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:c31ff9abcb1910f3ab25c7957bdaf0bfe12a01eb546e8df2282f1c8f682b606c
 LABEL org.opencontainers.image.source="https://github.com/fastrevmd-lab/rustproxmoxmcp"
 LABEL org.opencontainers.image.licenses="MIT"
 
