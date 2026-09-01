@@ -14,7 +14,7 @@
 
 ---
 
-## Status: 0.8.0 — the tool surface is complete but for two gaps
+## Status: 0.9.0 — the tool surface is complete but for two gaps
 
 **36 callable tools**: 17 read, 18 `low`, and `apply_proxmox_change_set` as the
 single `destructive` entry point. Seven further names --- `delete_vm`,
