@@ -7,12 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-01
+
+This is a **minor version** rather than a patch because claim-before-apply
+changes the semantics of the apply path. An operation is now claimed before
+sending the request, spending the approval before anything reaches the cluster.
+
+The approval digest change from mecmcp 0.23.0 does not invalidate any live
+approval on LXC 971 `prod-proxmoxmcp`. The only change set in state `Approved`
+on that deployment is a `probe-verify` / `probe-approver` test targeting guest
+640, and it expired 2026-08-26 22:19Z.
+
+### Security
+
+- **`delete_backup` and `delete_iso` are separately authorized tools, but both
+  dispatched to the same Proxmox endpoint.** Nothing tied the volid's content
+  kind to the tool being invoked, so a token holding only `delete_iso` could
+  pass `local:backup/vzdump-lxc-950.tar.zst` and delete a backup. The preview
+  an approver reads calls it an ISO and says "It can be downloaded again",
+  which is false for a backup.
+- **Nothing bound the volid's storage prefix to the `storage` parameter**, so
+  the two could name different backends.
+- Both are now validated at plan time via `validate_volid_for_operation`, which
+  checks content kind *and* binds the storage prefix to the `storage` argument.
+  A mismatched volid never reaches an approver. A defence-in-depth check also
+  runs at apply for records that predate this fix, placed *before* the
+  apply-intent evidence write so a refusal does not leave the evidence chain at
+  intent with no outcome for an operation that never left the process.
+- **The apply-time check only fired when the fields it reads were present**,
+  leaving the same hole it was written to close. An action carrying neither
+  volid nor storage would reach `execute_destructive`, where a `missing` error
+  produces `Malformed` after apply intent has been written. No result receipt
+  follows, and the trail reads "the request may have been sent, go and look"
+  for an operation that never left the process.
+- `missing_required_fields` now names every field an operation needs, checked
+  before the intent write and returned through `tool_error` so the refusal is
+  definitive. It covers `snapname` too: `delete_snapshot` and
+  `rollback_snapshot` strand the chain the same way. `build_destroy_action`
+  requires all of these at plan time, so a record planned by this version
+  cannot be incomplete -- the exposure is exactly the older, imported and
+  hand-written records the apply-time check exists for.
+- The validator treated `""` as present. `build_destroy_action` filters empty
+  strings at plan time, so an action carrying one was never planned by this
+  version -- and calling it present sends it to `expand_path`, which rejects
+  the empty segment as `Malformed`, landing in the same stranded-chain state.
+  Presence now means non-empty, matching planning.
+- Both volid validators parsed `storage:kind/name` for `kind` alone and
+  discarded the other two components unchecked, so `:backup/x`,
+  `local:backup/` and `local:iso/` all validated. An empty prefix is now
+  rejected *before* the storage comparison in `validate_volid_for_operation`,
+  because an empty `storage` argument would otherwise let `":iso/x"` bind to
+  nothing and read as a match. Planning could previously record and solicit
+  approval for a volid that cannot address a volume.
+
 ### Changed
 
 - Re-pinned the `mecmcp-*` crates from `v0.21.0` to `v0.23.0`. 0.23.0 binds a
   change set's preview digest into its approval digest, so an approval now
   vouches for the exact preview a reviewer saw. The coordinator refuses any
   write that would swap or drop a preview once an approval exists.
+- Dependabot will no longer attempt to bump the git-pinned `mecmcp-*` crates,
+  which was causing the weekly cargo run to fail. The mecmcp version is
+  deliberately moved by hand in a `chore/mecmcp-<version>` PR that re-pins
+  every file at once.
+- Updated `uuid` from 1.25.0 to 1.26.0.
+- Updated Rust builder image.
+- Updated distroless runtime base image.
 
 ### Fixed
 
@@ -23,9 +83,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   approved, previewless, carrying a v4 approval digest -- and confirms apply
   still refuses it. Verified by sabotage: with the guard disabled, the test
   fails.
-
-### Fixed
-
 - **A second apply of the same approved change set could issue a second
   destroy.** mecmcp 0.22.0 made `claim_change_set_for_apply` the only legal
   `Approved -> Applying` transition, but `apply_proxmox_change_set` still sent
@@ -68,6 +125,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `a/b` or a storage node of `..`. Caught after the claim it would strand the
   record in `Applying` with nothing sent; caught before it, the change set is
   simply refused.
+- Moved off the yanked `chacha20` 0.10.1. It arrives through `rand -> rmcp ->
+  mecmcp-server`, and `cargo-deny` fails the advisories check on a yanked
+  crate. This is a lockfile-only move; 0.10.2 satisfies the same requirement.
 
 ### Documentation
 
