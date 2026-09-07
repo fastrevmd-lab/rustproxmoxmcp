@@ -273,7 +273,7 @@ Run `rust-proxmoxmcp --help` for the complete list.
 
 ## Installation
 
-See [docs/HOW-TO-SETUP-LXC.md](docs/HOW-TO-SETUP-LXC.md) for step-by-step instructions on building a rust-proxmoxmcp LXC from scratch.
+See [docs/HOW-TO-SETUP-LXC.md](docs/HOW-TO-SETUP-LXC.md) for step-by-step instructions on building a rust-proxmoxmcp LXC from scratch. For Docker, see [docs/HOW-TO-SETUP-DOCKER.md](docs/HOW-TO-SETUP-DOCKER.md).
 
 `packaging/lxc/install.sh` is a POSIX installer targeting Debian 13 LXC. The installer:
 - Creates the `proxmoxmcp` system user
