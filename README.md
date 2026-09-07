@@ -273,7 +273,9 @@ Run `rust-proxmoxmcp --help` for the complete list.
 
 ## Installation
 
-See `packaging/lxc/install.sh` for a POSIX installer targeting Debian 13 LXC. The installer:
+See [docs/HOW-TO-SETUP-LXC.md](docs/HOW-TO-SETUP-LXC.md) for step-by-step instructions on building a rust-proxmoxmcp LXC from scratch.
+
+`packaging/lxc/install.sh` is a POSIX installer targeting Debian 13 LXC. The installer:
 - Creates the `proxmoxmcp` system user
 - Installs the binary to `/usr/local/bin/rust-proxmoxmcp`
 - Installs example config files to `/etc/proxmoxmcp` (mode 0600, owned by `proxmoxmcp`) **only if absent**
