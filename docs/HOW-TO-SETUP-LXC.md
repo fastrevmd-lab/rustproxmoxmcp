@@ -99,14 +99,14 @@ pct create 616 local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst \
     --cores 1 --memory 512 --swap 512 \
     --rootfs local-lvm:4 \
     --unprivileged 1 --features nesting=1 \
-    --net0 name=eth0,bridge=vmbr0,firewall=1,gw=192.168.1.1,ip=192.168.1.236/24,type=veth \
+    --net0 name=eth0,bridge=vmbr0,firewall=1,gw=192.0.2.1,ip=192.0.2.10/24,type=veth \
     --onboot 0 --ostype debian \
     --tags "disposable;test;twoperson"
 
 pct start 616
 ```
 
-For the lab-mode pair, substitute `617`, `test-labmode-proxmox`, `192.168.1.237`,
+For the lab-mode pair, substitute `617`, `test-labmode-proxmox`, `192.0.2.11`,
 and the tag `labmode`.
 
 512 MB and one core is enough. The tags matter: `disposable` is what marks a
@@ -200,7 +200,7 @@ ExecStart=/usr/local/bin/rust-proxmoxmcp \
     --host 0.0.0.0 \
     --port 30031 \
     --allow-insecure-bind \
-    --allowed-host 192.168.1.236 \
+    --allowed-host 192.0.2.10 \
     --allowed-host test-twoperson-proxmox:30031 \
     --audit-format json \
     --audit-log-file /var/lib/proxmoxmcp/audit.jsonl \
@@ -239,7 +239,7 @@ pid=$(pct exec 616 -- systemctl show -p MainPID --value rust-proxmoxmcp.service)
 pct exec 616 -- grep -E '^Seccomp' /proc/$pid/status                                      # Seccomp: 2
 
 # 4. it is serving, and refusing unauthenticated callers
-curl -s -o /dev/null -w '%{http_code}\n' -X POST http://192.168.1.236:30031/mcp \
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://192.0.2.10:30031/mcp \
      -H 'content-type: application/json' -d '{}'                                          # 401
 ```
 
