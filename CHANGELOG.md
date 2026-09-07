@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-06
+
+### Fixed
+
+- **The shipped systemd unit now sets `SystemCallErrorNumber=EPERM`**, so a denied
+  syscall returns `EPERM` rather than killing the server with `SIGSYS`. Without it,
+  systemd's default raises `SIGSYS` and terminates the process mid-request — which
+  is exactly what happened to `rustunifimcp` during a change-set state write
+  (mecmcp#351), and this server had the same exposure. An `EPERM` denial is silent
+  at the systemd layer; visibility depends on the application handling the errno
+  rather than discarding it. This brings the unit into compliance with the fleet
+  seccomp standard agreed in mecmcp#354.
+
 ## [0.9.0] - 2026-09-01
 
 This is a **minor version** rather than a patch because claim-before-apply
