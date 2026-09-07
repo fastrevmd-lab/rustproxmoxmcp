@@ -41,8 +41,14 @@ StateDirectoryMode=0700
 ReadWritePaths=/var/lib/proxmoxmcp
 
 # Seccomp filter and syscall restrictions
+# Without SystemCallErrorNumber=EPERM, systemd's default raises SIGSYS and kills the
+# process mid-request — which is exactly what happened to rustunifimcp during a
+# change-set state write (mecmcp#351), and this server had the same exposure.
+# An EPERM denial is silent at the systemd layer; visibility depends on the application
+# handling the errno rather than discarding it.
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @obsolete @mount @swap @reboot @module
+SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 
 # Drop all capabilities
