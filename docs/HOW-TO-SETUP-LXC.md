@@ -234,11 +234,13 @@ for (the addresses clients actually dial, e.g., `192.0.2.10` or
 
 `--allowed-origin` specifies trusted browser application origins (e.g.,
 `https://console.example.org`), checked against the `Origin` header. Mismatches
-return **403 FORBIDDEN**. Non-browser MCP clients (curl, SDK calls) send no
-`Origin` header and are unaffected. An off-loopback listener requires at least
-one `--allowed-origin` or the service refuses to start, even when no browser
-clients exist — use a placeholder like `https://console.example.org` in that
-case.
+return **403 FORBIDDEN**. Set it to the origin of the browser client that will
+call this server. An off-loopback listener requires at least one
+`--allowed-origin` or the service refuses to start; if there is no browser client
+yet, the value must still be present — any single well-formed origin satisfies
+that requirement with no effect on non-browser MCP clients (curl, SDK calls),
+which send no `Origin` header and are never matched. Replace it with the real
+client origin before a browser client is pointed at the server.
 
 Then:
 
@@ -334,8 +336,10 @@ where each file is expected, rather than assuming a default location.
 
 **`non-loopback bind '0.0.0.0' requires at least one --allowed-origin`**  
 An off-loopback listener must supply at least one `--allowed-origin`, even when
-no browser clients exist. Add a placeholder (e.g., `https://console.example.org`)
-to satisfy the startup requirement. The service refuses to start without it.
+no browser client exists yet. Any single well-formed origin (e.g.,
+`https://console.example.org`) satisfies the startup requirement with no effect
+on non-browser clients. Replace it with the real client origin before a browser
+client is pointed at the server.
 
 **Service active but every call returns 421 MISDIRECTED_REQUEST**  
 `--allowed-host` does not match the HTTP `Host` header (the address clients

@@ -135,15 +135,26 @@ Both are shown below. The second is what the examples here were verified with.
 
 ## 3. Run it — two-person mode
 
+Pin the image by **immutable digest**, not mutable tag. If the tag is republished,
+the same documented command runs different bytes with no visible change. Obtain
+the digest:
+
+```bash
+docker inspect ghcr.io/fastrevmd-lab/rust-proxmoxmcp:0.9.1 --format '{{index .RepoDigests 0}}'
+# ghcr.io/fastrevmd-lab/rust-proxmoxmcp@sha256:abcd1234...
+```
+
+Then use the digest in the run command, with the version tag as a comment:
+
 ```bash
 docker run -d --name proxmox-twoperson \
   --user "$(id -u):$(id -g)" \
-  -p 30033:30031 \
+  -p 127.0.0.1:30033:30031 \
   --entrypoint /usr/local/bin/rust-proxmoxmcp \
   -v "$PWD/clusters.json:/etc/proxmoxmcp/clusters.json:ro" \
   -v "$PWD/tokens.json:/var/lib/proxmoxmcp/tokens.json:ro" \
   -v "$PWD/secrets:/etc/proxmoxmcp/secrets:ro" \
-  ghcr.io/fastrevmd-lab/rust-proxmoxmcp:0.9.1 \
+  ghcr.io/fastrevmd-lab/rust-proxmoxmcp@sha256:abcd1234... `# 0.9.1` \
   --clusters-file /etc/proxmoxmcp/clusters.json \
   --tokens-file /var/lib/proxmoxmcp/tokens.json \
   --transport streamable-http --host 0.0.0.0 --port 30031 \
@@ -152,6 +163,10 @@ docker run -d --name proxmox-twoperson \
   --allowed-origin http://127.0.0.1:30033 --allowed-origin http://localhost:30033
 ```
 
+The `-p 127.0.0.1:30033:30031` publish binds only to loopback on the host.
+Reaching this server from another host requires TLS, not a wider publish — Host
+and Origin header validation is not a network boundary.
+
 Configuration files are mounted read-only. No state directory is mounted because
 this server persists change-set state only — there are no leases or staged
 transfers like the Junos server has.
@@ -159,17 +174,17 @@ transfers like the Junos server has.
 ## 4. Run it — lab mode
 
 Identical but for `--lab-mode`, and a different published port so both can run
-side by side:
+side by side. Use the same digest you obtained above:
 
 ```bash
 docker run -d --name proxmox-labmode \
   --user "$(id -u):$(id -g)" \
-  -p 30043:30031 \
+  -p 127.0.0.1:30043:30031 \
   --entrypoint /usr/local/bin/rust-proxmoxmcp \
   -v "$PWD/clusters.json:/etc/proxmoxmcp/clusters.json:ro" \
   -v "$PWD/tokens.json:/var/lib/proxmoxmcp/tokens.json:ro" \
   -v "$PWD/secrets:/etc/proxmoxmcp/secrets:ro" \
-  ghcr.io/fastrevmd-lab/rust-proxmoxmcp:0.9.1 \
+  ghcr.io/fastrevmd-lab/rust-proxmoxmcp@sha256:abcd1234... `# 0.9.1` \
   --clusters-file /etc/proxmoxmcp/clusters.json \
   --tokens-file /var/lib/proxmoxmcp/tokens.json \
   --transport streamable-http --host 0.0.0.0 --port 30031 \
