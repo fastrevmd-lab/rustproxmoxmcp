@@ -217,7 +217,7 @@ ExecStart=/usr/local/bin/rust-proxmoxmcp \
     --allow-insecure-bind \
     --allowed-host 192.0.2.10 \
     --allowed-host test-twoperson-proxmox:30031 \
-    --allowed-origin https://console.example.org \
+    --allowed-origin http://console.example.org \
     --audit-format json \
     --audit-log-file /var/lib/proxmoxmcp/audit.jsonl \
     --audit-journald
@@ -235,14 +235,16 @@ for (the addresses clients actually dial, e.g., `192.0.2.10` or
 **421 MISDIRECTED_REQUEST**.
 
 `--allowed-origin` specifies trusted browser application origins (e.g.,
-`https://console.example.org`), checked against the `Origin` header. Mismatches
+`http://console.example.org`), checked against the `Origin` header. Mismatches
 return **403 FORBIDDEN**. Set it to the origin of the browser client that will
-call this server. An off-loopback listener requires at least one
-`--allowed-origin` or the service refuses to start; if there is no browser client
-yet, the value must still be present — any single well-formed origin satisfies
-that requirement with no effect on non-browser MCP clients (curl, SDK calls),
-which send no `Origin` header and are never matched. Replace it with the real
-client origin before a browser client is pointed at the server.
+call this server. **The scheme must match the server's TLS configuration**: this
+plaintext lab drop-in takes `http://` origins; an HTTPS console origin requires
+`--tls-cert` and `--tls-key` on the listener. An off-loopback listener requires
+at least one `--allowed-origin` or the service refuses to start; if there is no
+browser client yet, the value must still be present — any single well-formed
+origin satisfies that requirement with no effect on non-browser MCP clients
+(curl, SDK calls), which send no `Origin` header and are never matched. Replace
+it with the real client origin before a browser client is pointed at the server.
 
 Then:
 
@@ -340,7 +342,7 @@ the empty seeded file if the legacy path holds the real store.
 **`non-loopback bind '0.0.0.0' requires at least one --allowed-origin`**  
 An off-loopback listener must supply at least one `--allowed-origin`, even when
 no browser client exists yet. Any single well-formed origin (e.g.,
-`https://console.example.org`) satisfies the startup requirement with no effect
+`http://console.example.org`) satisfies the startup requirement with no effect
 on non-browser clients. Replace it with the real client origin before a browser
 client is pointed at the server.
 
@@ -350,5 +352,5 @@ actually dial). Add the exact host and port they use.
 
 **Browser requests return 403 FORBIDDEN, "Origin '...' is not allowed"**  
 The browser's `Origin` header is not in the `--allowed-origin` allowlist. Add the
-browser application's origin (e.g., `https://console.example.org`). Non-browser
+browser application's origin (e.g., `http://console.example.org`). Non-browser
 MCP clients are unaffected.
