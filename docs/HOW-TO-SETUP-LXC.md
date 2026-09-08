@@ -25,9 +25,12 @@ You need:
 - A Proxmox node, a container template, and a free VMID and IP.
 - **The credentials the server will use.** Four files: `clusters.json`,
   `tokens.json`, `mcp-rig.secret`, and a per-cluster token file in
-  `secrets/<cluster>.token`. Building the container is the easy part; these are
-  the part you cannot regenerate. If you are rebuilding an existing rig, back
-  them up first — see [Rebuilding](#rebuilding-an-existing-rig).
+  `secrets/<cluster>.token`. The token store lives at
+  `/var/lib/proxmoxmcp/tokens.json` by default (or
+  `/etc/proxmoxmcp/tokens.json` on pre-0.9.0 rigs, a legacy fallback the runtime
+  still recognizes). Building the container is the easy part; these are the part
+  you cannot regenerate. If you are rebuilding an existing rig, back them up
+  first — see [Rebuilding](#rebuilding-an-existing-rig).
 
 Check the template is present:
 
@@ -129,18 +132,26 @@ configuration, and it says so.
 
 ```
 /etc/proxmoxmcp/clusters.json
-/etc/proxmoxmcp/tokens.json
+/var/lib/proxmoxmcp/tokens.json
 /etc/proxmoxmcp/mcp-rig.secret
 /etc/proxmoxmcp/secrets/<cluster>.token
 ```
+
+The token store's canonical location is `/var/lib/proxmoxmcp/tokens.json` (the
+installer seeds an empty store there). The runtime still recognizes
+`/etc/proxmoxmcp/tokens.json` as a legacy fallback, **but only when the
+canonical store does not exist**. Restoring to the wrong path produces an empty
+token store: the service loads the seeded canonical file and rejects every
+existing bearer token.
 
 Two real failures happened here during the rebuild this document is written from:
 
 1. `configuration error: file /etc/proxmoxmcp/mcp-rig.secret: No such file or directory`
    — that file was not restored.
-2. `token file /etc/proxmoxmcp/tokens.json: No such file or directory` even
-   though `tokens.json` existed at `/var/lib/proxmoxmcp/tokens.json` — because
-   the drop-in's `--tokens-file` points at `/etc/proxmoxmcp/`.
+2. `token file /var/lib/proxmoxmcp/tokens.json: No such file or directory` even
+   though `tokens.json` existed at `/etc/proxmoxmcp/tokens.json` — because the
+   drop-in's `--tokens-file` points at `/var/lib/proxmoxmcp/` and the legacy
+   fallback only reads `/etc` when the canonical store is absent.
 
 **Read the drop-in first to learn where it expects each file**, rather than
 assuming a default location. Restore everything before the first start.
@@ -149,7 +160,7 @@ Place the credentials:
 
 ```bash
 pct push 616 clusters.json        /etc/proxmoxmcp/clusters.json
-pct push 616 tokens.json          /etc/proxmoxmcp/tokens.json
+pct push 616 tokens.json          /var/lib/proxmoxmcp/tokens.json
 pct push 616 mcp-rig.secret       /etc/proxmoxmcp/mcp-rig.secret
 pct push 616 pve3.token           /etc/proxmoxmcp/secrets/pve3.token
 ```
@@ -162,9 +173,11 @@ checks them one at a time — so getting this wrong costs you one restart per fi
 pct exec 616 -- bash -lc '
     install -d -o proxmoxmcp -g proxmoxmcp -m 0700 /etc/proxmoxmcp/secrets
     chown -R proxmoxmcp:proxmoxmcp /etc/proxmoxmcp
-    for f in clusters.json tokens.json mcp-rig.secret secrets/*.token; do
+    chown -R proxmoxmcp:proxmoxmcp /var/lib/proxmoxmcp
+    for f in clusters.json mcp-rig.secret secrets/*.token; do
         [ -f "/etc/proxmoxmcp/$f" ] && chmod 0600 "/etc/proxmoxmcp/$f"
     done
+    [ -f /var/lib/proxmoxmcp/tokens.json ] && chmod 0600 /var/lib/proxmoxmcp/tokens.json
 '
 ```
 
@@ -201,9 +214,8 @@ ExecStart=/usr/local/bin/rust-proxmoxmcp \
     --port 30031 \
     --allow-insecure-bind \
     --allowed-host 192.0.2.10 \
-    --allowed-origin http://192.0.2.10:30031 \
     --allowed-host test-twoperson-proxmox:30031 \
-    --allowed-origin http://test-twoperson-proxmox:30031 \
+    --allowed-origin https://console.example.org \
     --audit-format json \
     --audit-log-file /var/lib/proxmoxmcp/audit.jsonl \
     --audit-journald
@@ -215,10 +227,18 @@ new one.
 **For lab mode, add `--lab-mode` to the `ExecStart` line.** That single flag is
 the whole difference between the two rigs.
 
-Point `--allowed-host` and `--allowed-origin` at that rig's own address — both
-must move in lockstep, and an off-loopback listener requires both or the service
-refuses to start. They must track whatever clients actually dial, or requests
-are refused with 421.
+`--allowed-host` specifies the HTTP **Host** authorities the server will answer
+for (the addresses clients actually dial, e.g., `192.0.2.10` or
+`test-twoperson-proxmox:30031`). Requests to other addresses are refused with
+**421 MISDIRECTED_REQUEST**.
+
+`--allowed-origin` specifies trusted browser application origins (e.g.,
+`https://console.example.org`), checked against the `Origin` header. Mismatches
+return **403 FORBIDDEN**. Non-browser MCP clients (curl, SDK calls) send no
+`Origin` header and are unaffected. An off-loopback listener requires at least
+one `--allowed-origin` or the service refuses to start, even when no browser
+clients exist — use a placeholder like `https://console.example.org` in that
+case.
 
 Then:
 
@@ -281,14 +301,17 @@ stopped container's filesystem without starting it:
 
 ```bash
 pct mount 616
-cp -a /var/lib/lxc/616/rootfs/etc/proxmoxmcp        /root/backup-616/
+cp -a /var/lib/lxc/616/rootfs/etc/proxmoxmcp           /root/backup-616/etc-proxmoxmcp
+cp -a /var/lib/lxc/616/rootfs/var/lib/proxmoxmcp      /root/backup-616/var-lib-proxmoxmcp
 cp -a /var/lib/lxc/616/rootfs/etc/systemd/system/rust-proxmoxmcp.service.d /root/backup-616/
 pct config 616 > /root/backup-616/pct-config.txt
 pct unmount 616
 ```
 
 `pct-config.txt` is worth keeping: it is the network, resources and tags you will
-want to reproduce.
+want to reproduce. Back up **both** `/etc/proxmoxmcp` and `/var/lib/proxmoxmcp`:
+the token store is at `/var/lib`, and a legacy `/etc/proxmoxmcp/tokens.json`
+left behind would shadow it on a rebuild.
 
 Restoring `tokens.json` rather than minting fresh tokens keeps existing clients
 working — the secrets are hashed and cannot be recovered, so re-minting means
@@ -302,17 +325,23 @@ Both of these were hit during the rebuild this document is written from.
 That file was not restored. Step 5 names all four required files. Missing even
 one prevents startup.
 
-**`token file /etc/proxmoxmcp/tokens.json: No such file or directory`**  
-Even though `tokens.json` existed at `/var/lib/proxmoxmcp/tokens.json`, the
-drop-in's `--tokens-file` points at `/etc/proxmoxmcp/`. Read the drop-in first
-to learn where each file is expected, rather than assuming a default location.
+**`token file /var/lib/proxmoxmcp/tokens.json: No such file or directory`**  
+Even though `tokens.json` existed at `/etc/proxmoxmcp/tokens.json`, the drop-in's
+`--tokens-file` points at `/var/lib/proxmoxmcp/` and the legacy `/etc` fallback
+only reads when the canonical store is absent. The installer seeds an empty store
+at `/var/lib`, which shadows the legacy path. Read the drop-in first to learn
+where each file is expected, rather than assuming a default location.
 
 **`non-loopback bind '0.0.0.0' requires at least one --allowed-origin`**  
-An off-loopback listener must supply both `--allowed-host` and `--allowed-origin`.
-Add an `--allowed-origin` line for each `--allowed-host`, using the full URL
-including scheme and port (e.g., `http://192.0.2.10:30031`). The service refuses
-to start without it.
+An off-loopback listener must supply at least one `--allowed-origin`, even when
+no browser clients exist. Add a placeholder (e.g., `https://console.example.org`)
+to satisfy the startup requirement. The service refuses to start without it.
 
-**Service active but every call returns 421**  
-`--allowed-host` does not match the address clients dial. Add the exact host and
-port they use.
+**Service active but every call returns 421 MISDIRECTED_REQUEST**  
+`--allowed-host` does not match the HTTP `Host` header (the address clients
+actually dial). Add the exact host and port they use.
+
+**Browser requests return 403 FORBIDDEN, "Origin '...' is not allowed"**  
+The browser's `Origin` header is not in the `--allowed-origin` allowlist. Add the
+browser application's origin (e.g., `https://console.example.org`). Non-browser
+MCP clients are unaffected.
