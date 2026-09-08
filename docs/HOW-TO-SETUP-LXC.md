@@ -164,7 +164,7 @@ Place the credentials:
 pct push 616 clusters.json        /etc/proxmoxmcp/clusters.json
 pct push 616 tokens.json          /var/lib/proxmoxmcp/tokens.json
 pct push 616 mcp-rig.secret       /etc/proxmoxmcp/mcp-rig.secret
-pct push 616 pve3.token           /etc/proxmoxmcp/secrets/pve3.token
+pct push 616 example-cluster.token /etc/proxmoxmcp/secrets/example-cluster.token
 ```
 
 Then fix ownership and modes. **Do this for every credential file at once.** The
