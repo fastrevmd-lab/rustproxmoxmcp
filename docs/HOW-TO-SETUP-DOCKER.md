@@ -136,15 +136,18 @@ Both are shown below. The second is what the examples here were verified with.
 ## 3. Run it — two-person mode
 
 Pin the image by **immutable digest**, not mutable tag. If the tag is republished,
-the same documented command runs different bytes with no visible change. Obtain
-the digest:
+the same documented command runs different bytes with no visible change. Pull the
+image first (RepoDigests is empty if the image has not been pulled), then capture
+the complete pinned reference:
 
 ```bash
-docker inspect ghcr.io/fastrevmd-lab/rust-proxmoxmcp:0.9.1 --format '{{index .RepoDigests 0}}'
-# ghcr.io/fastrevmd-lab/rust-proxmoxmcp@sha256:abcd1234...
+docker pull ghcr.io/fastrevmd-lab/rust-proxmoxmcp:0.9.1
+image=$(docker inspect ghcr.io/fastrevmd-lab/rust-proxmoxmcp:0.9.1 \
+    --format '{{index .RepoDigests 0}}')
 ```
 
-Then use the digest in the run command, with the version tag as a comment:
+The resolved digest should be recorded wherever the deployment is tracked, since
+that value identifies the exact bytes.
 
 ```bash
 docker run -d --name proxmox-twoperson \
@@ -154,7 +157,7 @@ docker run -d --name proxmox-twoperson \
   -v "$PWD/clusters.json:/etc/proxmoxmcp/clusters.json:ro" \
   -v "$PWD/tokens.json:/var/lib/proxmoxmcp/tokens.json:ro" \
   -v "$PWD/secrets:/etc/proxmoxmcp/secrets:ro" \
-  ghcr.io/fastrevmd-lab/rust-proxmoxmcp@sha256:abcd1234... `# 0.9.1` \
+  "$image" \
   --clusters-file /etc/proxmoxmcp/clusters.json \
   --tokens-file /var/lib/proxmoxmcp/tokens.json \
   --transport streamable-http --host 0.0.0.0 --port 30031 \
@@ -174,7 +177,7 @@ transfers like the Junos server has.
 ## 4. Run it — lab mode
 
 Identical but for `--lab-mode`, and a different published port so both can run
-side by side. Use the same digest you obtained above:
+side by side. Use the same `$image` variable captured above:
 
 ```bash
 docker run -d --name proxmox-labmode \
@@ -184,7 +187,7 @@ docker run -d --name proxmox-labmode \
   -v "$PWD/clusters.json:/etc/proxmoxmcp/clusters.json:ro" \
   -v "$PWD/tokens.json:/var/lib/proxmoxmcp/tokens.json:ro" \
   -v "$PWD/secrets:/etc/proxmoxmcp/secrets:ro" \
-  ghcr.io/fastrevmd-lab/rust-proxmoxmcp@sha256:abcd1234... `# 0.9.1` \
+  "$image" \
   --clusters-file /etc/proxmoxmcp/clusters.json \
   --tokens-file /var/lib/proxmoxmcp/tokens.json \
   --transport streamable-http --host 0.0.0.0 --port 30031 \
