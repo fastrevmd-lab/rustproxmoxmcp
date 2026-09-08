@@ -148,10 +148,12 @@ Two real failures happened here during the rebuild this document is written from
 
 1. `configuration error: file /etc/proxmoxmcp/mcp-rig.secret: No such file or directory`
    — that file was not restored.
-2. `token file /var/lib/proxmoxmcp/tokens.json: No such file or directory` even
-   though `tokens.json` existed at `/etc/proxmoxmcp/tokens.json` — because the
-   drop-in's `--tokens-file` points at `/var/lib/proxmoxmcp/` and the legacy
-   fallback only reads `/etc` when the canonical store is absent.
+2. The service started cleanly but rejected every bearer token with no file
+   error, because the real `tokens.json` was restored to
+   `/etc/proxmoxmcp/tokens.json` while `install.sh` had already seeded an empty
+   store at `/var/lib/proxmoxmcp/tokens.json`. The canonical store exists, so it
+   shadows the legacy path — the runtime never falls back to `/etc`, and the
+   server loads zero tokens.
 
 **Read the drop-in first to learn where it expects each file**, rather than
 assuming a default location. Restore everything before the first start.
@@ -312,8 +314,8 @@ pct unmount 616
 
 `pct-config.txt` is worth keeping: it is the network, resources and tags you will
 want to reproduce. Back up **both** `/etc/proxmoxmcp` and `/var/lib/proxmoxmcp`:
-the token store is at `/var/lib`, and a legacy `/etc/proxmoxmcp/tokens.json`
-left behind would shadow it on a rebuild.
+the token store is at `/var/lib`, and a rebuild seeds an empty canonical store
+there that shadows any legacy `/etc/proxmoxmcp/tokens.json` left behind.
 
 Restoring `tokens.json` rather than minting fresh tokens keeps existing clients
 working — the secrets are hashed and cannot be recovered, so re-minting means
@@ -327,12 +329,13 @@ Both of these were hit during the rebuild this document is written from.
 That file was not restored. Step 5 names all four required files. Missing even
 one prevents startup.
 
-**`token file /var/lib/proxmoxmcp/tokens.json: No such file or directory`**  
-Even though `tokens.json` existed at `/etc/proxmoxmcp/tokens.json`, the drop-in's
-`--tokens-file` points at `/var/lib/proxmoxmcp/` and the legacy `/etc` fallback
-only reads when the canonical store is absent. The installer seeds an empty store
-at `/var/lib`, which shadows the legacy path. Read the drop-in first to learn
-where each file is expected, rather than assuming a default location.
+**Service starts cleanly but rejects every bearer token, no file error**  
+The token store was restored to `/etc/proxmoxmcp/tokens.json`, but `install.sh`
+seeded an empty store at `/var/lib/proxmoxmcp/tokens.json`. The canonical store
+exists, so it shadows the legacy `/etc` path — the runtime never falls back, and
+the server loads zero tokens. Symptom: authentication rejected with no "no such
+file" error. Restore `tokens.json` to `/var/lib/proxmoxmcp/` instead, or remove
+the empty seeded file if the legacy path holds the real store.
 
 **`non-loopback bind '0.0.0.0' requires at least one --allowed-origin`**  
 An off-loopback listener must supply at least one `--allowed-origin`, even when

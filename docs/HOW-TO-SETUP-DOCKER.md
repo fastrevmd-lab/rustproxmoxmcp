@@ -147,7 +147,10 @@ image=$(docker inspect ghcr.io/fastrevmd-lab/rust-proxmoxmcp:0.9.1 \
 ```
 
 The resolved digest should be recorded wherever the deployment is tracked, since
-that value identifies the exact bytes.
+that value identifies the exact bytes. On subsequent runs, use the recorded
+digest directly (`image=ghcr.io/...@sha256:<recorded digest>`) or compare the
+freshly resolved one against it and stop on mismatch — re-resolving the tag runs
+whatever that tag points at today, which may be different bytes.
 
 ```bash
 docker run -d --name proxmox-twoperson \
@@ -167,8 +170,11 @@ docker run -d --name proxmox-twoperson \
 ```
 
 The `-p 127.0.0.1:30033:30031` publish binds only to loopback on the host.
-Reaching this server from another host requires TLS, not a wider publish — Host
-and Origin header validation is not a network boundary.
+Reaching this server from another host requires BOTH a non-loopback publish
+(`-p 30033:30031` or `-p 0.0.0.0:30033:30031`) AND TLS with the allow-lists
+updated to the externally dialled authority, or a TLS-terminating reverse proxy
+in front of the loopback endpoint — Host and Origin header validation is not a
+network boundary.
 
 Configuration files are mounted read-only. No state directory is mounted because
 this server persists change-set state only — there are no leases or staged
