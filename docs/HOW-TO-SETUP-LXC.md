@@ -193,7 +193,7 @@ pct exec 616 -- mkdir -p /etc/systemd/system/rust-proxmoxmcp.service.d
 ExecStart=
 ExecStart=/usr/local/bin/rust-proxmoxmcp \
     --clusters-file /etc/proxmoxmcp/clusters.json \
-    --tokens-file /etc/proxmoxmcp/tokens.json \
+    --tokens-file /var/lib/proxmoxmcp/tokens.json \
     --mcp-rig-secret-file /etc/proxmoxmcp/mcp-rig.secret \
     --waivers-file /etc/proxmoxmcp/waivers.json \
     --transport streamable-http \
@@ -201,7 +201,9 @@ ExecStart=/usr/local/bin/rust-proxmoxmcp \
     --port 30031 \
     --allow-insecure-bind \
     --allowed-host 192.0.2.10 \
+    --allowed-origin http://192.0.2.10:30031 \
     --allowed-host test-twoperson-proxmox:30031 \
+    --allowed-origin http://test-twoperson-proxmox:30031 \
     --audit-format json \
     --audit-log-file /var/lib/proxmoxmcp/audit.jsonl \
     --audit-journald
@@ -213,8 +215,10 @@ new one.
 **For lab mode, add `--lab-mode` to the `ExecStart` line.** That single flag is
 the whole difference between the two rigs.
 
-Point `--allowed-host` at that rig's own address — it must track whatever
-clients actually dial, or requests are refused with 421.
+Point `--allowed-host` and `--allowed-origin` at that rig's own address — both
+must move in lockstep, and an off-loopback listener requires both or the service
+refuses to start. They must track whatever clients actually dial, or requests
+are refused with 421.
 
 Then:
 
@@ -302,6 +306,12 @@ one prevents startup.
 Even though `tokens.json` existed at `/var/lib/proxmoxmcp/tokens.json`, the
 drop-in's `--tokens-file` points at `/etc/proxmoxmcp/`. Read the drop-in first
 to learn where each file is expected, rather than assuming a default location.
+
+**`non-loopback bind '0.0.0.0' requires at least one --allowed-origin`**  
+An off-loopback listener must supply both `--allowed-host` and `--allowed-origin`.
+Add an `--allowed-origin` line for each `--allowed-host`, using the full URL
+including scheme and port (e.g., `http://192.0.2.10:30031`). The service refuses
+to start without it.
 
 **Service active but every call returns 421**  
 `--allowed-host` does not match the address clients dial. Add the exact host and
