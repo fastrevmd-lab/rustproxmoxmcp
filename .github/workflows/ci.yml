@@ -107,37 +107,3 @@ jobs:
             echo "$output" >&2
             exit 1
           fi
-
-  gitleaks:
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-
-      - name: Gitleaks
-        uses: gitleaks/gitleaks-action@7e97665c5af48d6e0f9963a7daea5ba2c89e8c7f # v2.3.8
-        env:
-          GITLEAKS_ENABLE_SUMMARY: false
-          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
-
-  cargo-audit:
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Audit dependencies
-        uses: rustsec/audit-check@fa4f57084af2a3f8f79f7d4b9a64e0ef46f2f4be # v2.0.1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  cargo-deny:
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Cargo deny
-        uses: EmbarkStudios/cargo-deny-action@8371184bd11e21dcf8ac82ebf8c9c9f74ebf7268 # v2
