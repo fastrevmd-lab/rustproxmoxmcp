@@ -72,5 +72,38 @@ jobs:
         with:
           context: .
           push: false
+          load: true
+          tags: rust-proxmoxmcp:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Verify ENTRYPOINT/CMD split preserves config paths under operator override
+        run: |
+          set -euo pipefail
+          
+          # Test that operator can override CMD args (--host, --port, --transport)
+          # without "cannot be used multiple times" error, and that ENTRYPOINT
+          # args (--clusters-file, --tokens-file) survive the override.
+          #
+          # The server should fail trying to load the config file (proving the
+          # ENTRYPOINT path is in effect), not with a clap argument error.
+          output=$(docker run --rm rust-proxmoxmcp:ci \
+            --host 0.0.0.0 --port 30031 --transport streamable-http \
+            --allow-insecure-bind \
+            --allowed-host test.example.org \
+            --allowed-origin http://test.example.org \
+            2>&1 || true)
+          
+          if echo "$output" | grep -q "cannot be used multiple times"; then
+            echo "FAIL: operator override triggers clap error (ENTRYPOINT/CMD split broken)" >&2
+            echo "$output" >&2
+            exit 1
+          fi
+          
+          if echo "$output" | grep -q "loading /etc/proxmoxmcp/clusters.json"; then
+            echo "OK: server reached config loading (ENTRYPOINT args preserved)"
+          else
+            echo "FAIL: unexpected error (expected config file load failure)" >&2
+            echo "$output" >&2
+            exit 1
+          fi

@@ -19,44 +19,32 @@ Records carry approval_waiver=lab-mode. Do not run this against production clust
 
 If you see that line and did not intend it, stop and fix the flag.
 
-## The ENTRYPOINT problem
+## What the image presets, and what you can override
 
-The image's `ENTRYPOINT` already passes six arguments:
+`ENTRYPOINT` carries what must always hold — the config and credential paths:
 
 ```
 --clusters-file /etc/proxmoxmcp/clusters.json
 --tokens-file   /var/lib/proxmoxmcp/tokens.json
---transport     streamable-http
---host          127.0.0.1
---port          30031
 ```
 
-The Dockerfile comment says *"Override `--host` to expose the port."* **That is
-impossible.** Docker appends your arguments to `ENTRYPOINT`, and clap rejects
-duplicates:
+`CMD` carries what an operator is expected to replace:
 
 ```
-error: the argument '--host <HOST>' cannot be used multiple times
+--transport streamable-http
+--host      127.0.0.1
+--port      30031
 ```
 
-The same applies to `--transport`. So as shipped, the container cannot be
-exposed beyond loopback at all through the documented route.
+Docker **appends** your arguments to `ENTRYPOINT` but **replaces** `CMD`
+outright. So passing `--host 0.0.0.0` swaps out the whole `CMD` line — supply
+`--transport` and `--port` alongside it — while the two config paths survive and
+must **not** be passed again. Repeating one is a clap error
+(`cannot be used multiple times`).
 
-This is filed as issue #85 in this repo. The working route is to replace the
-entrypoint, which then obliges you to re-specify every preset flag. The examples
-below do this.
-
-## The tokens.json path inconsistency
-
-The image presets `--tokens-file /var/lib/proxmoxmcp/tokens.json`, but this
-repo's **LXC drop-in expects `/etc/proxmoxmcp/tokens.json`**. One repo, two
-answers to where the token store lives. During the 2026-09-07 rig rebuild that
-mismatch cost a wasted restart with `token file /etc/proxmoxmcp/tokens.json: No
-such file or directory`.
-
-Check which path your deployment uses rather than assuming. The LXC setup is
-tracked in fastrevmd-lab/mecmcp#356. This document uses
-`/var/lib/proxmoxmcp/tokens.json` to match the image default.
+Before #85 the bind flags were in `ENTRYPOINT` too, which made the documented
+`--host` override impossible and forced a `--entrypoint` workaround. That is
+fixed; no example below needs it.
 
 ## 1. Prepare host paths
 
@@ -156,13 +144,10 @@ whatever that tag points at today, which may be different bytes.
 docker run -d --name proxmox-twoperson \
   --user "$(id -u):$(id -g)" \
   -p 127.0.0.1:30033:30031 \
-  --entrypoint /usr/local/bin/rust-proxmoxmcp \
   -v "$PWD/clusters.json:/etc/proxmoxmcp/clusters.json:ro" \
   -v "$PWD/tokens.json:/var/lib/proxmoxmcp/tokens.json:ro" \
   -v "$PWD/secrets:/etc/proxmoxmcp/secrets:ro" \
   "$image" \
-  --clusters-file /etc/proxmoxmcp/clusters.json \
-  --tokens-file /var/lib/proxmoxmcp/tokens.json \
   --transport streamable-http --host 0.0.0.0 --port 30031 \
   --allow-insecure-bind \
   --allowed-host 127.0.0.1:30033 --allowed-host localhost:30033 \
@@ -189,13 +174,10 @@ side by side. Use the same `$image` variable captured above:
 docker run -d --name proxmox-labmode \
   --user "$(id -u):$(id -g)" \
   -p 127.0.0.1:30043:30031 \
-  --entrypoint /usr/local/bin/rust-proxmoxmcp \
   -v "$PWD/clusters.json:/etc/proxmoxmcp/clusters.json:ro" \
   -v "$PWD/tokens.json:/var/lib/proxmoxmcp/tokens.json:ro" \
   -v "$PWD/secrets:/etc/proxmoxmcp/secrets:ro" \
   "$image" \
-  --clusters-file /etc/proxmoxmcp/clusters.json \
-  --tokens-file /var/lib/proxmoxmcp/tokens.json \
   --transport streamable-http --host 0.0.0.0 --port 30031 \
   --allow-insecure-bind \
   --allowed-host 127.0.0.1:30043 --allowed-host localhost:30043 \
@@ -252,11 +234,11 @@ caller finds the guest blocked.
 All of these were hit while writing this document or during the 2026-09-07 rig
 rebuild.
 
-**`error: the argument '--host <HOST>' cannot be used multiple times`**
-You tried to pass `--host` or `--transport` to the container without replacing
-the `ENTRYPOINT`. The image presets both flags, and clap rejects duplicates.
-Add `--entrypoint /usr/local/bin/rust-proxmoxmcp` before the image name and
-re-specify all six preset arguments as shown above.
+**`error: the argument '--clusters-file <PATH>' cannot be used multiple times`**
+You passed a flag the `ENTRYPOINT` already sets. `--clusters-file` and
+`--tokens-file` are preset and must not be repeated; only the `CMD` flags
+(`--transport`, `--host`, `--port`) are yours to supply. See the section at the
+top of this document.
 
 **`token file /etc/proxmoxmcp/tokens.json: No such file or directory`**
 The tokens file is mounted to the wrong path. The image expects

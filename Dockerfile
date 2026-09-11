@@ -51,11 +51,13 @@ USER 65532:65532
 # orchestrators (Compose healthcheck, Kubernetes liveness probes) supervise the
 # process directly via the container runtime rather than shelling out.
 
-# Note: The shipped unit currently binds 0.0.0.0 by default, but this Dockerfile
-# follows the junos model of binding 127.0.0.1. Override --host to expose the port.
+# ENTRYPOINT carries what must always hold: config paths and anything security-
+# relevant. CMD carries only what an operator is expected to replace: bind
+# address, port, and mode flags. Docker replaces CMD when the caller supplies
+# arguments, so security-relevant defaults must stay in ENTRYPOINT.
 ENTRYPOINT ["/usr/local/bin/rust-proxmoxmcp", \
     "--clusters-file", "/etc/proxmoxmcp/clusters.json", \
-    "--tokens-file", "/var/lib/proxmoxmcp/tokens.json", \
-    "--transport", "streamable-http", \
+    "--tokens-file", "/var/lib/proxmoxmcp/tokens.json"]
+CMD ["--transport", "streamable-http", \
     "--host", "127.0.0.1", \
     "--port", "30031"]
