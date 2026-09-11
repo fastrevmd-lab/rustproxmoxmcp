@@ -19,6 +19,33 @@ Records carry approval_waiver=lab-mode. Do not run this against production clust
 
 If you see that line and did not intend it, stop and fix the flag.
 
+## What the image presets, and what you can override
+
+`ENTRYPOINT` carries what must always hold — the config and credential paths:
+
+```
+--clusters-file /etc/proxmoxmcp/clusters.json
+--tokens-file   /var/lib/proxmoxmcp/tokens.json
+```
+
+`CMD` carries what an operator is expected to replace:
+
+```
+--transport streamable-http
+--host      127.0.0.1
+--port      30031
+```
+
+Docker **appends** your arguments to `ENTRYPOINT` but **replaces** `CMD`
+outright. So passing `--host 0.0.0.0` swaps out the whole `CMD` line — supply
+`--transport` and `--port` alongside it — while the two config paths survive and
+must **not** be passed again. Repeating one is a clap error
+(`cannot be used multiple times`).
+
+Before #85 the bind flags were in `ENTRYPOINT` too, which made the documented
+`--host` override impossible and forced a `--entrypoint` workaround. That is
+fixed; no example below needs it.
+
 ## 1. Prepare host paths
 
 ```bash
@@ -32,59 +59,77 @@ references a **separate secret file** per cluster via `token_secret_file`:
 ```json
 {
   "version": 1,
-  "clusters": [
-    {
-      "name": "homelab",
-      "api_host": "pve3.mechub.org",
-      "port": 8006,
-      "verify_tls": true,
-      "token_name": "rust-proxmoxmcp@pve!ci",
-      "token_secret_file": "/etc/proxmoxmcp/secrets/homelab.token"
+  "devices": {
+    "pve-demo": {
+      "endpoint": "https://192.0.2.10:8006",
+      "token_id": "root@pam!mcp",
+      "token_secret_file": "/etc/proxmoxmcp/secrets/pve-demo.token",
+      "protected_vmids": [100, 101],
+      "protected_tags": ["protected"]
     }
-  ]
+  },
+  "policy": {
+    "resource_cache_ttl_secs": 10
+  }
 }
 ```
 
-`tokens.json` — initially empty. Tokens are minted with `rust-proxmoxmcp token
-add` once the server is running:
+**`token_secret_file` must be the in-container path**, not the host path. The
+file lives at `secrets/pve-demo.token` on the host and is mounted to
+`/etc/proxmoxmcp/secrets`.
 
-```json
-{"version":1,"tokens":[]}
-```
-
-`secrets/homelab.token` — the API token secret for the cluster (plain text):
-
-```
-12345678-1234-1234-1234-123456789abc
-```
-
-## 2. Build or pull the image
-
-Pull a published release:
+Create the Proxmox API token secret file:
 
 ```bash
-docker pull ghcr.io/fastrevmd-lab/rust-proxmoxmcp:0.9.1
+echo -n "your-proxmox-api-token-secret" > secrets/pve-demo.token
 ```
 
-Or build from the working tree:
+Mint a bearer token for MCP clients. The binary can do this on the host:
 
 ```bash
-docker build -t rust-proxmoxmcp:local .
+rust-proxmoxmcp token add --tokens-file ./tokens.json \
+    --name my-client --devices '*' --tools '*'
 ```
+
+The secret prints **once** and is stored hashed. Note the CLI's hint: a token
+minted without `--guests` cannot use guest-addressed tools. Grant that with
+`--guests '*'` or a selector (`vmid:X`, `tag:Y`, `pool:Z`).
+
+Then lock the modes down:
+
+```bash
+chmod 0600 clusters.json tokens.json secrets/*.token
+```
+
+## 2. Ownership: two options
+
+The container process is UID 65532 and must read the config and write the state
+directory.
+
+**For a real deployment**, give it ownership:
+
+```bash
+sudo chown -R 65532:65532 clusters.json tokens.json secrets
+```
+
+**For local testing without root**, run the container as yourself instead. The
+files stay owned by you and nothing needs `sudo`:
+
+```bash
+--user "$(id -u):$(id -g)"
+```
+
+Both are shown below. The second is what the examples here were verified with.
 
 ## 3. Run it — two-person mode
 
-The image's `ENTRYPOINT` presets `--clusters-file` and `--tokens-file` so they
-cannot be lost on override. The `CMD` carries the defaults for `--transport`,
-`--host`, and `--port` — operators replace `CMD` to expose the container, add
-TLS, or change the mode. Docker replaces `CMD` wholesale when you pass
-arguments, so just supply the flags you want; do not re-pass `--clusters-file`
-or `--tokens-file` unless you need different paths.
-
-When building your own deployment command from these examples, it is safer to
-specify the image by digest rather than tag. Resolve it once with:
+Pin the image by **immutable digest**, not mutable tag. If the tag is republished,
+the same documented command runs different bytes with no visible change. Pull the
+image first (RepoDigests is empty if the image has not been pulled), then capture
+the complete pinned reference:
 
 ```bash
+docker pull ghcr.io/fastrevmd-lab/rust-proxmoxmcp:0.9.1
 image=$(docker inspect ghcr.io/fastrevmd-lab/rust-proxmoxmcp:0.9.1 \
     --format '{{index .RepoDigests 0}}')
 ```
@@ -140,63 +185,39 @@ docker run -d --name proxmox-labmode \
   --lab-mode
 ```
 
-## 5. Mint a token
+**Note the port asymmetry, because it catches people.** The server always
+listens on `30031` *inside* the container; `-p 30043:30031` publishes it as
+30043 on the host. But `--allowed-host` and `--allowed-origin` are matched
+against the `Host` and `Origin` headers the **client** sends, and the client is
+talking to 30043. So those flags carry the *published* port, not the internal
+one. Get this wrong and the server starts cleanly and then refuses every request
+with `421`.
 
-Run `token add` inside the container to create an MCP bearer token:
+Lab mode waives approval on creation and records `approval_waiver=lab-mode`.
+Never point it at a production cluster.
 
-```bash
-docker exec proxmox-twoperson rust-proxmoxmcp token add \
-  --tokens-file /var/lib/proxmoxmcp/tokens.json \
-  --scopes tools=all,devices=all \
-  my-session
-```
-
-The token is printed once and cannot be recovered. Record it in your MCP client
-config immediately. The tool cannot overwrite the tokens file by default because
-the server is hardened with `ProtectSystem=strict`, so the mounted
-`tokens.json` must be writable by the container user (UID 65532 or your own
-UID if you passed `--user`).
-
-Alternatively, run the `token add` command on the host with a copy of the
-tokens file, merge the result back, and restart the container. This is the safer
-path when the container is already serving.
-
-## 6. Register the MCP server
-
-Add the server to your MCP client (Claude Desktop, Zed, etc.) with the
-streamable-http transport:
-
-```json
-{
-  "mcpServers": {
-    "proxmox": {
-      "transport": {
-        "type": "streamable-http",
-        "url": "http://127.0.0.1:30033/mcp",
-        "headers": {
-          "Authorization": "Bearer <token-from-step-5>"
-        }
-      }
-    }
-  }
-}
-```
-
-Restart the client to load the server. The tools list appears under
-`mcp__prod-labmode-proxmox__*`.
-
-## 7. Verify it responds
+## 5. Verify
 
 ```bash
-curl -H "Authorization: Bearer <your-token>" \
-  http://127.0.0.1:30033/health
+docker ps --filter name=proxmox- --format '{{.Names}} {{.Status}}'
+
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:30033/mcp \
+     -H 'content-type: application/json' -d '{}'    # 401
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:30043/mcp \
+     -H 'content-type: application/json' -d '{}'    # 401
 ```
 
-Expected response: `{"status":"ok"}`. If this returns 421, the `--allowed-host`
-value does not match the Host header your client sends — see
-[Troubleshooting](#troubleshooting) below.
+**`401` is the success case**: the transport is up and authentication is being
+enforced. `000` means nothing is listening — check `docker logs`. A `421` means
+the allow-lists do not match the address the client used.
 
-## 8. Stop and remove containers
+Confirm the mode is what you intended:
+
+```bash
+docker logs proxmox-labmode 2>&1 | grep -i 'lab mode'
+```
+
+## 6. Stop
 
 ```bash
 docker stop proxmox-twoperson proxmox-labmode
@@ -213,14 +234,18 @@ caller finds the guest blocked.
 All of these were hit while writing this document or during the 2026-09-07 rig
 rebuild.
 
+**`error: the argument '--clusters-file <PATH>' cannot be used multiple times`**
+You passed a flag the `ENTRYPOINT` already sets. `--clusters-file` and
+`--tokens-file` are preset and must not be repeated; only the `CMD` flags
+(`--transport`, `--host`, `--port`) are yours to supply. See the section at the
+top of this document.
+
 **`token file /etc/proxmoxmcp/tokens.json: No such file or directory`**
-The tokens file is mounted to the wrong path. The current canonical location
-since #22 is `/var/lib/proxmoxmcp/tokens.json`, which is what the image presets
-via `ENTRYPOINT` and what the systemd unit uses. Some older deployments or
-documentation may reference `/etc/proxmoxmcp/tokens.json`. The install script
-handles migration from the old path with a fallback and warning. Check your
-mount and either update it to `/var/lib/proxmoxmcp/tokens.json` or pass
-`--tokens-file /etc/proxmoxmcp/tokens.json` explicitly if you need the old path.
+The tokens file is mounted to the wrong path. The image expects
+`/var/lib/proxmoxmcp/tokens.json` by default, but some deployments use
+`/etc/proxmoxmcp/tokens.json`. Check which path your `--tokens-file` flag
+points to and mount the file there. This inconsistency is tracked in
+fastrevmd-lab/mecmcp#356.
 
 **`421` on every request after the server starts cleanly**
 The `--allowed-host` and `--allowed-origin` values do not match the address
@@ -234,8 +259,7 @@ received.
 process is UID 65532 and does not own your files. Either `chown -R 65532:65532`
 them, or run with `--user "$(id -u):$(id -g)"` as shown above.
 
-**`Error: loading /etc/proxmoxmcp/clusters.json` with `No such file or directory`**
-The mount path does not match where the binary expects to read from. The image
-presets `--clusters-file /etc/proxmoxmcp/clusters.json`, so mount your
-`clusters.json` there with `-v $PWD/clusters.json:/etc/proxmoxmcp/clusters.json:ro`,
-or pass a different `--clusters-file` flag and mount to that path instead.
+**Container exits immediately with no log output** — check `docker logs` on the
+stopped container: `docker ps -a --filter name=proxmox-`. Startup validation
+failures print and exit before the transport is up, so the container is gone by
+the time you look for it with plain `docker ps`.
