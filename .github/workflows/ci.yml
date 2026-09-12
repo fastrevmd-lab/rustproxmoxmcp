@@ -76,6 +76,12 @@ jobs:
           tags: rust-proxmoxmcp:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # The local argv assertion that used to live here (#85) is retired:
+      # R6 in the conformance job below now covers it centrally, and was
+      # confirmed to fail (FAIL[R6]) when --tokens-file was temporarily
+      # removed from ENTRYPOINT, before that removal was reverted.
+
   conformance:
     name: Package conformance
     runs-on: ubuntu-24.04

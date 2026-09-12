@@ -56,7 +56,8 @@ USER 65532:65532
 # address, port, and mode flags. Docker replaces CMD when the caller supplies
 # arguments, so security-relevant defaults must stay in ENTRYPOINT.
 ENTRYPOINT ["/usr/local/bin/rust-proxmoxmcp", \
-    "--clusters-file", "/etc/proxmoxmcp/clusters.json"]
+    "--clusters-file", "/etc/proxmoxmcp/clusters.json", \
+    "--tokens-file", "/var/lib/proxmoxmcp/tokens.json"]
 CMD ["--transport", "streamable-http", \
     "--host", "127.0.0.1", \
     "--port", "30031"]
