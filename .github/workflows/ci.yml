@@ -107,3 +107,50 @@ jobs:
             echo "$output" >&2
             exit 1
           fi
+
+  conformance:
+    name: Package conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: 1.98.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Build the release binary
+        run: cargo build --release --locked --bin rust-proxmoxmcp
+
+      - name: Stage the package
+        run: |
+          set -euo pipefail
+          mkdir -p staging/bin
+          cp target/release/rust-proxmoxmcp staging/bin/
+          cp -r packaging staging/packaging
+          cp packaging/conformance.toml staging/
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: rust-proxmoxmcp:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Conformance
+        uses: fastrevmd-lab/mecmcp/packaging/conformance@85498b26398ff408e6d24aebb30af92cec878237
+        with:
+          staging: staging
+          manifest: staging/conformance.toml
+          image: rust-proxmoxmcp:ci
