@@ -1,0 +1,16 @@
+binary     = "bin/rust-proxmoxmcp"
+installer  = "packaging/lxc/install.sh"
+service    = "rust-proxmoxmcp"
+config_dir = "/etc/proxmoxmcp"
+tokens     = "/var/lib/proxmoxmcp/tokens.json"
+
+# No supported skip-build path yet, so no honest BUILD-INFO is possible.
+# R3 warns until both change together. See mecmcp's spec, "Provenance ordering".
+build_info     = false
+skip_build_env = false
+
+units = ["packaging/systemd/rust-proxmoxmcp.service"]
+
+# ENTRYPOINT holds the config and credential paths; these must survive any
+# operator override. Fixed in #85, guarded centrally from here.
+must_survive_override = ["--clusters-file", "--tokens-file"]

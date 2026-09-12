@@ -77,33 +77,54 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Verify ENTRYPOINT/CMD split preserves config paths under operator override
+      # The local argv assertion that used to live here (#85) is retired:
+      # R6 in the conformance job below now covers it centrally, and was
+      # confirmed to fail (FAIL[R6]) when --tokens-file was temporarily
+      # removed from ENTRYPOINT, before that removal was reverted.
+
+  conformance:
+    name: Package conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: 1.98.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Build the release binary
+        run: cargo build --release --locked --bin rust-proxmoxmcp
+
+      - name: Stage the package
         run: |
           set -euo pipefail
-          
-          # Test that operator can override CMD args (--host, --port, --transport)
-          # without "cannot be used multiple times" error, and that ENTRYPOINT
-          # args (--clusters-file, --tokens-file) survive the override.
-          #
-          # The server should fail trying to load the config file (proving the
-          # ENTRYPOINT path is in effect), not with a clap argument error.
-          output=$(docker run --rm rust-proxmoxmcp:ci \
-            --host 0.0.0.0 --port 30031 --transport streamable-http \
-            --allow-insecure-bind \
-            --allowed-host test.example.org \
-            --allowed-origin http://test.example.org \
-            2>&1 || true)
-          
-          if echo "$output" | grep -q "cannot be used multiple times"; then
-            echo "FAIL: operator override triggers clap error (ENTRYPOINT/CMD split broken)" >&2
-            echo "$output" >&2
-            exit 1
-          fi
-          
-          if echo "$output" | grep -q "loading /etc/proxmoxmcp/clusters.json"; then
-            echo "OK: server reached config loading (ENTRYPOINT args preserved)"
-          else
-            echo "FAIL: unexpected error (expected config file load failure)" >&2
-            echo "$output" >&2
-            exit 1
-          fi
+          mkdir -p staging/bin
+          cp target/release/rust-proxmoxmcp staging/bin/
+          cp -r packaging staging/packaging
+          cp packaging/conformance.toml staging/
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: rust-proxmoxmcp:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Conformance
+        uses: fastrevmd-lab/mecmcp/packaging/conformance@85498b26398ff408e6d24aebb30af92cec878237
+        with:
+          staging: staging
+          manifest: staging/conformance.toml
+          image: rust-proxmoxmcp:ci
