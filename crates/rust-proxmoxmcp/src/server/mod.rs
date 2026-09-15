@@ -12,7 +12,7 @@ use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
         CallToolResult, Implementation, ListToolsResult, PaginatedRequestParams,
-        ServerCapabilities, ServerInfo,
+        ServerCapabilities, ServerConfig,
     },
     service::RequestContext,
     tool, tool_handler, tool_router,
@@ -3884,8 +3884,8 @@ fn listed_tools(tools: Vec<rmcp::model::Tool>, cache_hints: bool) -> ListToolsRe
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for ProxmoxServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 "rust-proxmoxmcp",
                 env!("CARGO_PKG_VERSION"),
