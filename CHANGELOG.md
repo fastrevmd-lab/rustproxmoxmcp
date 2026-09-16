@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-16
+
+This is a **minor version** rather than a patch because the ENTRYPOINT/CMD split
+changes the contract for operators running the container with their own arguments.
+An `ENTRYPOINT` exec-form array holds the fixed binary path, and a `CMD` holds
+its default arguments — which `docker run` overrides when the user supplies their
+own. The previous single-directive form made every container override a
+FROM-dependent rebuild.
+
+The headline reason for the release is a rustls security update closing
+RUSTSEC-2026-0285, a TLS 1.3 boundary-crossing vulnerability rated CVSS 5.3.
+
+### Security
+
+- **Updated rustls from 0.23.44 to 0.23.45**, closing **RUSTSEC-2026-0285**
+  (#98). TLS 1.3 handshake messages could be accepted across encryption-level
+  boundaries, allowing a network attacker to inject handshake messages during the
+  cleartext phase that would be processed as if they arrived after the handshake
+  completed. Rated CVSS 5.3 MEDIUM. This server terminates TLS, so the exposure
+  was direct.
+
+### Changed
+
+- **The Dockerfile now uses separate `ENTRYPOINT` and `CMD` directives** (#88),
+  so operators can override arguments without patching the image. `ENTRYPOINT`
+  holds the binary path `["/usr/local/bin/rust-proxmoxmcp"]` and `CMD` holds
+  the default flags (empty, letting the binary read its own defaults).
+  `docker run <image> --port 3131` now works as written; the previous form
+  required `--entrypoint` or a rebuild.
+- **Adopted the mecmcp package conformance check** (#89), which gates on the
+  presence of the security policy, license, README, changelog, and uninstalled-
+  command audit. The gate ensures release artifacts carry the operator-facing
+  documentation. R5 (the uninstalled-command filter) was later corrected to
+  anchor the pattern (#366), and R6 was fixed to continue after an earlier rule
+  fails (#367).
+- Re-pinned `rmcp` from 3.2.0 to 3.4.0 (#99), which renames the internal
+  `ServerInfo` type to `ServerConfig`. No wire-format or API surface change; the
+  rename is compile-time only.
+- Updated Rust builder base image from `1469a27` to `ebd900b` (#90).
+- Updated distroless runtime base image from `c31ff9a` to `54df941` (#92).
+- Updated `reqwest` from 0.13.4 to 0.13.5 (#96).
+- Updated `uuid` from 1.26.0 to 1.26.1 (#93).
+- Updated `trybuild` from 1.0.120 to 1.0.121 (#97).
+- Pinned the conformance action from floating to a commit digest (#91).
+
+### Fixed
+
+- **Corrected the LXC setup guide to add `--allowed-origin` and fix the
+  `--tokens-file` path** (#86). The guide previously omitted the origin
+  allowlist, which would cause streamable-HTTP handshake refusals from any
+  client not on `localhost`, and pointed at the wrong tokens file.
+- **Redacted a real Proxmox node name from the LXC guide** (#87). The example
+  output included a production node name where a placeholder was intended.
+
+### Documentation
+
+- **Added a complete LXC-from-scratch setup guide** (#84), explaining how to
+  build a Debian 13 container, extract the glibc-compatible binary from the
+  release image, and install the systemd unit and sysusers config.
+
 ## [0.9.1] - 2026-09-06
 
 ### Fixed

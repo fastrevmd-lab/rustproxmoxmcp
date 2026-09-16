@@ -49,7 +49,7 @@ the old binary has been replaced — an outage, not a build failure.
 Take the binary from the release image, which CI builds against the right glibc:
 
 ```bash
-docker create --name px ghcr.io/fastrevmd-lab/rust-proxmoxmcp:0.9.1
+docker create --name px ghcr.io/fastrevmd-lab/rust-proxmoxmcp:0.10.0
 docker cp px:/usr/local/bin/rust-proxmoxmcp ./rust-proxmoxmcp
 docker rm px
 ```
@@ -57,7 +57,7 @@ docker rm px
 No docker? On the Proxmox host, `skopeo` is available:
 
 ```bash
-skopeo copy docker://ghcr.io/fastrevmd-lab/rust-proxmoxmcp:0.9.1 dir:/tmp/img
+skopeo copy docker://ghcr.io/fastrevmd-lab/rust-proxmoxmcp:0.10.0 dir:/tmp/img
 ```
 
 Then find the layer containing `usr/local/bin/rust-proxmoxmcp` and untar it.
