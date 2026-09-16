@@ -129,8 +129,8 @@ image first (RepoDigests is empty if the image has not been pulled), then captur
 the complete pinned reference:
 
 ```bash
-docker pull ghcr.io/fastrevmd-lab/rust-proxmoxmcp:0.9.1
-image=$(docker inspect ghcr.io/fastrevmd-lab/rust-proxmoxmcp:0.9.1 \
+docker pull ghcr.io/fastrevmd-lab/rust-proxmoxmcp:0.10.0
+image=$(docker inspect ghcr.io/fastrevmd-lab/rust-proxmoxmcp:0.10.0 \
     --format '{{index .RepoDigests 0}}')
 ```
 
