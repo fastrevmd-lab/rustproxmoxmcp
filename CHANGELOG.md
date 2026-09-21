@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Raised MSRV to 1.89 (family-wide decision).
+
 ## [0.10.0] - 2026-09-16
 
 This is a **minor version** rather than a patch because the ENTRYPOINT/CMD split
