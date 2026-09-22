@@ -77,10 +77,18 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # The local argv assertion that used to live here (#85) is retired:
-      # R6 in the conformance job below now covers it centrally, and was
-      # confirmed to fail (FAIL[R6]) when --tokens-file was temporarily
-      # removed from ENTRYPOINT, before that removal was reverted.
+      - name: Argv-survival regression guard
+        run: |
+          # Regression guard for mecmcp#357: config paths must survive operator overrides.
+          # Docker replaces CMD entirely when the caller supplies args, but appends to
+          # ENTRYPOINT, so config paths must live in ENTRYPOINT or they vanish the
+          # moment anyone passes --host.
+          container_id=$(docker create rust-proxmoxmcp:ci --host 0.0.0.0)
+          argv=$(docker inspect "$container_id" --format '{{join .Args "\n"}}')
+          docker rm "$container_id" > /dev/null
+          echo "$argv" | grep -q -- '/etc/proxmoxmcp/clusters.json' || { echo "FAIL: --clusters-file path missing from argv with --host override"; exit 1; }
+          echo "$argv" | grep -q -- '/var/lib/proxmoxmcp/tokens.json' || { echo "FAIL: --tokens-file path missing from argv with --host override"; exit 1; }
+          echo "PASS: config paths survive --host override"
 
   conformance:
     name: Package conformance
