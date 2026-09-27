@@ -251,7 +251,7 @@ role that carries only the privileges this server's tools actually use:
 
 ```sh
 # A role scoped to exactly what rustproxmoxmcp's tools call, no more.
-pveum role add ProxmoxMcp -privs "VM.Audit,Sys.Audit,Datastore.Audit,VM.PowerMgmt,VM.Snapshot,VM.Snapshot.Rollback,VM.Backup,VM.Clone,VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,VM.Allocate,Datastore.AllocateSpace,Datastore.AllocateTemplate,Datastore.Allocate,Sys.AccessNetwork"
+pveum role add ProxmoxMcp -privs "VM.Audit,Sys.Audit,Datastore.Audit,VM.PowerMgmt,VM.Snapshot,VM.Snapshot.Rollback,VM.Backup,VM.Clone,VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,VM.Allocate,Datastore.AllocateSpace,Datastore.AllocateTemplate,Sys.AccessNetwork"
 
 # A service account with no interactive password -- it is only ever reached
 # through its API token.
@@ -295,8 +295,27 @@ privileges guard.
 | `VM.Allocate` | `create_vm`, `create_container`, `delete_vm`/`delete_container` (the `destroy_guest` apply-time op), and `restore_backup` when it overwrites an existing VMID |
 | `Datastore.AllocateSpace` | `create_vm`/`create_container` (disk allocation), `create_backup`, `delete_backup` |
 | `Datastore.AllocateTemplate` | `download_iso` (the destination storage) |
-| `Datastore.Allocate` | `delete_iso`. Proxmox's `API2/Storage/Content.pm` delete handler asks for this privilege on the storage (or `Datastore.AllocateSpace` only for a backup volume, which `delete_iso` never targets) |
-| `Sys.AccessNetwork` | `download_iso` (`download-url`), granted on `/nodes/{node}`. `API2/Storage/Status.pm` accepts either this privilege scoped to the node, or `Sys.Audit`+`Sys.Modify` on `/` — the node-scoped grant is the one that does not also hand out node reboot/network/disk-wipe access. `Sys.AccessNetwork` for `download-url` requires a PVE version recent enough to carry the download-url feature (7.0+); confirm against your cluster's changelog before relying on it, and fall back to the broader `/`-scoped pair on older clusters |
+| `Datastore.Allocate` | `delete_iso`. **Optional add-on, not in the base role** — see below |
+| `Sys.AccessNetwork` | `download_iso` (`download-url`), granted on `/nodes/{node}`. `API2/Storage/Status.pm` accepts either this privilege scoped to the node, or `Sys.Audit`+`Sys.Modify` on `/` — the node-scoped grant is the one that does not also hand out node reboot/network/disk-wipe access. `Sys.AccessNetwork` for `download-url` requires PVE 8+; on older clusters use the broader `Sys.Audit`+`Sys.Modify` pair on `/` instead |
+
+`Datastore.Allocate` is deliberately **not** in the role above. `delete_iso`
+is the only tool that needs it, and Proxmox's `API2/Storage/Content.pm`
+delete handler checks it on the *storage*, not on a single ISO volume — there
+is no Proxmox privilege that grants "delete this one ISO" without also
+granting "modify or remove this storage's definition." Granting it at `/`
+(as the base role does) makes the token an admin of every storage in the
+cluster: it could delete a storage definition cluster-wide, repoint one, or
+add a new NFS/CIFS/PBS mount that every node then connects to. If this
+deployment needs `delete_iso`, scope the grant to the one storage that holds
+ISOs instead of the whole cluster:
+
+```sh
+# Optional: only if delete_iso must work. Scoped to one storage, not `/` —
+# still lets the token edit or remove *that storage's* definition, but not
+# any other storage in the cluster.
+pveum role add ProxmoxMcpIsoDelete -privs "Datastore.Allocate"
+pveum acl modify /storage/<iso-storage> --users mcp-automation@pve --roles ProxmoxMcpIsoDelete
+```
 
 `Sys.Modify` on `/` is deliberately **not** in the role above. The only tool
 that can touch it is `stop_task`, and `API2/Tasks.pm` only requires
