@@ -48,7 +48,7 @@ tags = ["panos", "secret"]
 [[rules]]
 id = "pve-api-token"
 description = "Proxmox VE API token"
-regex = '''PVEAPIToken=[A-Za-z0-9_.\-]+@[A-Za-z0-9]+![A-Za-z0-9_.\-]+=[A-Za-z0-9\-]{20,}'''
+regex = '''PVEAPIToken=[A-Za-z0-9_.\-]+@[A-Za-z0-9._\-]+![A-Za-z0-9_.\-]+=[A-Za-z0-9\-]{20,}'''
 tags = ["proxmox", "secret"]
 
 [[rules]]
