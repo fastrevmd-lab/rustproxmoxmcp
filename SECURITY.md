@@ -23,4 +23,4 @@ This is an MCP server that authorizes and executes actions against Proxmox VE cl
 
 ## Response
 
-This is a community-maintained project. There's no guaranteed SLA, but reports are read and triaged by a human maintainer, not by any automated or model-based process.
+This is a community-maintained project. There's no guaranteed SLA. A human maintainer is responsible for triaging every report and for all disclosure and fix decisions.
