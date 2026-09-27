@@ -62,7 +62,7 @@ references a **separate secret file** per cluster via `token_secret_file`:
   "devices": {
     "pve-demo": {
       "endpoint": "https://192.0.2.10:8006",
-      "token_id": "root@pam!mcp",
+      "token_id": "mcp-automation@pve!mcp",
       "token_secret_file": "/etc/proxmoxmcp/secrets/pve-demo.token",
       "protected_vmids": [100, 101],
       "protected_tags": ["protected"]
@@ -73,6 +73,12 @@ references a **separate secret file** per cluster via `token_secret_file`:
   }
 }
 ```
+
+`token_id` is a dedicated, non-root Proxmox user carrying a purpose-built
+least-privilege role — never `root@pam`, which bypasses Proxmox's ACL system
+entirely and so cannot be constrained by anything in this file. See
+[README § The Proxmox-side token: least privilege, not `root@pam`](../README.md#the-proxmox-side-token-least-privilege-not-rootpam)
+for the exact `pveum` commands and the privilege-to-tool mapping.
 
 **`token_secret_file` must be the in-container path**, not the host path. The
 file lives at `secrets/pve-demo.token` on the host and is mounted to

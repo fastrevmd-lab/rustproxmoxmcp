@@ -210,7 +210,7 @@ If the guest is out of scope or the action tier (`read`/`low`/`destructive`) is 
   "devices": {
     "pve3": {
       "endpoint": "https://pve3.example.org:8006",
-      "token_id": "root@pam!mcp",
+      "token_id": "mcp-automation@pve!mcp",
       "token_secret_env": "PVE_PVE3_TOKEN",
       "protected_vmids": [905, 906, 907],
       "protected_tags": ["protected"]
@@ -230,6 +230,79 @@ If the guest is out of scope or the action tier (`read`/`low`/`destructive`) is 
 - **`token_secret_env`**: Names an environment variable. Supported via `EnvironmentFile=-/etc/proxmoxmcp/secrets.env` in the systemd unit (the `-` prefix makes a missing file non-fatal). The environment-variable path is weaker because the credential becomes readable from the process environment.
 
 Both are loaded through `mecmcp-secret` into an `OutboundSecret` that is zeroized on drop and implements neither `Debug` nor `Serialize`.
+
+### The Proxmox-side token: least privilege, not `root@pam`
+
+`token_id` names a Proxmox API token, and that token's *Proxmox-side*
+privileges are a second authorization boundary this server does not control.
+Stage 1 and stage 2 (above) gate what an MCP caller can do; they say nothing
+about what the underlying Proxmox credential is allowed to do once a request
+reaches the cluster. Handing this server a `root@pam!...` token collapses that
+second boundary: `root@pam` is Proxmox's hardcoded superuser and bypasses ACL
+checks entirely — see
+[Proxmox VE's own user management documentation](https://pve.proxmox.com/wiki/User_Management)
+— so no role, no path scoping, and nothing in `clusters.json` can constrain
+it. A bug in this server, a stolen token, or an over-broad `grant` in
+`tokens.json` would then fail open onto full cluster control instead of
+failing closed onto a bounded role.
+
+Create a dedicated, non-root user in the `pve` realm instead, with a custom
+role that carries only the privileges this server's tools actually use:
+
+```sh
+# A role scoped to exactly what rustproxmoxmcp's tools call, no more.
+pveum role add ProxmoxMcp -privs "VM.Audit,Sys.Audit,Datastore.Audit,VM.PowerMgmt,VM.Snapshot,VM.Snapshot.Rollback,VM.Backup,VM.Clone,VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,Sys.Modify,VM.Allocate,Datastore.AllocateSpace,Datastore.AllocateTemplate"
+
+# A service account with no interactive password -- it is only ever reached
+# through its API token.
+pveum user add mcp-automation@pve --comment "rustproxmoxmcp service account"
+
+# Grant the role cluster-wide (`/`), matching this server's own reach: guests
+# migrate between nodes and clusters.json addresses a whole cluster, not one
+# VM or pool. An operator who wants to scope one token to one pool of guests
+# can grant ProxmoxMcp at `/pool/<name>` instead and mint a separate token per
+# pool; that is a deployment choice this server does not require.
+pveum acl modify / --users mcp-automation@pve --roles ProxmoxMcp
+
+# --privsep 0: the token carries exactly the user's own permissions, so the
+# role above is the token's complete privilege set with nothing left to grant
+# or forget on a separate token-level ACL.
+pveum user token add mcp-automation@pve mcp --privsep 0
+```
+
+The last command prints the token secret once. Put it in the file
+`token_secret_file` points to (or the variable `token_secret_env` names) —
+never in `clusters.json` itself.
+
+Every privilege in `ProxmoxMcp` maps to specific tools this server registers.
+Nothing else is granted: no `Sys.PowerMgmt` (node reboot), no `VM.Console` or
+`Sys.Console`, no `VM.Migrate`, no `Pool.*`/`Group.Allocate`/`Realm.Allocate`/
+`Permissions.Modify` — this server never calls the Proxmox endpoints those
+privileges guard.
+
+| Privilege | Tool(s) that need it |
+|-----------|----------------------|
+| `VM.Audit` | Every guest-scoped read: `get_vms`, `get_containers`, `get_vm_config`, `get_container_config`, `get_container_ip`, `get_guest_status`, `list_snapshots`, and the guest resolve/fingerprint read every plan and apply performs |
+| `Sys.Audit` | `get_cluster_status`, `get_nodes`, `get_node_status`, `list_tasks`, `get_task_status` |
+| `Datastore.Audit` | `get_storage`, `list_backups`, `list_isos`, `list_templates` |
+| `VM.PowerMgmt` | `start_vm`, `stop_vm`, `shutdown_vm`, `reset_vm`, `start_container`, `stop_container`, `restart_container` |
+| `VM.Snapshot` | `create_snapshot`, `delete_snapshot` (an apply-time `plan_proxmox_destroy` op) |
+| `VM.Snapshot.Rollback` | `rollback_snapshot` (an apply-time op) |
+| `VM.Backup` | `create_backup`, `restore_backup` (an apply-time op) |
+| `VM.Clone` | `clone_vm` |
+| `VM.Config.Disk` | `resize_disk` |
+| `VM.Config.CPU`, `VM.Config.Memory` | `update_container_resources` (cores vs. memory/swap) |
+| `Sys.Modify` | `stop_task`, which can cancel a task Proxmox scopes at the node rather than the guest |
+| `VM.Allocate` | `create_vm`, `create_container`, `delete_vm`/`delete_container` (the `destroy_guest` apply-time op), and `restore_backup` when it overwrites an existing VMID |
+| `Datastore.AllocateSpace` | `create_vm`/`create_container` (disk allocation), `create_backup`, `delete_backup`, `delete_iso` |
+| `Datastore.AllocateTemplate` | `download_iso` |
+
+`plan_proxmox_destroy`, `approve_proxmox_change_set` and
+`get_proxmox_change_set` issue no Proxmox API call of their own beyond the
+guest-resolve read (`VM.Audit`, already listed above) — approval is local
+bookkeeping in this server's own change-set store. The Proxmox privilege a
+plan will need is whichever row above names its `op`, and that privilege is
+only spent when `apply_proxmox_change_set` actually executes it.
 
 ### Token store: `tokens.json`
 
