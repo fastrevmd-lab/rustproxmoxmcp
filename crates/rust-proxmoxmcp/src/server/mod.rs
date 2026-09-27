@@ -2787,6 +2787,7 @@ impl ProxmoxServer {
         use mecmcp_changeset::WaiverKind;
         use rust_proxmoxmcp_core::{
             fingerprint::{GuestState, fingerprint},
+            guests::fetch_guest_config_state,
             preview::{PreviewInput, render_preview},
             protect::{Override, destructive_allowed, protection_of},
         };
@@ -2863,21 +2864,6 @@ impl ProxmoxServer {
 
         let guest = authorized.guest();
 
-        // Compute fingerprint.
-        let state = GuestState {
-            cluster: args.cluster.clone(),
-            vmid: guest.vmid,
-            name: guest.name.clone(),
-            kind: guest.r#type.path_segment().to_owned(),
-            node: guest.node.clone(),
-            status: guest.status.clone(),
-            tags: guest.tags.clone(),
-            config_digest: String::new(),
-            disks: Vec::new(),
-        };
-
-        let expected_fingerprint = fingerprint(&state);
-
         // Built before the preview, because the preview describes it.
         let action = match build_destroy_action(&args) {
             Ok(action) => action,
@@ -2919,6 +2905,37 @@ impl ProxmoxServer {
         {
             return tool_error(error);
         }
+
+        // The digest and disk sizes come from the guest's own config, not
+        // `/cluster/resources` -- that snapshot is cluster-wide and reports
+        // neither. Fetched fresh rather than cached: this is what apply
+        // re-checks, and a stale digest here would defeat the fingerprint the
+        // same way a stale `/cluster/resources` read once did.
+        //
+        // Deferred until after the cheap local checks above (volid validation,
+        // the stopped-guest check, op-tool scope), so a plan that was always
+        // going to be refused for one of those reasons does not first pay for
+        // a network round trip.
+        let config_state =
+            match fetch_guest_config_state(client, &guest.node, guest.r#type, guest.vmid).await {
+                Ok(state) => state,
+                Err(error) => return tool_error(format!("reading guest config: {error}")),
+            };
+
+        // Compute fingerprint.
+        let state = GuestState {
+            cluster: args.cluster.clone(),
+            vmid: guest.vmid,
+            name: guest.name.clone(),
+            kind: guest.r#type.path_segment().to_owned(),
+            node: guest.node.clone(),
+            status: guest.status.clone(),
+            tags: guest.tags.clone(),
+            config_digest: config_state.config_digest,
+            disks: config_state.disks,
+        };
+
+        let expected_fingerprint = fingerprint(&state);
 
         // Render preview.
         let preview_input = PreviewInput {
@@ -3234,6 +3251,7 @@ impl ProxmoxServer {
     ) -> CallToolResult {
         use rust_proxmoxmcp_core::{
             fingerprint::{GuestState, fingerprint},
+            guests::fetch_guest_config_state,
             protect::{Override, destructive_allowed, protection_of},
         };
 
@@ -3350,6 +3368,15 @@ impl ProxmoxServer {
 
         let guest = authorized.guest();
 
+        // Same source as `plan_destroy`: the guest's own config, fetched
+        // fresh, because this is precisely the check that must not compare a
+        // cached read against itself.
+        let config_state =
+            match fetch_guest_config_state(client, &guest.node, guest.r#type, guest.vmid).await {
+                Ok(state) => state,
+                Err(error) => return tool_error(format!("reading guest config: {error}")),
+            };
+
         let state = GuestState {
             cluster: args.cluster.clone(),
             vmid: guest.vmid,
@@ -3358,8 +3385,8 @@ impl ProxmoxServer {
             node: guest.node.clone(),
             status: guest.status.clone(),
             tags: guest.tags.clone(),
-            config_digest: String::new(),
-            disks: Vec::new(),
+            config_digest: config_state.config_digest,
+            disks: config_state.disks,
         };
 
         let current_fingerprint = fingerprint(&state);
