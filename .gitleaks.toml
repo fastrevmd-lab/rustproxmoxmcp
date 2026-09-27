@@ -3,7 +3,7 @@
 # marker, so a genuine credential without the marker cannot match.
 
 [extend]
-useDefault = true
+path = ".gitleaks-vendor.toml"
 
 [allowlist]
 description = "Test fixtures with explicit not-a-real-secret marker"
