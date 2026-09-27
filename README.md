@@ -251,7 +251,7 @@ role that carries only the privileges this server's tools actually use:
 
 ```sh
 # A role scoped to exactly what rustproxmoxmcp's tools call, no more.
-pveum role add ProxmoxMcp -privs "VM.Audit,Sys.Audit,Datastore.Audit,VM.PowerMgmt,VM.Snapshot,VM.Snapshot.Rollback,VM.Backup,VM.Clone,VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,Sys.Modify,VM.Allocate,Datastore.AllocateSpace,Datastore.AllocateTemplate"
+pveum role add ProxmoxMcp -privs "VM.Audit,Sys.Audit,Datastore.Audit,VM.PowerMgmt,VM.Snapshot,VM.Snapshot.Rollback,VM.Backup,VM.Clone,VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,VM.Allocate,Datastore.AllocateSpace,Datastore.AllocateTemplate,Datastore.Allocate,Sys.AccessNetwork"
 
 # A service account with no interactive password -- it is only ever reached
 # through its API token.
@@ -292,10 +292,30 @@ privileges guard.
 | `VM.Clone` | `clone_vm` |
 | `VM.Config.Disk` | `resize_disk` |
 | `VM.Config.CPU`, `VM.Config.Memory` | `update_container_resources` (cores vs. memory/swap) |
-| `Sys.Modify` | `stop_task`, which can cancel a task Proxmox scopes at the node rather than the guest |
 | `VM.Allocate` | `create_vm`, `create_container`, `delete_vm`/`delete_container` (the `destroy_guest` apply-time op), and `restore_backup` when it overwrites an existing VMID |
-| `Datastore.AllocateSpace` | `create_vm`/`create_container` (disk allocation), `create_backup`, `delete_backup`, `delete_iso` |
-| `Datastore.AllocateTemplate` | `download_iso` |
+| `Datastore.AllocateSpace` | `create_vm`/`create_container` (disk allocation), `create_backup`, `delete_backup` |
+| `Datastore.AllocateTemplate` | `download_iso` (the destination storage) |
+| `Datastore.Allocate` | `delete_iso`. Proxmox's `API2/Storage/Content.pm` delete handler asks for this privilege on the storage (or `Datastore.AllocateSpace` only for a backup volume, which `delete_iso` never targets) |
+| `Sys.AccessNetwork` | `download_iso` (`download-url`), granted on `/nodes/{node}`. `API2/Storage/Status.pm` accepts either this privilege scoped to the node, or `Sys.Audit`+`Sys.Modify` on `/` — the node-scoped grant is the one that does not also hand out node reboot/network/disk-wipe access. `Sys.AccessNetwork` for `download-url` requires a PVE version recent enough to carry the download-url feature (7.0+); confirm against your cluster's changelog before relying on it, and fall back to the broader `/`-scoped pair on older clusters |
+
+`Sys.Modify` on `/` is deliberately **not** in the role above. The only tool
+that can touch it is `stop_task`, and `API2/Tasks.pm` only requires
+`Sys.Modify` when the caller is stopping a task it does not own; this
+server's own tasks always belong to its own token, so the common case needs
+nothing extra. `Sys.Modify` at `/` is a broad node-admin grant — node network
+config, disk init and wipe, `apt`, and more — so add it only if this token
+must be able to stop tasks that *other* principals started on the same
+cluster:
+
+```sh
+pveum role modify ProxmoxMcp -privs "...,Sys.Modify" # append to the existing list
+```
+
+**Unverified, check on a lab PVE before relying on it in production:**
+`create_vm`, `create_container`, and `clone_vm` calls that attach a network
+device likely also need `SDN.Use` on the bridge on PVE 8+. This role list has
+not been exercised against SDN-managed bridges; if your cluster uses them,
+test a plan/apply cycle against a disposable guest first.
 
 `plan_proxmox_destroy`, `approve_proxmox_change_set` and
 `get_proxmox_change_set` issue no Proxmox API call of their own beyond the

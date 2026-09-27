@@ -27,16 +27,20 @@ pub struct GuestConfigState {
 ///
 /// Used to fill [`crate::fingerprint::GuestState::config_digest`] and
 /// `::disks`, which the plan/apply fingerprint compares to detect drift
-/// between approval and application. Failing to read either field, or
-/// finding a disk whose size cannot be parsed, refuses rather than fingerprint
-/// with the field silently omitted -- an omitted field cannot compare unequal,
-/// so a change to it would never be caught.
+/// between approval and application. Failing to read `digest`, or finding a
+/// disk that carries a `size=` which cannot be parsed, refuses rather than
+/// fingerprint with the field silently omitted -- an omitted field cannot
+/// compare unequal, so a change to it would never be caught. A disk with no
+/// `size=` at all (an empty cdrom, an LXC bind mount, a passed-through block
+/// device) is not refused: it contributes nothing to `disks`, but
+/// `config_digest` already covers every byte of its config line, so drift on
+/// it still fails the fingerprint compare. See [`classify_disk_size`].
 ///
 /// # Errors
 ///
 /// Returns [`ProxmoxError::Malformed`] if the response is not an object, has
-/// no `digest`, or has a disk key whose value has no parseable `size=`.
-/// Propagates any client error from the request.
+/// no `digest`, or has a disk key whose value has a `size=` that cannot be
+/// parsed. Propagates any client error from the request.
 pub async fn fetch_guest_config_state(
     client: &ProxmoxClient,
     node: &str,
@@ -70,12 +74,18 @@ pub async fn fetch_guest_config_state(
         let Some(raw) = value.as_str() else {
             continue;
         };
-        let size = parse_disk_size(raw).ok_or_else(|| {
-            ProxmoxError::Malformed(format!(
-                "guest {vmid} disk '{key}' has no parseable size in '{raw}'"
-            ))
-        })?;
-        disks.push((key.clone(), size));
+        match classify_disk_size(raw) {
+            DiskSize::Sized(size) => disks.push((key.clone(), size)),
+            // No managed size to track (cdrom, LXC bind mount, passthrough
+            // device), but config_digest still covers every byte of the
+            // config line, so drift is still caught.
+            DiskSize::Unmanaged => {}
+            DiskSize::Unparseable => {
+                return Err(ProxmoxError::Malformed(format!(
+                    "guest {vmid} disk '{key}' has an unparseable size"
+                )));
+            }
+        }
     }
 
     Ok(GuestConfigState {
@@ -103,14 +113,41 @@ fn is_disk_key(key: &str) -> bool {
     })
 }
 
-/// Extract the `size=` parameter from a disk config value and parse it.
+/// The outcome of interpreting one disk config value for fingerprinting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskSize {
+    /// Has a `size=` that parsed; contributes a `(key, bytes)` entry.
+    Sized(u64),
+    /// No managed size to track: an empty cdrom drive (`media=cdrom`), an
+    /// LXC bind mount (`mp=/data` over a host path with no `size=`), or a
+    /// passed-through block device (a bare path, also no `size=`). These are
+    /// not refused: `config_digest` already covers every byte of the config
+    /// line, so a change to any of them still fails the fingerprint compare.
+    Unmanaged,
+    /// Had a `size=` parameter, but its value could not be parsed. Refused
+    /// rather than guessed, per [`parse_size_bytes`].
+    Unparseable,
+}
+
+/// Classify a disk config value from `size=`, matching the fields Proxmox
+/// puts on `ideN`/`sataN`/`scsiN`/`virtioN`/`efidiskN`/`tpmstateN`/`rootfs`/
+/// `mpN` values.
 ///
 /// A disk value looks like `local-lvm:vm-100-disk-0,size=32G`: a storage
 /// volume followed by comma-separated options. `size` is one of them, not
-/// necessarily the first.
-fn parse_disk_size(raw: &str) -> Option<u64> {
-    let size_param = raw.split(',').find_map(|part| part.strip_prefix("size="))?;
-    parse_size_bytes(size_param)
+/// necessarily the first. An empty cdrom drive looks like
+/// `none,media=cdrom` or `cdrom,media=cdrom` and carries no size at all.
+fn classify_disk_size(raw: &str) -> DiskSize {
+    if raw.split(',').any(|part| part == "media=cdrom") {
+        return DiskSize::Unmanaged;
+    }
+    let Some(size_param) = raw.split(',').find_map(|part| part.strip_prefix("size=")) else {
+        return DiskSize::Unmanaged;
+    };
+    match parse_size_bytes(size_param) {
+        Some(size) => DiskSize::Sized(size),
+        None => DiskSize::Unparseable,
+    }
 }
 
 /// Parse a Proxmox size string (`32G`, `512M`, `1536`) into bytes.
@@ -1170,41 +1207,66 @@ mod disk_key_tests {
 
 #[cfg(test)]
 mod disk_size_tests {
-    use super::parse_disk_size;
+    use super::{DiskSize, classify_disk_size};
 
     #[test]
     fn units_convert_to_binary_bytes() {
         assert_eq!(
-            parse_disk_size("local-lvm:vm-100-disk-0,size=32G"),
-            Some(32 * 1024 * 1024 * 1024)
+            classify_disk_size("local-lvm:vm-100-disk-0,size=32G"),
+            DiskSize::Sized(32 * 1024 * 1024 * 1024)
         );
         assert_eq!(
-            parse_disk_size("local:100/vm-100-disk-0.raw,size=512M"),
-            Some(512 * 1024 * 1024)
+            classify_disk_size("local:100/vm-100-disk-0.raw,size=512M"),
+            DiskSize::Sized(512 * 1024 * 1024)
         );
         assert_eq!(
-            parse_disk_size("local-lvm:vm-100-disk-0,size=2048"),
-            Some(2048)
+            classify_disk_size("local-lvm:vm-100-disk-0,size=2048"),
+            DiskSize::Sized(2048)
         );
     }
 
     #[test]
     fn size_need_not_be_the_first_option() {
         assert_eq!(
-            parse_disk_size("local-lvm:vm-100-disk-0,ssd=1,size=8G,discard=on"),
-            Some(8 * 1024 * 1024 * 1024)
+            classify_disk_size("local-lvm:vm-100-disk-0,ssd=1,size=8G,discard=on"),
+            DiskSize::Sized(8 * 1024 * 1024 * 1024)
         );
     }
 
     #[test]
-    fn missing_or_unparseable_size_refuses() {
+    fn unparseable_size_refuses() {
         for raw in [
-            "local-lvm:vm-100-disk-0",
             "local-lvm:vm-100-disk-0,size=",
             "local-lvm:vm-100-disk-0,size=-8G",
             "local-lvm:vm-100-disk-0,size=banana",
         ] {
-            assert_eq!(parse_disk_size(raw), None, "{raw} should not parse");
+            assert_eq!(
+                classify_disk_size(raw),
+                DiskSize::Unparseable,
+                "{raw} should be unparseable"
+            );
+        }
+    }
+
+    /// Common real-world shapes that carry no `size=` at all: the PVE wizard
+    /// default empty cdrom (`none,media=cdrom`), an explicit empty cdrom
+    /// (`cdrom,media=cdrom`), a cloud-init drive, an LXC bind mount, and a
+    /// passed-through block device. None of these should refuse the
+    /// fingerprint -- `config_digest` already covers their config line.
+    #[test]
+    fn shapes_with_no_managed_size_are_unmanaged_not_refused() {
+        for raw in [
+            "none,media=cdrom",
+            "cdrom,media=cdrom",
+            "local-lvm:vm-100-cloudinit,media=cdrom",
+            "/host/path,mp=/data",
+            "/dev/disk/by-id/scsi-3600508b1001c0000abcdef1234567890",
+        ] {
+            assert_eq!(
+                classify_disk_size(raw),
+                DiskSize::Unmanaged,
+                "{raw} should be unmanaged, not refused"
+            );
         }
     }
 }

@@ -40,6 +40,30 @@ async fn an_approved_destroy_issues_the_delete_and_follows_the_task_to_completio
     );
 }
 
+/// Regression test for the disk parse that used to treat `ide2:
+/// none,media=cdrom` (the PVE wizard's default empty cdrom drive) as a disk
+/// with no parseable size, refusing the plan for a guest shape millions of
+/// real VMs have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn destroy_plans_for_a_guest_with_an_empty_cdrom_drive() {
+    let h = handler_with_guest(617, false).await;
+    h.set_guest_config(
+        "pve2",
+        "lxc",
+        617,
+        br#"{"data":{"hostname":"test-guest-617","cores":1,"memory":512,"digest":"aabbccddeeff00112233445566778899aabbccdd","rootfs":"local-lvm:vm-617-disk-0,size=8G","ide2":"none,media=cdrom"}}"#,
+    );
+
+    let planned = call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster":"pve3","vmid":617}),
+    )
+    .await
+    .expect("an empty cdrom drive must not refuse the destroy plan");
+    assert!(planned["change_set_id"].as_str().is_some());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_task_that_ends_non_ok_is_reported_as_a_failure_not_a_success() {
     let h = handler_with_guest(617, false).await;
