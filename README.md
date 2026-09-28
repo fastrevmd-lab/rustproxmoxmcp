@@ -97,18 +97,18 @@ outside the tool call: **there is deliberately no `grant_waiver` tool and no
 | `get_cluster_status` | cluster | Quorum and node membership |
 | `get_nodes` | cluster | All nodes with status and resource totals |
 | `get_node_status` | node | Detailed status for one node |
-| `get_vms` | cluster | All QEMU guests with node, status, tags |
-| `get_containers` | cluster | All LXC guests with node, status, tags |
+| `get_vms` | cluster | All QEMU guests with node, status, tags (paginated: `offset`/`limit`, default 500, max 700) |
+| `get_containers` | cluster | All LXC guests with node, status, tags (paginated: `offset`/`limit`, default 500, max 700) |
 | `get_vm_config` | guest (QEMU only) | Configuration including Proxmox digest, with `description`/`cicustom`/`args` content redacted on a best-effort basis -- credential-shaped text is stripped, but this is not a safe place to store secrets (sshkeys and network config preserved) |
 | `get_container_config` | guest (LXC only) | Configuration including Proxmox digest, with `description`/`cicustom`/`args` content redacted on a best-effort basis -- credential-shaped text is stripped, but this is not a safe place to store secrets (sshkeys and network config preserved) |
 | `get_container_ip` | guest (LXC only) | Network interfaces and addresses |
 | `get_guest_status` | guest | Current runtime status |
 | `list_snapshots` | guest | Snapshots of one guest |
 | `get_storage` | node | Storage backends visible to one node |
-| `list_backups` | storage | Backup archives on one storage backend |
+| `list_backups` | storage | Backup archives on one storage backend (paginated: `offset`/`limit`, default 500, max 700) |
 | `list_isos` | storage | ISO images on one storage backend |
 | `list_templates` | storage | Container templates on one storage backend |
-| `list_tasks` | node | Recent tasks on one node |
+| `list_tasks` | node | Recent tasks on one node (paginated: `offset`/`limit`, default 500, max 700) |
 | `get_task_status` | task | Status of one task by UPID |
 | `get_proxmox_change_set` | change set | One change set's state and preview |
 | `get_cluster_firewall_rules` | cluster | Cluster-wide firewall rules |
@@ -135,6 +135,14 @@ those exist only at cluster and guest scope. All fourteen firewall tools are
 read-only: none of them appear in `WRITE_TOOLS`, so nothing here can create,
 edit or delete a rule, alias, IPSet or security group. That capability is
 tracked separately as governed firewall writes.
+
+**Pagination:** `get_vms`, `get_containers`, `list_tasks` and `list_backups`
+have no bound on cluster/node/storage size and can exceed the MCP result's
+512 KiB cap on a large deployment. They take an optional `offset` and
+`limit` (default 500, max 700 -- sized to stay comfortably under the cap)
+and return `{items, total, offset, limit, has_more}` rather than a bare
+array, so a caller can tell a short list from one that needs another page. A
+`limit` above 700 is refused, not silently clamped.
 
 ### The 18 low tools
 
