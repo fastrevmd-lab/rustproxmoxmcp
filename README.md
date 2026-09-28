@@ -430,13 +430,13 @@ The core crate has a non-default `testing` feature that pulls in `rcgen`, `rustl
 
 ## Sibling servers
 
-| | [rustjunosmcp](https://github.com/fastrevmd-lab/rustjunosmcp) | [rustpanosmcp](https://github.com/fastrevmd-lab/rustpanosmcp) | rustproxmoxmcp |
-|---|---|---|---|
-| Vendor | Juniper Junos / SRX | Palo Alto PAN-OS | Proxmox VE |
-| Transport | NETCONF over SSH | HTTPS XML-API | HTTPS REST |
-| Status | shipping | shipping | shipping, 0.8.0 |
+| | [rustjunosmcp](https://github.com/fastrevmd-lab/rustjunosmcp) | [rustpanosmcp](https://github.com/fastrevmd-lab/rustpanosmcp) | [rustmistmcp](https://github.com/fastrevmd-lab/rustmistmcp) | [rustunifimcp](https://github.com/fastrevmd-lab/rustunifimcp) | [rustsdcmcp](https://github.com/fastrevmd-lab/rustsdcmcp) | rustproxmoxmcp |
+|---|---|---|---|---|---|---|
+| Vendor | Juniper Junos / SRX | Palo Alto PAN-OS | Juniper Mist | Ubiquiti UniFi Network | HPE Juniper Security Director Cloud | Proxmox VE |
+| Transport | NETCONF over SSH | HTTPS XML-API | HTTPS REST | HTTPS REST | HTTPS REST | HTTPS REST |
+| Status | shipping, v0.25.0 | shipping, v0.14.0 | foundation built, read-only live-tenant acceptance passed | in production | pre-release (v0.1.0-lab) | shipping, v0.10.0 |
 
-All three consume `mecmcp` — the shared Rust crate family underneath mechub's per-vendor MCP servers.
+All six consume `mecmcp` — the shared Rust crate family underneath mechub's per-vendor MCP servers.
 
 ## Audit forwarding to the event store
 

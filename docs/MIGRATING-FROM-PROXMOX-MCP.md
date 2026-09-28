@@ -20,12 +20,13 @@ approval binds the **plan digest**, which covers `(owner, device, expected
 fingerprint, actions)`; and applying re-checks the guest's fingerprint.
 
 **Know what the fingerprint covers before relying on it.** It is computed over
-`cluster`, `vmid`, `name`, `kind`, `node`, `status` and `tags`. `config_digest`
-and `disks` are sent **empty** at both plan and apply, so a configuration-only
-change does not move it: a guest can have its hardware or disks altered between
-approval and apply and still match. What the re-check reliably catches is a
-guest that was renamed, migrated, stopped or started, retagged, or replaced by
-one with different identity metadata -- not one that was reconfigured in place.
+`cluster`, `vmid`, `name`, `kind`, `node`, `status`, `tags`, `config_digest`
+and `disks`. `config_digest` and `disks` are read from the guest's live
+configuration at both plan and apply, so a configuration-only change --
+Proxmox's own config digest moving, or a disk being resized, added, or
+removed -- also invalidates the fingerprint. What the re-check catches is a
+guest that was renamed, migrated, stopped or started, retagged, reconfigured,
+or replaced by one with different identity metadata.
 
 `--lab-mode` waives the second principal for a single-operator lab, and
 `--waivers-file` carries time-boxed operator waivers — both originate outside
