@@ -3473,6 +3473,12 @@ impl ProxmoxServer {
             .as_ref()
             .map(|ctx| ctx.token_name.clone())
             .unwrap_or_else(|| "stdio".to_owned());
+        // Truthful, not permissive: a stdio caller carries no verified token
+        // entry, so its actor type is unknown rather than assumed human. mecmcp's
+        // `approve_change_set` refuses anything but `Human` (the house rule that
+        // a human approves), which is exactly the outcome an unattributed caller
+        // should get.
+        let approver_actor_type = change_set::actor_type(caller.as_ref());
 
         let coordinator = self.coordinator.clone();
 
@@ -3501,6 +3507,7 @@ impl ProxmoxServer {
                 device.clone(),
                 approver,
                 record.digest.clone(),
+                approver_actor_type,
             )
             .await
         {

@@ -68,6 +68,14 @@ service-owned) carries time-boxed operator waivers. Both overrides originate
 outside the tool call: **there is deliberately no `grant_waiver` tool and no
 `force` argument**, because an override a caller can pass is not an override.
 
+- **`approve_proxmox_change_set` requires a human approver token.** The
+  server passes the caller's token `actor_type` through to mecmcp, which
+  refuses any approval from an `agent` or unattributed (stdio) caller --
+  only `actor_type: human` can approve. Mint the approver's token with
+  `rust-proxmoxmcp token add ... --actor-type human`. `actor_type` is a
+  claim the operator makes at mint time, not something the server proves;
+  a token tagged `human` but handed to an LLM agent defeats the gate.
+
 ### What's implemented
 
 - **Multi-cluster inventory:** One server, many clusters. Each cluster gets its own API token and protection policy.
@@ -383,7 +391,7 @@ only spent when `apply_proxmox_change_set` actually executes it.
 }
 ```
 
-Mint a token with `rust-proxmoxmcp token add <name>`. The plaintext token is printed once and never recoverable.
+Mint a token with `rust-proxmoxmcp token add <name>`. The plaintext token is printed once and never recoverable. Pass `--actor-type human` for any token that will approve change sets -- see [Change control](#change-control).
 
 **IMPORTANT:** A token without a `grant` key is refused for guest-addressed tools. To grant read access to all guests:
 
