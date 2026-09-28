@@ -858,6 +858,107 @@ pub async fn clone_guest(
     upid_from(data)
 }
 
+/// The node names Proxmox currently reports as cluster members.
+///
+/// Used to validate a migration target before it is planned: Proxmox itself
+/// would refuse a migrate to an unknown node, but only after an approval has
+/// been spent on it. Refusing here keeps that state unreachable, the same
+/// reasoning [`fetch_guest_config_state`] and the stopped-guest check in the
+/// change-set handlers already apply to other preconditions.
+///
+/// # Errors
+///
+/// Propagates any client error. Returns [`ProxmoxError::Malformed`] if the
+/// response is not an array of objects each carrying a `node` string.
+pub async fn list_node_names(client: &ProxmoxClient) -> Result<Vec<String>, ProxmoxError> {
+    let data = client.get_json("/api2/json/nodes", &[], &[]).await?;
+    let array = data
+        .as_array()
+        .ok_or_else(|| ProxmoxError::Malformed("nodes response is not an array".into()))?;
+
+    array
+        .iter()
+        .map(|entry| {
+            entry
+                .get("node")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+                .ok_or_else(|| ProxmoxError::Malformed("node entry has no 'node' string".into()))
+        })
+        .collect()
+}
+
+/// Migrate a guest to another node and return its UPID.
+///
+/// Covers both guest types under one function, unlike [`destroy_vm`] and
+/// [`destroy_container`], because migration's form parameters are close enough
+/// across the two that a shared function reads more clearly than the
+/// difference would justify splitting it: only the meaning of `online` moves,
+/// documented below.
+///
+/// `online` means the vendor-documented thing for each guest type:
+/// - QEMU (`kind` is [`crate::selector::GuestType::Qemu`]): Proxmox's own
+///   `online` parameter, a true live migration that keeps the guest running
+///   throughout.
+/// - LXC (`kind` is [`crate::selector::GuestType::Lxc`]): Proxmox's `restart`
+///   parameter. Containers have no live-migration path in stock Proxmox VE;
+///   `restart` stops the container, migrates it, and starts it again on the
+///   target node. Requesting `online` for a container therefore still causes
+///   a brief interruption -- the caller-visible difference from `online: false`
+///   is that Proxmox performs that stop/start itself as one operation, rather
+///   than refusing outright because the container is running.
+///
+/// `with_local_disks` only means anything for QEMU: it tells Proxmox to copy
+/// disks that live on node-local storage along with the guest, rather than
+/// refusing because they are not on shared storage. Proxmox ignores the
+/// concept for LXC, which always migrates its volumes, so it is not sent for
+/// that guest type.
+///
+/// This is the primitive operation, reached only from `apply_proxmox_change_set`
+/// after two-principal approval; calling it directly bypasses change-set
+/// control.
+///
+/// # Errors
+///
+/// As [`lifecycle`].
+pub async fn migrate_guest(
+    client: &ProxmoxClient,
+    node: &str,
+    kind: crate::selector::GuestType,
+    vmid: u32,
+    target_node: &str,
+    online: bool,
+    with_local_disks: bool,
+) -> Result<String, ProxmoxError> {
+    let path_template = "/api2/json/nodes/{node}/{kind}/{vmid}/migrate";
+    let vmid_string = vmid.to_string();
+    let params = &[
+        ("node", node),
+        ("kind", kind.path_segment()),
+        ("vmid", vmid_string.as_str()),
+    ];
+
+    let mut form: Vec<(&str, &str)> = vec![("target", target_node)];
+    match kind {
+        crate::selector::GuestType::Qemu => {
+            if online {
+                form.push(("online", "1"));
+            }
+            if with_local_disks {
+                form.push(("with-local-disks", "1"));
+            }
+        }
+        crate::selector::GuestType::Lxc => {
+            if online {
+                form.push(("restart", "1"));
+            }
+        }
+    }
+
+    let data = client.post_form(path_template, params, &form).await?;
+    upid_from(data)
+}
+
 /// Resize a guest disk and return the UPID.
 ///
 /// `size` is Proxmox's form: `+8G` to grow by, or an absolute value. See

@@ -378,6 +378,16 @@ impl TestServer {
     pub fn requests(&self) -> Vec<rust_proxmoxmcp_core::testing::RecordedRequest> {
         self.mock.requests()
     }
+
+    /// Replace (or add) one route on the mock Proxmox.
+    ///
+    /// A thin passthrough for tests that simulate state changing out from
+    /// under a change set for a resource with no dedicated helper -- an HA
+    /// rule, unlike a guest, has neither `set_guest_config` nor
+    /// `move_guest_to_node` to reach for.
+    pub fn replace_route(&self, route: Route) {
+        self.mock.replace_route(route);
+    }
 }
 
 /// Parse a scope specification into a `ScopeSet`.
@@ -455,6 +465,11 @@ pub fn default_guest_routes(_vmid: u32, protected: bool) -> Vec<Route> {
             status: 200,
             body: br#"{"data":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:617:root@pam:"}"#,
         },
+        Route {
+            path: "/api2/json/nodes/pve2/lxc/617/migrate",
+            status: 200,
+            body: br#"{"data":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzmigrate:617:root@pam:"}"#,
+        },
     ]
 }
 
@@ -490,6 +505,9 @@ pub async fn handler_with_guest_on_state(
             // The fixture guest is an LXC, and a guest destroy authorises
             // against its own type: delete_container, not delete_vm.
             "delete_container".to_owned(),
+            // Migration: the fixture guest is an LXC, so migrate_container,
+            // not migrate_vm.
+            "migrate_container".to_owned(),
         ],
         guests: vec!["*".to_owned()],
     };

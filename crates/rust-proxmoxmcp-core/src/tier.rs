@@ -78,6 +78,7 @@ pub fn interrupts_service(tool: &str) -> bool {
 /// Tools excluded from a wildcard tool scope. Complete as of spec §4.3.
 pub const WRITE_TOOLS: &[&str] = &[
     // low
+    "approve_ha_rule_change",
     "approve_proxmox_change_set",
     "clone_vm",
     "create_backup",
@@ -85,6 +86,7 @@ pub const WRITE_TOOLS: &[&str] = &[
     "create_snapshot",
     "create_vm",
     "download_iso",
+    "plan_ha_rule_change",
     "plan_proxmox_destroy",
     "reset_vm",
     "restart_container",
@@ -98,29 +100,41 @@ pub const WRITE_TOOLS: &[&str] = &[
     // low or destructive depending on direction; classified at call time
     "resize_disk",
     // destructive
+    "apply_ha_rule_change",
     "apply_proxmox_change_set",
+    "create_ha_rule",
     "delete_backup",
     "delete_container",
+    "delete_ha_rule",
     "delete_iso",
     "delete_snapshot",
     "delete_vm",
+    "migrate_container",
+    "migrate_vm",
     "restore_backup",
     "rollback_snapshot",
+    "update_ha_rule",
     // deferred to 0.5, registered here so a wildcard never reaches it
     "execute_vm_command",
 ];
 
 /// Tools whose tier is `Destructive`.
 const DESTRUCTIVE_TOOLS: &[&str] = &[
+    "apply_ha_rule_change",
     "apply_proxmox_change_set",
+    "create_ha_rule",
     "delete_backup",
     "delete_container",
+    "delete_ha_rule",
     "delete_iso",
     "delete_snapshot",
     "delete_vm",
     "execute_vm_command",
+    "migrate_container",
+    "migrate_vm",
     "restore_backup",
     "rollback_snapshot",
+    "update_ha_rule",
 ];
 
 /// Classify a tool.
@@ -141,7 +155,7 @@ pub fn tier_of(tool: &str) -> Option<Tier> {
         return Some(Tier::Low);
     }
     // Change-set inspection tools are Read-tier but not Proxmox API calls.
-    if tool == "get_proxmox_change_set" {
+    if tool == "get_proxmox_change_set" || tool == "get_ha_rule_change_set" {
         return Some(Tier::Read);
     }
     crate::catalog::read_tool(tool).map(|_| Tier::Read)

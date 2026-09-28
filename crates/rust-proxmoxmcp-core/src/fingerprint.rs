@@ -100,3 +100,34 @@ pub fn fingerprint(state: &GuestState) -> String {
         .collect::<String>();
     format!("sha256:{}", hex)
 }
+
+/// Computes a stable fingerprint of an HA rule's current state.
+///
+/// HA rules have no per-object digest field this server relies on, and unlike
+/// a guest they carry no vmid/node identity of their own -- the rule's own
+/// JSON body (or its absence, for a rule that does not exist yet) is the only
+/// state there is to detect drift against. `existing` is `None` when the rule
+/// is absent, which `create` plans against and any other op must not.
+///
+/// Returns a string in the format `sha256:<lowercase hex>`, matching
+/// [`fingerprint`] so the two are never confused for one another by shape.
+#[must_use]
+pub fn ha_rule_fingerprint(
+    cluster: &str,
+    rule: &str,
+    existing: Option<&serde_json::Value>,
+) -> String {
+    let tuple = (cluster, rule, existing);
+    let bytes =
+        serde_json::to_vec(&tuple).expect("tuple serialization cannot fail with these types");
+
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let hash = hasher.finalize();
+
+    let hex = hash
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>();
+    format!("sha256:{}", hex)
+}
