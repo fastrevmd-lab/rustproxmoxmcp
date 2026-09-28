@@ -6,7 +6,173 @@
 
 use crate::client::ProxmoxClient;
 use crate::error::ProxmoxError;
+use crate::selector::GuestType;
 use crate::task::Upid;
+
+/// A guest's own config digest and disk sizes, read from its config endpoint.
+///
+/// `/cluster/resources` (what [`crate::resolve::GuestIndex`] caches) is a
+/// cluster-wide summary and reports neither field. Both are needed for the
+/// plan/apply fingerprint, so they come from the guest's own
+/// `/nodes/{node}/{kind}/{vmid}/config` instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestConfigState {
+    /// Proxmox's own digest of this guest's config, changed by any edit.
+    pub config_digest: String,
+    /// `(disk key, size in bytes)` for every disk device in the config.
+    pub disks: Vec<(String, u64)>,
+}
+
+/// Fetch a guest's `digest` and disk sizes from its own config endpoint.
+///
+/// Used to fill [`crate::fingerprint::GuestState::config_digest`] and
+/// `::disks`, which the plan/apply fingerprint compares to detect drift
+/// between approval and application. Failing to read `digest`, or finding a
+/// disk that carries a `size=` which cannot be parsed, refuses rather than
+/// fingerprint with the field silently omitted -- an omitted field cannot
+/// compare unequal, so a change to it would never be caught. A disk with no
+/// `size=` at all (an empty cdrom, an LXC bind mount, a passed-through block
+/// device) is not refused: it contributes nothing to `disks`, but
+/// `config_digest` already covers every byte of its config line, so drift on
+/// it still fails the fingerprint compare. See [`classify_disk_size`].
+///
+/// # Errors
+///
+/// Returns [`ProxmoxError::Malformed`] if the response is not an object, has
+/// no `digest`, or has a disk key whose value has a `size=` that cannot be
+/// parsed. Propagates any client error from the request.
+pub async fn fetch_guest_config_state(
+    client: &ProxmoxClient,
+    node: &str,
+    kind: GuestType,
+    vmid: u32,
+) -> Result<GuestConfigState, ProxmoxError> {
+    let path_template = "/api2/json/nodes/{node}/{kind}/{vmid}/config";
+    let vmid_string = vmid.to_string();
+    let params = &[
+        ("node", node),
+        ("kind", kind.path_segment()),
+        ("vmid", vmid_string.as_str()),
+    ];
+
+    let data = client.get_json(path_template, params, &[]).await?;
+    let object = data.as_object().ok_or_else(|| {
+        ProxmoxError::Malformed(format!("guest {vmid} config response is not an object"))
+    })?;
+
+    let config_digest = object
+        .get("digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ProxmoxError::Malformed(format!("guest {vmid} config has no digest")))?
+        .to_owned();
+
+    let mut disks = Vec::new();
+    for (key, value) in object {
+        if !is_disk_key(key) {
+            continue;
+        }
+        let Some(raw) = value.as_str() else {
+            continue;
+        };
+        match classify_disk_size(raw) {
+            DiskSize::Sized(size) => disks.push((key.clone(), size)),
+            // No managed size to track (cdrom, LXC bind mount, passthrough
+            // device), but config_digest still covers every byte of the
+            // config line, so drift is still caught.
+            DiskSize::Unmanaged => {}
+            DiskSize::Unparseable => {
+                return Err(ProxmoxError::Malformed(format!(
+                    "guest {vmid} disk '{key}' has an unparseable size"
+                )));
+            }
+        }
+    }
+
+    Ok(GuestConfigState {
+        config_digest,
+        disks,
+    })
+}
+
+/// Whether a config key names an attached disk device.
+///
+/// Covers every disk-bearing key Proxmox defines for QEMU (`ideN`, `sataN`,
+/// `scsiN`, `virtioN`, `efidiskN`, `tpmstateN`) and LXC (`rootfs`, `mpN`).
+/// `unusedN` (a detached disk still consuming storage) is deliberately
+/// excluded: it is not part of the guest's active disk set, and a rename it
+/// undergoes is not among the "make illegal states unrepresentable" cases
+/// this fingerprint targets.
+fn is_disk_key(key: &str) -> bool {
+    if key == "rootfs" {
+        return true;
+    }
+    const PREFIXES: [&str; 7] = ["ide", "sata", "scsi", "virtio", "efidisk", "tpmstate", "mp"];
+    PREFIXES.iter().any(|prefix| {
+        key.strip_prefix(prefix)
+            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()))
+    })
+}
+
+/// The outcome of interpreting one disk config value for fingerprinting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskSize {
+    /// Has a `size=` that parsed; contributes a `(key, bytes)` entry.
+    Sized(u64),
+    /// No managed size to track: an empty cdrom drive (`media=cdrom`), an
+    /// LXC bind mount (`mp=/data` over a host path with no `size=`), or a
+    /// passed-through block device (a bare path, also no `size=`). These are
+    /// not refused: `config_digest` already covers every byte of the config
+    /// line, so a change to any of them still fails the fingerprint compare.
+    Unmanaged,
+    /// Had a `size=` parameter, but its value could not be parsed. Refused
+    /// rather than guessed, per [`parse_size_bytes`].
+    Unparseable,
+}
+
+/// Classify a disk config value from `size=`, matching the fields Proxmox
+/// puts on `ideN`/`sataN`/`scsiN`/`virtioN`/`efidiskN`/`tpmstateN`/`rootfs`/
+/// `mpN` values.
+///
+/// A disk value looks like `local-lvm:vm-100-disk-0,size=32G`: a storage
+/// volume followed by comma-separated options. `size` is one of them, not
+/// necessarily the first. An empty cdrom drive looks like
+/// `none,media=cdrom` or `cdrom,media=cdrom` and carries no size at all.
+fn classify_disk_size(raw: &str) -> DiskSize {
+    if raw.split(',').any(|part| part == "media=cdrom") {
+        return DiskSize::Unmanaged;
+    }
+    let Some(size_param) = raw.split(',').find_map(|part| part.strip_prefix("size=")) else {
+        return DiskSize::Unmanaged;
+    };
+    match parse_size_bytes(size_param) {
+        Some(size) => DiskSize::Sized(size),
+        None => DiskSize::Unparseable,
+    }
+}
+
+/// Parse a Proxmox size string (`32G`, `512M`, `1536`) into bytes.
+///
+/// Units are binary (1024-based), matching Proxmox's own convention. A bare
+/// number is already bytes. Rejects a negative or unreadable value rather
+/// than guessing: an unparseable size must refuse the fingerprint, not be
+/// silently treated as some default.
+fn parse_size_bytes(value: &str) -> Option<u64> {
+    let (digits, multiplier) = match value.chars().last()? {
+        'K' | 'k' => (&value[..value.len() - 1], 1024u64),
+        'M' | 'm' => (&value[..value.len() - 1], 1024 * 1024),
+        'G' | 'g' => (&value[..value.len() - 1], 1024 * 1024 * 1024),
+        'T' | 't' => (&value[..value.len() - 1], 1024 * 1024 * 1024 * 1024),
+        _ => (value, 1),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let parsed: f64 = digits.parse().ok()?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return None;
+    }
+    Some((parsed * multiplier as f64) as u64)
+}
 
 /// Destroy a container and return its UPID string.
 ///
@@ -1006,6 +1172,103 @@ pub async fn stop_task(
     let path = format!("{prefix}/{}", crate::client::percent_encode(upid));
 
     client.delete_json(&path, &[], &[]).await
+}
+
+#[cfg(test)]
+mod disk_key_tests {
+    use super::is_disk_key;
+
+    #[test]
+    fn every_disk_bearing_key_is_recognized() {
+        for key in [
+            "rootfs",
+            "mp0",
+            "mp12",
+            "ide0",
+            "sata1",
+            "scsi5",
+            "virtio0",
+            "efidisk0",
+            "tpmstate0",
+        ] {
+            assert!(is_disk_key(key), "{key} should be a disk key");
+        }
+    }
+
+    #[test]
+    fn non_disk_keys_and_unused_are_excluded() {
+        for key in [
+            "memory", "cores", "digest", "tags", "unused0", "net0", "ide",
+        ] {
+            assert!(!is_disk_key(key), "{key} should not be a disk key");
+        }
+    }
+}
+
+#[cfg(test)]
+mod disk_size_tests {
+    use super::{DiskSize, classify_disk_size};
+
+    #[test]
+    fn units_convert_to_binary_bytes() {
+        assert_eq!(
+            classify_disk_size("local-lvm:vm-100-disk-0,size=32G"),
+            DiskSize::Sized(32 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(
+            classify_disk_size("local:100/vm-100-disk-0.raw,size=512M"),
+            DiskSize::Sized(512 * 1024 * 1024)
+        );
+        assert_eq!(
+            classify_disk_size("local-lvm:vm-100-disk-0,size=2048"),
+            DiskSize::Sized(2048)
+        );
+    }
+
+    #[test]
+    fn size_need_not_be_the_first_option() {
+        assert_eq!(
+            classify_disk_size("local-lvm:vm-100-disk-0,ssd=1,size=8G,discard=on"),
+            DiskSize::Sized(8 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn unparseable_size_refuses() {
+        for raw in [
+            "local-lvm:vm-100-disk-0,size=",
+            "local-lvm:vm-100-disk-0,size=-8G",
+            "local-lvm:vm-100-disk-0,size=banana",
+        ] {
+            assert_eq!(
+                classify_disk_size(raw),
+                DiskSize::Unparseable,
+                "{raw} should be unparseable"
+            );
+        }
+    }
+
+    /// Common real-world shapes that carry no `size=` at all: the PVE wizard
+    /// default empty cdrom (`none,media=cdrom`), an explicit empty cdrom
+    /// (`cdrom,media=cdrom`), a cloud-init drive, an LXC bind mount, and a
+    /// passed-through block device. None of these should refuse the
+    /// fingerprint -- `config_digest` already covers their config line.
+    #[test]
+    fn shapes_with_no_managed_size_are_unmanaged_not_refused() {
+        for raw in [
+            "none,media=cdrom",
+            "cdrom,media=cdrom",
+            "local-lvm:vm-100-cloudinit,media=cdrom",
+            "/host/path,mp=/data",
+            "/dev/disk/by-id/scsi-3600508b1001c0000abcdef1234567890",
+        ] {
+            assert_eq!(
+                classify_disk_size(raw),
+                DiskSize::Unmanaged,
+                "{raw} should be unmanaged, not refused"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

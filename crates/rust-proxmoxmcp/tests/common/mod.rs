@@ -442,11 +442,13 @@ pub fn default_guest_routes(_vmid: u32, protected: bool) -> Vec<Route> {
             },
         },
         // A read that resolves through GuestIndex, so a test can deliberately
-        // warm the snapshot the plan path reads.
+        // warm the snapshot the plan path reads. Carries a `digest` and a
+        // disk: the plan/apply fingerprint reads both from this endpoint, and
+        // an absent field would make the whole fixture untestable for drift.
         Route {
             path: "/api2/json/nodes/pve2/lxc/617/config",
             status: 200,
-            body: br#"{"data":{"hostname":"test-guest-617","cores":1,"memory":512}}"#,
+            body: br#"{"data":{"hostname":"test-guest-617","cores":1,"memory":512,"digest":"aabbccddeeff00112233445566778899aabbccdd","rootfs":"local-lvm:vm-617-disk-0,size=8G"}}"#,
         },
         Route {
             path: "/api2/json/nodes/pve2/lxc/617",
@@ -604,6 +606,22 @@ pub async fn approve_as_second_principal_for(
 }
 
 impl TestServer {
+    /// Replace a guest's own `/config` response, e.g. to simulate the guest's
+    /// config or a disk changing between plan and apply.
+    ///
+    /// Unlike `/cluster/resources`, nothing caches this endpoint: the
+    /// plan/apply fingerprint fetches it fresh on every call, so no index
+    /// invalidation is needed here the way `move_guest_to_node` needs one.
+    pub fn set_guest_config(&self, node: &str, kind: &str, vmid: u32, body: &'static [u8]) {
+        self.mock.replace_route(Route {
+            path: Box::leak(
+                format!("/api2/json/nodes/{node}/{kind}/{vmid}/config").into_boxed_str(),
+            ),
+            status: 200,
+            body,
+        });
+    }
+
     /// Simulate moving a guest to a different node (changes fingerprint).
     ///
     /// Updates the mock Proxmox's `/api2/json/cluster/resources` response to
@@ -621,6 +639,17 @@ impl TestServer {
             path: "/api2/json/cluster/resources",
             status: 200,
             body: Box::leak(body.into_boxed_str()).as_bytes(),
+        });
+
+        // The re-fetched fingerprint reads the guest's config from its
+        // (now-current) node, so the mock needs a route there too, or the
+        // apply fails on the fetch itself rather than on the fingerprint
+        // mismatch the test means to exercise. `replace_route` adds a route
+        // that does not already exist, which this one does not.
+        self.mock.replace_route(Route {
+            path: Box::leak(format!("/api2/json/nodes/{new_node}/lxc/{vmid}/config").into_boxed_str()),
+            status: 200,
+            body: br#"{"data":{"hostname":"test-guest-moved","cores":1,"memory":512,"digest":"aabbccddeeff00112233445566778899aabbccdd","rootfs":"local-lvm:vm-617-disk-0,size=8G"}}"#,
         });
 
         // Invalidate the cache so the next resolve fetches the updated data.
@@ -643,6 +672,15 @@ impl TestServer {
             path: "/api2/json/cluster/resources",
             status: 200,
             body: Box::leak(body.into_boxed_str()).as_bytes(),
+        });
+
+        // Same reasoning as `move_guest_to_node`: whichever node the next
+        // resolve reports, its config endpoint must exist for the fingerprint
+        // re-check to reach its own comparison rather than failing the fetch.
+        self.mock.replace_route(Route {
+            path: Box::leak(format!("/api2/json/nodes/{new_node}/lxc/{vmid}/config").into_boxed_str()),
+            status: 200,
+            body: br#"{"data":{"hostname":"test-guest-moved","cores":1,"memory":512,"digest":"aabbccddeeff00112233445566778899aabbccdd","rootfs":"local-lvm:vm-617-disk-0,size=8G"}}"#,
         });
     }
 }

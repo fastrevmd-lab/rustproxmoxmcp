@@ -111,6 +111,84 @@ async fn a_fingerprint_that_moved_after_approval_refuses_the_apply() {
     );
 }
 
+/// M12: the fingerprint must cover the guest's own config digest, not just
+/// what `/cluster/resources` reports (name, node, status, tags). A config
+/// edit with no node move or status change used to leave `config_digest`
+/// hardcoded to an empty string on both sides of the comparison, so it could
+/// never catch drift.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_config_digest_that_changed_after_approval_refuses_the_apply() {
+    let h = common::handler_with_guest(617, false).await;
+    let planned = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect("plan");
+    let id = planned["change_set_id"].as_str().expect("id");
+    common::approve_as_second_principal(&h, id).await;
+
+    // Same node, same status, same disks -- only the digest changes, the way
+    // any config edit changes it on a real Proxmox.
+    h.set_guest_config(
+        "pve2",
+        "lxc",
+        617,
+        br#"{"data":{"hostname":"test-guest-617","cores":1,"memory":512,"digest":"0000000000000000000000000000000000000000","rootfs":"local-lvm:vm-617-disk-0,size=8G"}}"#,
+    );
+
+    let err = common::call(
+        &h,
+        "apply_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect_err("a changed config digest must refuse the apply");
+    assert!(
+        err.to_string().to_lowercase().contains("fingerprint"),
+        "{err}"
+    );
+}
+
+/// M12's other half: a disk that grew (or shrank) between approval and apply
+/// must be caught even when the digest field were somehow unchanged. Disks
+/// were the other hardcoded-empty field in the fingerprint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disk_that_grew_after_approval_refuses_the_apply() {
+    let h = common::handler_with_guest(617, false).await;
+    let planned = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect("plan");
+    let id = planned["change_set_id"].as_str().expect("id");
+    common::approve_as_second_principal(&h, id).await;
+
+    // Digest deliberately kept identical to the plan-time fixture, so this
+    // failure is attributable to the disk size alone.
+    h.set_guest_config(
+        "pve2",
+        "lxc",
+        617,
+        br#"{"data":{"hostname":"test-guest-617","cores":1,"memory":512,"digest":"aabbccddeeff00112233445566778899aabbccdd","rootfs":"local-lvm:vm-617-disk-0,size=16G"}}"#,
+    );
+
+    let err = common::call(
+        &h,
+        "apply_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect_err("a grown disk must refuse the apply");
+    assert!(
+        err.to_string().to_lowercase().contains("fingerprint"),
+        "{err}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_protected_guest_with_matching_waiver_can_be_applied() {
     use rust_proxmoxmcp_core::waiver::{WaiverEntry, WaiverFile};
@@ -159,6 +237,11 @@ async fn a_protected_guest_with_matching_waiver_can_be_applied() {
             path: "/api2/json/nodes/pve2/lxc/618",
             status: 200,
             body: br#"{"data":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:618:root@pam:"}"#,
+        },
+        common::Route {
+            path: "/api2/json/nodes/pve2/lxc/618/config",
+            status: 200,
+            body: br#"{"data":{"hostname":"test-protected","digest":"aabbccddeeff00112233445566778899aabbccdd","rootfs":"local-lvm:vm-618-disk-0,size=8G"}}"#,
         },
     ];
 
@@ -240,6 +323,11 @@ async fn a_protected_guest_with_lab_mode_can_be_applied() {
             path: "/api2/json/nodes/pve2/lxc/619",
             status: 200,
             body: br#"{"data":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:619:root@pam:"}"#,
+        },
+        common::Route {
+            path: "/api2/json/nodes/pve2/lxc/619/config",
+            status: 200,
+            body: br#"{"data":{"hostname":"test-protected","digest":"aabbccddeeff00112233445566778899aabbccdd","rootfs":"local-lvm:vm-619-disk-0,size=8G"}}"#,
         },
     ];
 
@@ -890,6 +978,11 @@ async fn an_approval_is_spent_by_the_first_apply_and_cannot_destroy_twice() {
             path: "/api2/json/nodes/pve2/lxc/619",
             status: 200,
             body: br#"{"data":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:619:root@pam:"}"#,
+        },
+        common::Route {
+            path: "/api2/json/nodes/pve2/lxc/619/config",
+            status: 200,
+            body: br#"{"data":{"hostname":"test-protected","digest":"aabbccddeeff00112233445566778899aabbccdd","rootfs":"local-lvm:vm-619-disk-0,size=8G"}}"#,
         },
     ];
 
