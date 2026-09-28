@@ -51,25 +51,36 @@ async fn a_request_flood_from_one_ip_is_rate_limited() {
     let h = common::TestServer::start(common::TokenSpec::full()).await;
     let client = reqwest::Client::new();
 
-    let mut saw_too_many_requests = false;
-    // The default burst is 100/ip; comfortably exceed it so the flood is not
-    // flaky against scheduling jitter between requests.
+    // The default burst is 100/ip, refilling at 50/s. Fire all 200 requests
+    // concurrently rather than sequentially awaiting each one: on a loaded
+    // CI runner, a sequential loop can take long enough between requests
+    // that the bucket refills as fast as it drains, and the flood never
+    // exceeds the burst.
+    let mut handles = Vec::with_capacity(200);
     for _ in 0..200 {
-        let response = client
-            .get(format!("{}/healthz", h.url))
-            .header(reqwest::header::HOST, "localhost")
-            .send()
-            .await
-            .expect("request");
-        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+        let client = client.clone();
+        let url = format!("{}/healthz", h.url);
+        handles.push(tokio::spawn(async move {
+            client
+                .get(url)
+                .header(reqwest::header::HOST, "localhost")
+                .send()
+                .await
+                .expect("request")
+                .status()
+        }));
+    }
+
+    let mut saw_too_many_requests = false;
+    for handle in handles {
+        if handle.await.expect("task") == StatusCode::TOO_MANY_REQUESTS {
             saw_too_many_requests = true;
-            break;
         }
     }
 
     assert!(
         saw_too_many_requests,
-        "a flood of 200 requests from one IP must eventually be rate-limited (429); \
+        "a flood of 200 concurrent requests from one IP must be rate-limited (429); \
          LimitsConfig::default() is supposed to be metered as of mecmcp 0.24.1"
     );
 }

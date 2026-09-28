@@ -101,6 +101,10 @@ The secret prints **once** and is stored hashed. Note the CLI's hint: a token
 minted without `--guests` cannot use guest-addressed tools. Grant that with
 `--guests '*'` or a selector (`vmid:X`, `tag:Y`, `pool:Z`).
 
+If this token will call `approve_proxmox_change_set`, add `--actor-type
+human`: the server refuses approvals from any token whose actor type is
+`agent` or unset. See [README § Change control](../README.md#change-control).
+
 Then lock the modes down:
 
 ```bash

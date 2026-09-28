@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A change set cannot be approved by a caller whose token declares
   `actor_type: agent`, or by an unattributed (stdio) caller -- only a
   distinct `actor_type: human` principal can approve.
+  **Upgrading:** every token minted before this release has `actor_type:
+  unknown` and can no longer approve change sets. Re-mint each approver's
+  token with `rust-proxmoxmcp token add ... --actor-type human`; other
+  tokens are unaffected. See [README § Change control](README.md#change-control).
 - Raised MSRV to 1.89 (family-wide decision).
 - **Added 14 read-only firewall tools** (MEC-453): rules, options, IPSets,
   aliases and security groups at cluster, node and guest scope, matching the
