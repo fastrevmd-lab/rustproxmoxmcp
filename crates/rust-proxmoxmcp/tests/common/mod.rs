@@ -57,8 +57,12 @@ pub struct TestServer {
     pub url: String,
     /// Plaintext bearer token for authentication (first principal).
     pub token: String,
-    /// Second bearer token for two-principal workflows.
+    /// Second bearer token for two-principal workflows. Carries
+    /// `actor_type: Human`.
     pub second_token: String,
+    /// A third bearer token carrying `actor_type: Agent`, for tests that
+    /// prove an agent cannot stand in as the human approver.
+    pub agent_token: String,
     /// The mock Proxmox server.
     mock: TlsMockServer,
     /// Guest index for cache invalidation in tests.
@@ -196,10 +200,30 @@ impl TestServer {
         )
         .expect("mint token");
 
-        // Mint a second token for two-principal workflows.
+        // Mint a second token for two-principal workflows. Carries
+        // `actor_type: Human`: mecmcp's `approve_change_set` (MEC-449) refuses
+        // an approval from anything but a human principal, so the approver
+        // this harness hands to every two-principal test must be one.
         let second_plaintext = TokenStoreFile::<ProxmoxGrant>::add_with_options(
             &tokens_path,
             "test-token-2",
+            parse_scope(&spec.clusters),
+            parse_scope(&spec.tools),
+            None,
+            Some(grant.clone()),
+            None,
+            None,
+            None,
+            Some(mecmcp_auth::ActorType::Human),
+            &known,
+        )
+        .expect("mint second token");
+
+        // A third token whose entry declares `actor_type: Agent`, for tests
+        // that prove an agent cannot stand in as the human approver.
+        let agent_plaintext = TokenStoreFile::<ProxmoxGrant>::add_with_options(
+            &tokens_path,
+            "test-token-agent",
             parse_scope(&spec.clusters),
             parse_scope(&spec.tools),
             None,
@@ -207,10 +231,10 @@ impl TestServer {
             None,
             None,
             None,
-            None,
+            Some(mecmcp_auth::ActorType::Agent),
             &known,
         )
-        .expect("mint second token");
+        .expect("mint agent-actor-type token");
 
         #[cfg(unix)]
         {
@@ -271,6 +295,7 @@ impl TestServer {
             url: format!("http://{}", served.address),
             token: plaintext.expose_secret().to_owned(),
             second_token: second_plaintext.expose_secret().to_owned(),
+            agent_token: agent_plaintext.expose_secret().to_owned(),
             mock,
             index,
             _temp_dir: temp_dir,

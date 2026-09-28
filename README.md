@@ -68,6 +68,14 @@ service-owned) carries time-boxed operator waivers. Both overrides originate
 outside the tool call: **there is deliberately no `grant_waiver` tool and no
 `force` argument**, because an override a caller can pass is not an override.
 
+- **`approve_proxmox_change_set` requires a human approver token.** The
+  server passes the caller's token `actor_type` through to mecmcp, which
+  refuses any approval from an `agent` or unattributed (stdio) caller --
+  only `actor_type: human` can approve. Mint the approver's token with
+  `rust-proxmoxmcp token add ... --actor-type human`. `actor_type` is a
+  claim the operator makes at mint time, not something the server proves;
+  a token tagged `human` but handed to an LLM agent defeats the gate.
+
 ### What's implemented
 
 - **Multi-cluster inventory:** One server, many clusters. Each cluster gets its own API token and protection policy.
@@ -383,7 +391,7 @@ only spent when `apply_proxmox_change_set` actually executes it.
 }
 ```
 
-Mint a token with `rust-proxmoxmcp token add <name>`. The plaintext token is printed once and never recoverable.
+Mint a token with `rust-proxmoxmcp token add <name>`. The plaintext token is printed once and never recoverable. Pass `--actor-type human` for any token that will approve change sets -- see [Change control](#change-control).
 
 **IMPORTANT:** A token without a `grant` key is refused for guest-addressed tools. To grant read access to all guests:
 
@@ -430,13 +438,13 @@ The core crate has a non-default `testing` feature that pulls in `rcgen`, `rustl
 
 ## Sibling servers
 
-| | [rustjunosmcp](https://github.com/fastrevmd-lab/rustjunosmcp) | [rustpanosmcp](https://github.com/fastrevmd-lab/rustpanosmcp) | rustproxmoxmcp |
-|---|---|---|---|
-| Vendor | Juniper Junos / SRX | Palo Alto PAN-OS | Proxmox VE |
-| Transport | NETCONF over SSH | HTTPS XML-API | HTTPS REST |
-| Status | shipping | shipping | shipping, 0.8.0 |
+| | [rustjunosmcp](https://github.com/fastrevmd-lab/rustjunosmcp) | [rustpanosmcp](https://github.com/fastrevmd-lab/rustpanosmcp) | [rustmistmcp](https://github.com/fastrevmd-lab/rustmistmcp) | [rustunifimcp](https://github.com/fastrevmd-lab/rustunifimcp) | [rustsdcmcp](https://github.com/fastrevmd-lab/rustsdcmcp) | rustproxmoxmcp |
+|---|---|---|---|---|---|---|
+| Vendor | Juniper Junos / SRX | Palo Alto PAN-OS | Juniper Mist | Ubiquiti UniFi Network | HPE Juniper Security Director Cloud | Proxmox VE |
+| Transport | NETCONF over SSH | HTTPS XML-API | HTTPS REST | HTTPS REST | HTTPS REST | HTTPS REST |
+| Status | shipping, v0.25.0 | shipping, v0.14.0 | foundation built, read-only live-tenant acceptance passed | in production | pre-release (v0.1.0-lab) | shipping, v0.10.0 |
 
-All three consume `mecmcp` — the shared Rust crate family underneath mechub's per-vendor MCP servers.
+All six consume `mecmcp` — the shared Rust crate family underneath mechub's per-vendor MCP servers.
 
 ## Audit forwarding to the event store
 

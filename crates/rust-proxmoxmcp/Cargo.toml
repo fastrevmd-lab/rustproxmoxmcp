@@ -44,7 +44,11 @@ tracing-subscriber = { workspace = true }
 # digest. Dev-only, so a release build never enables it.
 mecmcp-changeset = { workspace = true, features = ["test-util"] }
 mecmcp-auth      = { workspace = true }
-mecmcp-transport = { workspace = true }
+# Test-only: the test harness uses mecmcp_transport::test_harness::serve_on_loopback
+# and mecmcp_transport::test_client::McpClient. mecmcp 0.24.0 (#387) moved both
+# behind this feature and dropped their `ureq` dependency from the normal
+# (non-test-util) dependency graph.
+mecmcp-transport = { workspace = true, features = ["test-util"] }
 reqwest          = { version = "0.13", features = ["json"] }
 rust-proxmoxmcp-core = { workspace = true, features = ["testing"] }
 serde_json       = { workspace = true }

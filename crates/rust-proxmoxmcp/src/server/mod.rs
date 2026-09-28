@@ -3462,13 +3462,12 @@ impl ProxmoxServer {
         // on load, so the text an approver reviewed cannot be edited afterwards
         // without the store refusing it.
         //
-        // It does **not** make the approval cryptographically cover the
-        // preview: the plan digest is over (owner, device, fingerprint,
-        // actions), and the approval is over that digest. The action is what
-        // the approval binds, and the preview is rendered from the action —
-        // but nothing forces them to agree. Tracked separately; the README and
-        // migration guide now describe the binding that exists rather than the
-        // one that does not.
+        // The plan digest itself is over (owner, device, fingerprint, actions)
+        // and says nothing about this preview text. Cryptographic coverage of
+        // the preview comes from the coordinator at approve time: mecmcp
+        // 0.23.0 folds this preview's digest into the approval digest, so the
+        // approver ends up signing the exact text stored here as well as the
+        // plan. See the `create_change_set` call above.
         let Some(mut with_preview) = coordinator
             .change_sets()
             .await
@@ -3638,6 +3637,12 @@ impl ProxmoxServer {
             .as_ref()
             .map(|ctx| ctx.token_name.clone())
             .unwrap_or_else(|| "stdio".to_owned());
+        // Truthful, not permissive: a stdio caller carries no verified token
+        // entry, so its actor type is unknown rather than assumed human. mecmcp's
+        // `approve_change_set` refuses anything but `Human` (the house rule that
+        // a human approves), which is exactly the outcome an unattributed caller
+        // should get.
+        let approver_actor_type = change_set::actor_type(caller.as_ref());
 
         let coordinator = self.coordinator.clone();
 
@@ -3647,11 +3652,12 @@ impl ProxmoxServer {
             Err(error) => return tool_error(format!("get: {error}")),
         };
 
-        // A change set with no stored preview must never be approved. The
-        // approval digest covers (owner, device, fingerprint, actions) and not
-        // the preview, so nothing downstream would notice the absence: this
-        // handler used to substitute the literal string "(no preview)" and
-        // approve anyway, recording an approval over text no one could read.
+        // A change set with no stored preview must never be approved. Since
+        // mecmcp 0.23.0 the approval digest folds in the stored preview's
+        // digest, but that binds whatever preview is on record -- it does not
+        // require one to exist. This handler used to substitute the literal
+        // string "(no preview)" and approve anyway, recording an approval over
+        // text no one could read.
         let Some(preview) = record.preview.as_ref() else {
             return tool_error(
                 "approval refused: this change set has no stored preview, so there is \
@@ -3665,6 +3671,7 @@ impl ProxmoxServer {
                 device.clone(),
                 approver,
                 record.digest.clone(),
+                approver_actor_type,
             )
             .await
         {
