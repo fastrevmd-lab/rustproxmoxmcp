@@ -209,7 +209,6 @@ ExecStart=
 ExecStart=/usr/local/bin/rust-proxmoxmcp \
     --clusters-file /etc/proxmoxmcp/clusters.json \
     --tokens-file /var/lib/proxmoxmcp/tokens.json \
-    --mcp-rig-secret-file /etc/proxmoxmcp/mcp-rig.secret \
     --waivers-file /etc/proxmoxmcp/waivers.json \
     --state-file /var/lib/proxmoxmcp/changeset-state.json \
     --transport streamable-http \

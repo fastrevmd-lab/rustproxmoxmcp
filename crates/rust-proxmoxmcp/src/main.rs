@@ -426,7 +426,7 @@ async fn main() -> Result<()> {
                 args.common.allowed_host,
                 args.common.allowed_origin,
                 args.limits.to_limits_config(),
-                !args.disable_metrics,
+                args.enable_metrics,
                 args.common.allow_insecure_bind,
                 tls,
                 shutdown,

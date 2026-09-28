@@ -56,12 +56,16 @@ pub struct ProxmoxCli {
     #[arg(long = "waivers-file", default_value = "/etc/proxmoxmcp/waivers.json")]
     pub waivers_file: PathBuf,
 
-    /// Disable the unauthenticated `/metrics` (Prometheus) endpoint (streamable-http
-    /// only). Metrics are ON by default as of MEC-450: `/metrics` is loopback-only
-    /// regardless of this flag (mecmcp-transport's default access model), so leaving
-    /// it enabled does not itself expose anything to the LAN.
-    #[arg(long = "disable-metrics")]
-    pub disable_metrics: bool,
+    /// Enable the `/metrics` (Prometheus) endpoint (streamable-http only). OFF
+    /// by default: this repo pins `mecmcp-transport` v0.23.0, whose `/metrics`
+    /// handler is not restricted to loopback callers — it is reachable, without
+    /// a bearer token, by anything that can satisfy the Host/Origin allowlist
+    /// (which always accepts `127.0.0.1`/`localhost`, trivially spoofable via
+    /// the `Host` header). Flip this on only once the transport pin is
+    /// `>= 0.24.0`, whose `metrics_access_middleware` enforces loopback-only
+    /// access by peer IP (see MEC-449).
+    #[arg(long = "enable-metrics")]
+    pub enable_metrics: bool,
 
     /// HTTP resource limits (streamable-http only). Defaults match
     /// `mecmcp_transport::LimitsConfig::default()` so an upgrade with no flags
@@ -309,18 +313,18 @@ mod tests {
     }
 
     #[test]
-    fn metrics_are_enabled_by_default() {
+    fn metrics_are_disabled_by_default() {
         let cli = ProxmoxCli::parse_from(["rust-proxmoxmcp"]);
         assert!(
-            !cli.disable_metrics,
-            "metrics must be on unless --disable-metrics is passed"
+            !cli.enable_metrics,
+            "metrics must stay off by default until the mecmcp-transport pin is >= 0.24.0 (MEC-449)"
         );
     }
 
     #[test]
-    fn disable_metrics_flag_is_observable_when_passed() {
-        let cli = ProxmoxCli::parse_from(["rust-proxmoxmcp", "--disable-metrics"]);
-        assert!(cli.disable_metrics);
+    fn enable_metrics_flag_is_observable_when_passed() {
+        let cli = ProxmoxCli::parse_from(["rust-proxmoxmcp", "--enable-metrics"]);
+        assert!(cli.enable_metrics);
     }
 
     /// Every default must match `LimitsConfig::default()` byte for byte: a
