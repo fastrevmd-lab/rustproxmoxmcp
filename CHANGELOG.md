@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - Raised MSRV to 1.89 (family-wide decision).
+- **Added pagination to `get_vms`, `get_containers`, `list_tasks` and
+  `list_backups`** (MEC-479). A dense large cluster (or a storage backend
+  with a long retention window) could exceed the MCP result's 512 KiB cap
+  and refuse outright with no way to retry at a smaller page (found by
+  MEC-456's lab test at ~1,000 QEMU guests). The four tools now take an
+  optional `offset`/`limit` (default 500, max 700) and return
+  `{items, total, offset, limit, has_more}` instead of a bare array.
 
 ## [0.10.0] - 2026-09-16
 

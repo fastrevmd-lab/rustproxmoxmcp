@@ -1,5 +1,5 @@
-//! Lab test for MEC-456: does an unpaginated list tool break at realistic
-//! large-cluster scale?
+//! Lab test for MEC-456, extended by MEC-479's fix: does a list tool break at
+//! realistic large-cluster scale, and does pagination (MEC-479) recover it?
 //!
 //! There are two independent caps in the read path, and this test measures
 //! against both:
@@ -10,9 +10,13 @@
 //!   tool call is allowed to hand back to the MCP caller.
 //!
 //! Both refuse outright rather than truncate (fail closed, per the house
-//! style), so the question is not "does data get corrupted" but "at what
-//! cluster size does a legitimate list call stop working at all, with no
-//! pagination parameter to work around it."
+//! style). MEC-456 found that a legitimate list call stopped working
+//! outright at realistic cluster sizes, with no way to retry at a smaller
+//! page. MEC-479 added client-side offset/limit pagination to `get_vms`,
+//! `get_containers`, `list_tasks` and `list_backups`, sized (500 default,
+//! 700 max) so a full page stays under the 512 KiB cap -- these tests now
+//! prove a cluster too large for one page still returns every record, across
+//! as many `offset` pages as it takes, rather than refusing outright.
 //!
 //! Each generator below mirrors the real Proxmox field set for its endpoint
 //! (`/cluster/resources`, `/nodes/{node}/tasks`,
@@ -110,21 +114,23 @@ fn guest_list_size_at_realistic_cluster_scale() {
     }
 }
 
-/// End-to-end proof at the scale found above: a `get_vms` call against a
-/// cluster with enough guests to cross the 512 KiB MCP result cap fails
-/// closed with a clear error, not a truncated or corrupted list -- and a
-/// cluster just under that size succeeds with every guest present.
+/// End-to-end proof at the scale found in MEC-456: a `get_vms` call against a
+/// cluster large enough to cross the 512 KiB MCP result cap in one shot now
+/// pages through it instead of failing closed, and every guest is still
+/// recovered across pages -- and a cluster just under one page's worth still
+/// succeeds in a single call, unpaged.
 ///
 /// A single Proxmox cluster tops out at 32 nodes; at ~50-100 guests per node
 /// (a realistic dense VDI/MSP node), 1,600-3,200 guests cluster-wide is a
 /// plausible "large cluster," not a synthetic edge case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_vms_fails_closed_once_the_result_cap_is_crossed() {
+async fn get_vms_pages_through_a_cluster_that_would_exceed_the_result_cap() {
     // From guest_list_size_at_realistic_cluster_scale: each guest record
     // pretty-prints to ~540 bytes, so 1,000 guests (~540 KB) already clears
     // the 512 KiB (524,288-byte) mcp_server::ResultLimits::max_json_bytes
     // cap baked into RESULT_LIMITS in server/mod.rs -- well inside a single
-    // 32-node cluster's realistic guest count.
+    // 32-node cluster's realistic guest count. The default page (500
+    // records) must still stay under it.
     let over_cap = leak_route(
         "/api2/json/cluster/resources".to_owned(),
         json_array_body((0..1_000u32).map(guest_resource_json)),
@@ -132,19 +138,42 @@ async fn get_vms_fails_closed_once_the_result_cap_is_crossed() {
     let server =
         TestServer::start_with_routes(TokenSpec::full(), vec![NODES_ROUTE, over_cap]).await;
 
-    let (is_error, text) = call(&server, "get_vms", serde_json::json!({ "cluster": "pve3" })).await;
-
+    let (first_is_error, first_text) =
+        call(&server, "get_vms", serde_json::json!({ "cluster": "pve3" })).await;
     assert!(
-        is_error,
-        "1,000 guests should exceed the MCP result cap and refuse, got: {text}"
+        !first_is_error,
+        "the default page should stay under the MCP result cap, got: {first_text}"
     );
     assert!(
-        text.contains("exceeds") && text.contains("byte limit"),
-        "refusal should name the byte-limit cause, not read as a generic \
-         failure an operator can't act on: {text}"
+        first_text.contains(r#"\"total\": 1000"#) && first_text.contains(r#"\"has_more\": true"#),
+        "the page should report the true total and that more remain: {first_text}"
+    );
+    assert!(
+        first_text.contains("guest-00000") && !first_text.contains("guest-00500"),
+        "the first page should hold exactly the first 500 guests: {first_text}"
     );
 
-    // A cluster comfortably under the cap still gets every guest back whole.
+    let (second_is_error, second_text) = call(
+        &server,
+        "get_vms",
+        serde_json::json!({ "cluster": "pve3", "offset": 500 }),
+    )
+    .await;
+    assert!(
+        !second_is_error,
+        "the second page should also stay under the cap, got: {second_text}"
+    );
+    assert!(
+        second_text.contains(r#"\"has_more\": false"#),
+        "the second page should be the last one: {second_text}"
+    );
+    assert!(
+        second_text.contains("guest-00500") && second_text.contains("guest-00999"),
+        "the second page should hold the remaining 500 guests: {second_text}"
+    );
+
+    // A cluster comfortably under one page still gets every guest back in a
+    // single, unpaged call.
     let under_cap = leak_route(
         "/api2/json/cluster/resources".to_owned(),
         json_array_body((0..200u32).map(guest_resource_json)),
@@ -162,63 +191,144 @@ async fn get_vms_fails_closed_once_the_result_cap_is_crossed() {
         "200 guests should stay under the cap: {small_text}"
     );
     assert!(
+        small_text.contains(r#"\"total\": 200"#) && small_text.contains(r#"\"has_more\": false"#),
+        "a cluster under one page should report has_more: false: {small_text}"
+    );
+    assert!(
         small_text.contains("guest-00000") && small_text.contains("guest-00199"),
         "every guest should be present, not truncated: first and last IDs missing"
     );
 }
 
-/// Same shape of failure for `list_tasks` -- the other list tool with no
-/// server-side page size and no client-side pagination.
+/// A `limit` above the 700-record ceiling is refused rather than silently
+/// clamped -- a caller asking for a page that would risk crossing the 512
+/// KiB cap gets told so in plain terms, per the house fail-closed style.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn list_tasks_fails_closed_once_the_result_cap_is_crossed() {
-    let over_cap = leak_route(
-        "/api2/json/nodes/pve-node01/tasks".to_owned(),
-        json_array_body((0..2_500u32).map(task_json)),
+async fn get_vms_refuses_a_limit_above_the_page_ceiling() {
+    let route = leak_route(
+        "/api2/json/cluster/resources".to_owned(),
+        json_array_body((0..10u32).map(guest_resource_json)),
     );
-    let server =
-        TestServer::start_with_routes(TokenSpec::full(), vec![NODES_ROUTE, over_cap]).await;
+    let server = TestServer::start_with_routes(TokenSpec::full(), vec![NODES_ROUTE, route]).await;
 
     let (is_error, text) = call(
         &server,
-        "list_tasks",
-        serde_json::json!({ "cluster": "pve3", "node": "pve-node01" }),
+        "get_vms",
+        serde_json::json!({ "cluster": "pve3", "limit": 5_000 }),
     )
     .await;
 
+    assert!(is_error, "a 5,000 limit should be refused, got: {text}");
     assert!(
-        is_error,
-        "2,500 tasks should exceed the MCP result cap and refuse, got: {text}"
-    );
-    assert!(
-        text.contains("exceeds") && text.contains("byte limit"),
-        "refusal should name the byte-limit cause: {text}"
+        text.contains("exceeds the maximum"),
+        "refusal should name the limit cause: {text}"
     );
 }
 
-/// Same shape of failure for `list_backups` -- a storage backend holding a
+/// Same shape of fix for `list_tasks` -- the other list tool with no
+/// server-side page size, now paginated client-side per MEC-479.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_tasks_pages_through_a_node_that_would_exceed_the_result_cap() {
+    let route = leak_route(
+        "/api2/json/nodes/pve-node01/tasks".to_owned(),
+        json_array_body((0..2_500u32).map(task_json)),
+    );
+    let server = TestServer::start_with_routes(TokenSpec::full(), vec![NODES_ROUTE, route]).await;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut offset = 0u32;
+    loop {
+        let (is_error, text) = call(
+            &server,
+            "list_tasks",
+            serde_json::json!({ "cluster": "pve3", "node": "pve-node01", "offset": offset }),
+        )
+        .await;
+        assert!(!is_error, "page at offset {offset} should succeed: {text}");
+
+        // Count via substring rather than parsing the escaped MCP envelope:
+        // each task fixture's `id` is unique, so counting matches is an exact
+        // page census.
+        for n in 0..2_500u32 {
+            if text.contains(&format!("\\\"id\\\": \\\"{n}\\\"")) {
+                seen.insert(n);
+            }
+        }
+
+        let has_more = text.contains(r#"\"has_more\": true"#);
+        if !has_more {
+            break;
+        }
+        offset += 500;
+        assert!(offset <= 3_000, "pagination should terminate: {text}");
+    }
+
+    assert_eq!(
+        seen.len(),
+        2_500,
+        "every task should be recovered across pages, got {} of 2,500",
+        seen.len()
+    );
+}
+
+/// Same shape of fix for `list_backups` -- a storage backend holding a
 /// realistic multi-month retention window for a busy cluster.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn list_backups_fails_closed_once_the_result_cap_is_crossed() {
-    let over_cap = leak_route(
+async fn list_backups_pages_through_a_storage_that_would_exceed_the_result_cap() {
+    let route = leak_route(
         "/api2/json/nodes/pve-node01/storage/local/content".to_owned(),
         json_array_body((0..1_500u32).map(|n| backup_json(100 + (n % 300), n))),
     );
-    let server =
-        TestServer::start_with_routes(TokenSpec::full(), vec![NODES_ROUTE, over_cap]).await;
+    let server = TestServer::start_with_routes(TokenSpec::full(), vec![NODES_ROUTE, route]).await;
 
-    let (is_error, text) = call(
+    let (first_is_error, first_text) = call(
         &server,
         "list_backups",
         serde_json::json!({ "cluster": "pve3", "node": "pve-node01", "storage": "local" }),
     )
     .await;
-
     assert!(
-        is_error,
-        "1,500 backup archives should exceed the MCP result cap and refuse, got: {text}"
+        !first_is_error,
+        "the default page should stay under the cap, got: {first_text}"
     );
     assert!(
-        text.contains("exceeds") && text.contains("byte limit"),
-        "refusal should name the byte-limit cause: {text}"
+        first_text.contains(r#"\"total\": 1500"#) && first_text.contains(r#"\"has_more\": true"#),
+        "the page should report the true total and that more remain: {first_text}"
+    );
+
+    let (second_is_error, second_text) = call(
+        &server,
+        "list_backups",
+        serde_json::json!({
+            "cluster": "pve3",
+            "node": "pve-node01",
+            "storage": "local",
+            "offset": 500,
+        }),
+    )
+    .await;
+    assert!(
+        !second_is_error,
+        "the second page should also stay under the cap, got: {second_text}"
+    );
+
+    let (third_is_error, third_text) = call(
+        &server,
+        "list_backups",
+        serde_json::json!({
+            "cluster": "pve3",
+            "node": "pve-node01",
+            "storage": "local",
+            "offset": 1_000,
+        }),
+    )
+    .await;
+    assert!(
+        !third_is_error,
+        "the third page should also stay under the cap, got: {third_text}"
+    );
+    assert!(
+        third_text.contains(r#"\"has_more\": false"#),
+        "the third page should be the last one: {third_text}"
     );
 }
