@@ -96,19 +96,19 @@ pub struct LimitsArgs {
     pub max_inflight_requests_per_token: usize,
 
     /// Max requests per second per source IP address. 0 = disabled (with burst 0).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 50)]
     pub max_requests_per_second_per_ip: u64,
 
     /// Max immediate request burst per source IP address. 0 = disabled (with rate 0).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 100)]
     pub max_request_burst_per_ip: u64,
 
     /// Max requests per second per bearer token. 0 = disabled (with burst 0).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 20)]
     pub max_requests_per_second_per_token: u64,
 
     /// Max immediate request burst per bearer token. 0 = disabled (with rate 0).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 40)]
     pub max_request_burst_per_token: u64,
 
     /// Max concurrent in-flight requests per target cluster. 0 = unlimited.
