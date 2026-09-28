@@ -347,11 +347,20 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "delete_snapshot",
     "delete_vm",
     "download_iso",
+    "get_cluster_firewall_options",
+    "get_cluster_firewall_rules",
     "get_cluster_status",
     "get_container_config",
     "get_container_ip",
     "get_containers",
+    "get_firewall_ipset_entries",
+    "get_firewall_security_group_rules",
+    "get_guest_firewall_ipset_entries",
+    "get_guest_firewall_options",
+    "get_guest_firewall_rules",
     "get_guest_status",
+    "get_node_firewall_options",
+    "get_node_firewall_rules",
     "get_node_status",
     "get_nodes",
     "get_proxmox_change_set",
@@ -360,6 +369,11 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "get_vm_config",
     "get_vms",
     "list_backups",
+    "list_firewall_aliases",
+    "list_firewall_ipsets",
+    "list_firewall_security_groups",
+    "list_guest_firewall_aliases",
+    "list_guest_firewall_ipsets",
     "list_isos",
     "list_snapshots",
     "list_tasks",
@@ -693,6 +707,35 @@ pub struct TaskArgs {
     pub node: String,
     /// Proxmox task UPID.
     pub upid: String,
+}
+
+/// Arguments for a cluster firewall security-group-scoped read.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FirewallGroupArgs {
+    /// Inventory name of the cluster.
+    pub cluster: String,
+    /// Security group name, as reported by `list_firewall_security_groups`.
+    pub group: String,
+}
+
+/// Arguments for a cluster firewall IPSet-scoped read.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FirewallIpsetArgs {
+    /// Inventory name of the cluster.
+    pub cluster: String,
+    /// IPSet name, as reported by `list_firewall_ipsets`.
+    pub name: String,
+}
+
+/// Arguments for a guest firewall IPSet-scoped read.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GuestFirewallIpsetArgs {
+    /// Inventory name of the cluster.
+    pub cluster: String,
+    /// Numeric guest id, unique within the cluster.
+    pub vmid: u32,
+    /// IPSet name, as reported by `list_guest_firewall_ipsets`.
+    pub name: String,
 }
 
 /// The MCP server.
@@ -1896,6 +1939,257 @@ impl ProxmoxServer {
         .await
     }
 
+    #[tool(
+        name = "get_cluster_firewall_rules",
+        description = "Cluster-wide firewall rules."
+    )]
+    async fn get_cluster_firewall_rules(
+        &self,
+        Parameters(args): Parameters<ClusterArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "get_cluster_firewall_rules",
+            &args.cluster,
+            &[],
+            None,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "get_cluster_firewall_options",
+        description = "Cluster-wide firewall options (enable flag, default in/out policy)."
+    )]
+    async fn get_cluster_firewall_options(
+        &self,
+        Parameters(args): Parameters<ClusterArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "get_cluster_firewall_options",
+            &args.cluster,
+            &[],
+            None,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "list_firewall_security_groups",
+        description = "Firewall security groups defined on the cluster."
+    )]
+    async fn list_firewall_security_groups(
+        &self,
+        Parameters(args): Parameters<ClusterArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "list_firewall_security_groups",
+            &args.cluster,
+            &[],
+            None,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "get_firewall_security_group_rules",
+        description = "Rules contained in one firewall security group."
+    )]
+    async fn get_firewall_security_group_rules(
+        &self,
+        Parameters(args): Parameters<FirewallGroupArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "get_firewall_security_group_rules",
+            &args.cluster,
+            &[("group", args.group.as_str())],
+            None,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(name = "list_firewall_ipsets", description = "Cluster-wide IPSets.")]
+    async fn list_firewall_ipsets(
+        &self,
+        Parameters(args): Parameters<ClusterArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read("list_firewall_ipsets", &args.cluster, &[], None, &context)
+            .await
+    }
+
+    #[tool(
+        name = "get_firewall_ipset_entries",
+        description = "CIDR entries in one cluster-wide IPSet."
+    )]
+    async fn get_firewall_ipset_entries(
+        &self,
+        Parameters(args): Parameters<FirewallIpsetArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "get_firewall_ipset_entries",
+            &args.cluster,
+            &[("name", args.name.as_str())],
+            None,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "list_firewall_aliases",
+        description = "Cluster-wide firewall address aliases."
+    )]
+    async fn list_firewall_aliases(
+        &self,
+        Parameters(args): Parameters<ClusterArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read("list_firewall_aliases", &args.cluster, &[], None, &context)
+            .await
+    }
+
+    #[tool(
+        name = "get_node_firewall_rules",
+        description = "Firewall rules on one node."
+    )]
+    async fn get_node_firewall_rules(
+        &self,
+        Parameters(args): Parameters<NodeArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "get_node_firewall_rules",
+            &args.cluster,
+            &[("node", args.node.as_str())],
+            None,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "get_node_firewall_options",
+        description = "Firewall options on one node."
+    )]
+    async fn get_node_firewall_options(
+        &self,
+        Parameters(args): Parameters<NodeArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "get_node_firewall_options",
+            &args.cluster,
+            &[("node", args.node.as_str())],
+            None,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "get_guest_firewall_rules",
+        description = "Firewall rules of one guest."
+    )]
+    async fn get_guest_firewall_rules(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "get_guest_firewall_rules",
+            &args.cluster,
+            &[],
+            Some(args.vmid),
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "get_guest_firewall_options",
+        description = "Firewall options of one guest."
+    )]
+    async fn get_guest_firewall_options(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "get_guest_firewall_options",
+            &args.cluster,
+            &[],
+            Some(args.vmid),
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "list_guest_firewall_aliases",
+        description = "Firewall address aliases of one guest."
+    )]
+    async fn list_guest_firewall_aliases(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "list_guest_firewall_aliases",
+            &args.cluster,
+            &[],
+            Some(args.vmid),
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "list_guest_firewall_ipsets",
+        description = "IPSets defined on one guest."
+    )]
+    async fn list_guest_firewall_ipsets(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "list_guest_firewall_ipsets",
+            &args.cluster,
+            &[],
+            Some(args.vmid),
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "get_guest_firewall_ipset_entries",
+        description = "CIDR entries in one IPSet of one guest."
+    )]
+    async fn get_guest_firewall_ipset_entries(
+        &self,
+        Parameters(args): Parameters<GuestFirewallIpsetArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "get_guest_firewall_ipset_entries",
+            &args.cluster,
+            &[("name", args.name.as_str())],
+            Some(args.vmid),
+            &context,
+        )
+        .await
+    }
+
     #[tool(name = "start_vm", description = "Start a stopped QEMU guest.")]
     async fn start_vm(
         &self,
@@ -3004,13 +3298,12 @@ impl ProxmoxServer {
         // on load, so the text an approver reviewed cannot be edited afterwards
         // without the store refusing it.
         //
-        // It does **not** make the approval cryptographically cover the
-        // preview: the plan digest is over (owner, device, fingerprint,
-        // actions), and the approval is over that digest. The action is what
-        // the approval binds, and the preview is rendered from the action —
-        // but nothing forces them to agree. Tracked separately; the README and
-        // migration guide now describe the binding that exists rather than the
-        // one that does not.
+        // The plan digest itself is over (owner, device, fingerprint, actions)
+        // and says nothing about this preview text. Cryptographic coverage of
+        // the preview comes from the coordinator at approve time: mecmcp
+        // 0.23.0 folds this preview's digest into the approval digest, so the
+        // approver ends up signing the exact text stored here as well as the
+        // plan. See the `create_change_set` call above.
         let Some(mut with_preview) = coordinator
             .change_sets()
             .await
@@ -3195,11 +3488,12 @@ impl ProxmoxServer {
             Err(error) => return tool_error(format!("get: {error}")),
         };
 
-        // A change set with no stored preview must never be approved. The
-        // approval digest covers (owner, device, fingerprint, actions) and not
-        // the preview, so nothing downstream would notice the absence: this
-        // handler used to substitute the literal string "(no preview)" and
-        // approve anyway, recording an approval over text no one could read.
+        // A change set with no stored preview must never be approved. Since
+        // mecmcp 0.23.0 the approval digest folds in the stored preview's
+        // digest, but that binds whatever preview is on record -- it does not
+        // require one to exist. This handler used to substitute the literal
+        // string "(no preview)" and approve anyway, recording an approval over
+        // text no one could read.
         let Some(preview) = record.preview.as_ref() else {
             return tool_error(
                 "approval refused: this change set has no stored preview, so there is \

@@ -25,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `actor_type: agent`, or by an unattributed (stdio) caller -- only a
   distinct `actor_type: human` principal can approve.
 - Raised MSRV to 1.89 (family-wide decision).
+- **Added 14 read-only firewall tools** (MEC-453): rules, options, IPSets,
+  aliases and security groups at cluster, node and guest scope, matching the
+  scopes Proxmox itself exposes (node-level firewall has no aliases, IPSets
+  or security groups — those exist only at cluster and guest scope). All are
+  declared in `catalog.rs` and dispatched through the existing generic read
+  executor; none are in `WRITE_TOOLS`, so read-only is enforced in code, not
+  convention. Prerequisite for governed firewall writes.
 
 ## [0.10.0] - 2026-09-16
 

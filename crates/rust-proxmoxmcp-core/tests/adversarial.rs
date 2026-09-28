@@ -13,7 +13,15 @@ use rust_proxmoxmcp_core::{
 
 #[test]
 fn every_catalog_path_templates_only_known_parameters() {
-    const KNOWN: &[&str] = &["{node}", "{vmid}", "{kind}", "{storage}", "{upid}"];
+    const KNOWN: &[&str] = &[
+        "{node}",
+        "{vmid}",
+        "{kind}",
+        "{storage}",
+        "{upid}",
+        "{group}",
+        "{name}",
+    ];
     for tool in READ_TOOLS {
         let mut rest = tool.path;
         while let Some(open) = rest.find('{') {
