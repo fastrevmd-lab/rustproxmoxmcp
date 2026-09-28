@@ -69,5 +69,5 @@ jobs:
       - name: cargo-audit (RUSTSEC advisories)
         run: cargo audit
 
-      - name: cargo-deny (bans + sources)
-        run: cargo deny check bans sources
+      - name: cargo-deny (advisories + licenses + bans + sources)
+        run: cargo deny check advisories licenses bans sources
