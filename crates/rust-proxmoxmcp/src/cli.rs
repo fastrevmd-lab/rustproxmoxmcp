@@ -55,6 +55,98 @@ pub struct ProxmoxCli {
     /// Time-boxed operator waivers (spec §4.2). Mode 0600, service-owned.
     #[arg(long = "waivers-file", default_value = "/etc/proxmoxmcp/waivers.json")]
     pub waivers_file: PathBuf,
+
+    /// Disable the unauthenticated `/metrics` (Prometheus) endpoint (streamable-http
+    /// only). Metrics are ON by default as of MEC-450: `/metrics` is loopback-only
+    /// regardless of this flag (mecmcp-transport's default access model), so leaving
+    /// it enabled does not itself expose anything to the LAN.
+    #[arg(long = "disable-metrics")]
+    pub disable_metrics: bool,
+
+    /// HTTP resource limits (streamable-http only). Defaults match
+    /// `mecmcp_transport::LimitsConfig::default()` so an upgrade with no flags
+    /// passed behaves exactly as before.
+    #[command(flatten)]
+    pub limits: LimitsArgs,
+}
+
+/// CLI-configurable mirror of `mecmcp_transport::LimitsConfig`.
+///
+/// Flattened into [`ProxmoxCli`] rather than left hardcoded so an operator can
+/// tune per-deployment resource limits without a fork. Every default below is
+/// copied from `LimitsConfig::default()` — changing one here without changing
+/// the other silently drifts a documented default out of sync with the
+/// enforced one.
+#[derive(Debug, clap::Args)]
+pub struct LimitsArgs {
+    /// Max request body bytes before HTTP 413. 0 = unlimited.
+    #[arg(long, default_value_t = 10 * 1024 * 1024)]
+    pub max_request_body_bytes: usize,
+
+    /// Max concurrent in-flight requests across all callers. 0 = unlimited.
+    #[arg(long, default_value_t = 64)]
+    pub max_inflight_requests: usize,
+
+    /// Max concurrent in-flight requests per bearer token. 0 = unlimited.
+    #[arg(long, default_value_t = 16)]
+    pub max_inflight_requests_per_token: usize,
+
+    /// Max requests per second per source IP address. 0 = disabled (with burst 0).
+    #[arg(long, default_value_t = 0)]
+    pub max_requests_per_second_per_ip: u64,
+
+    /// Max immediate request burst per source IP address. 0 = disabled (with rate 0).
+    #[arg(long, default_value_t = 0)]
+    pub max_request_burst_per_ip: u64,
+
+    /// Max requests per second per bearer token. 0 = disabled (with burst 0).
+    #[arg(long, default_value_t = 0)]
+    pub max_requests_per_second_per_token: u64,
+
+    /// Max immediate request burst per bearer token. 0 = disabled (with rate 0).
+    #[arg(long, default_value_t = 0)]
+    pub max_request_burst_per_token: u64,
+
+    /// Max concurrent in-flight requests per target cluster. 0 = unlimited.
+    #[arg(long, default_value_t = 4)]
+    pub max_inflight_requests_per_cluster: usize,
+
+    /// Max concurrent MCP sessions. 0 = unlimited.
+    #[arg(long, default_value_t = 128)]
+    pub max_sessions: usize,
+
+    /// Max concurrent MCP sessions per bearer token. 0 = unlimited.
+    #[arg(long, default_value_t = 16)]
+    pub max_sessions_per_token: usize,
+
+    /// Session idle timeout in seconds. 0 = disabled.
+    #[arg(long, default_value_t = 300)]
+    pub session_idle_timeout_secs: u64,
+
+    /// Session max lifetime in seconds. 0 = disabled.
+    #[arg(long, default_value_t = 3600)]
+    pub session_max_lifetime_secs: u64,
+}
+
+impl LimitsArgs {
+    /// Build the transport's `LimitsConfig` from the parsed flags.
+    #[must_use]
+    pub fn to_limits_config(&self) -> mecmcp_transport::LimitsConfig {
+        mecmcp_transport::LimitsConfig {
+            max_request_body_bytes: self.max_request_body_bytes,
+            max_inflight_requests: self.max_inflight_requests,
+            max_inflight_requests_per_token: self.max_inflight_requests_per_token,
+            max_requests_per_second_per_ip: self.max_requests_per_second_per_ip,
+            max_request_burst_per_ip: self.max_request_burst_per_ip,
+            max_requests_per_second_per_token: self.max_requests_per_second_per_token,
+            max_request_burst_per_token: self.max_request_burst_per_token,
+            max_inflight_requests_per_device: self.max_inflight_requests_per_cluster,
+            max_sessions: self.max_sessions,
+            max_sessions_per_token: self.max_sessions_per_token,
+            session_idle_timeout_secs: self.session_idle_timeout_secs,
+            session_max_lifetime_secs: self.session_max_lifetime_secs,
+        }
+    }
 }
 
 /// Token management CLI, parsed only when argv starts with `token`.
@@ -214,6 +306,82 @@ mod tests {
     fn lab_mode_defaults_to_false() {
         let cli = ProxmoxCli::parse_from(["rust-proxmoxmcp"]);
         assert!(!cli.lab_mode, "the default must be false");
+    }
+
+    #[test]
+    fn metrics_are_enabled_by_default() {
+        let cli = ProxmoxCli::parse_from(["rust-proxmoxmcp"]);
+        assert!(
+            !cli.disable_metrics,
+            "metrics must be on unless --disable-metrics is passed"
+        );
+    }
+
+    #[test]
+    fn disable_metrics_flag_is_observable_when_passed() {
+        let cli = ProxmoxCli::parse_from(["rust-proxmoxmcp", "--disable-metrics"]);
+        assert!(cli.disable_metrics);
+    }
+
+    /// Every default must match `LimitsConfig::default()` byte for byte: a
+    /// mismatch here means an upgrade with no flags passed silently changes
+    /// enforced limits, exactly the drift the flatten struct's doc comment
+    /// warns about.
+    #[test]
+    fn limits_defaults_match_transport_defaults() {
+        let cli = ProxmoxCli::parse_from(["rust-proxmoxmcp"]);
+        let got = cli.limits.to_limits_config();
+        let want = mecmcp_transport::LimitsConfig::default();
+        assert_eq!(got.max_request_body_bytes, want.max_request_body_bytes);
+        assert_eq!(got.max_inflight_requests, want.max_inflight_requests);
+        assert_eq!(
+            got.max_inflight_requests_per_token,
+            want.max_inflight_requests_per_token
+        );
+        assert_eq!(
+            got.max_requests_per_second_per_ip,
+            want.max_requests_per_second_per_ip
+        );
+        assert_eq!(got.max_request_burst_per_ip, want.max_request_burst_per_ip);
+        assert_eq!(
+            got.max_requests_per_second_per_token,
+            want.max_requests_per_second_per_token
+        );
+        assert_eq!(
+            got.max_request_burst_per_token,
+            want.max_request_burst_per_token
+        );
+        assert_eq!(
+            got.max_inflight_requests_per_device,
+            want.max_inflight_requests_per_device
+        );
+        assert_eq!(got.max_sessions, want.max_sessions);
+        assert_eq!(got.max_sessions_per_token, want.max_sessions_per_token);
+        assert_eq!(
+            got.session_idle_timeout_secs,
+            want.session_idle_timeout_secs
+        );
+        assert_eq!(
+            got.session_max_lifetime_secs,
+            want.session_max_lifetime_secs
+        );
+    }
+
+    #[test]
+    fn limits_flags_override_defaults() {
+        let cli = ProxmoxCli::parse_from([
+            "rust-proxmoxmcp",
+            "--max-requests-per-second-per-ip",
+            "10",
+            "--max-request-burst-per-ip",
+            "20",
+            "--max-sessions",
+            "5",
+        ]);
+        let limits = cli.limits.to_limits_config();
+        assert_eq!(limits.max_requests_per_second_per_ip, 10);
+        assert_eq!(limits.max_request_burst_per_ip, 20);
+        assert_eq!(limits.max_sessions, 5);
     }
 
     #[test]

@@ -211,13 +211,12 @@ ExecStart=/usr/local/bin/rust-proxmoxmcp \
     --tokens-file /var/lib/proxmoxmcp/tokens.json \
     --mcp-rig-secret-file /etc/proxmoxmcp/mcp-rig.secret \
     --waivers-file /etc/proxmoxmcp/waivers.json \
+    --state-file /var/lib/proxmoxmcp/changeset-state.json \
     --transport streamable-http \
-    --host 0.0.0.0 \
+    --host 127.0.0.1 \
     --port 30031 \
-    --allow-insecure-bind \
-    --allowed-host 192.0.2.10 \
-    --allowed-host test-twoperson-proxmox:30031 \
-    --allowed-origin http://console.example.org \
+    --allowed-host 127.0.0.1:30031 \
+    --allowed-origin http://127.0.0.1:30031 \
     --audit-format json \
     --audit-log-file /var/lib/proxmoxmcp/audit.jsonl \
     --audit-journald
@@ -229,22 +228,42 @@ new one.
 **For lab mode, add `--lab-mode` to the `ExecStart` line.** That single flag is
 the whole difference between the two rigs.
 
-`--allowed-host` specifies the HTTP **Host** authorities the server will answer
-for (the addresses clients actually dial, e.g., `192.0.2.10` or
-`test-twoperson-proxmox:30031`). Requests to other addresses are refused with
-**421 MISDIRECTED_REQUEST**.
+`--state-file` persists change-set and operation state across restarts. Without
+it the coordinator keeps state in memory only, and every approval, preview and
+in-flight apply is lost on restart — the server still starts and warns loudly
+at boot, but do not run this drop-in without it.
 
-`--allowed-origin` specifies trusted browser application origins (e.g.,
-`http://console.example.org`), checked against the `Origin` header. Mismatches
-return **403 FORBIDDEN**. Set it to the origin of the browser client that will
-call this server. **The scheme must match the server's TLS configuration**: this
-plaintext lab drop-in takes `http://` origins; an HTTPS console origin requires
-`--tls-cert` and `--tls-key` on the listener. An off-loopback listener requires
-at least one `--allowed-origin` or the service refuses to start; if there is no
-browser client yet, the value must still be present — any single well-formed
-origin satisfies that requirement with no effect on non-browser MCP clients
-(curl, SDK calls), which send no `Origin` header and are never matched. Replace
-it with the real client origin before a browser client is pointed at the server.
+This drop-in binds `127.0.0.1` only, same as the shipped unit. **Do not add
+`--allow-insecure-bind` with a non-loopback `--host` to reach this server from
+another host on the LAN** — that combination accepts a plaintext HTTP bind on a
+real network interface, and every MCP bearer token and Proxmox API secret this
+server handles would then cross the network unencrypted. To reach it from
+another host, either:
+
+- Put a TLS-terminating reverse proxy (nginx, Caddy, ...) in front of this
+  loopback listener, forwarding to `127.0.0.1:30031`; or
+- Configure the listener's own TLS directly with `--tls-cert` and `--tls-key`,
+  then bind a real interface without `--allow-insecure-bind`.
+
+Either way, update `--allowed-host` and `--allowed-origin` to the address
+clients actually dial once one of those is in place — they are checked before
+any bind mode is decided, so plaintext-on-LAN never becomes the only way to
+satisfy them.
+
+`--allowed-host` specifies the HTTP **Host** authorities the server will answer
+for (the addresses clients actually dial). Requests to other addresses are
+refused with **421 MISDIRECTED_REQUEST**.
+
+`--allowed-origin` specifies trusted browser application origins, checked
+against the `Origin` header. Mismatches return **403 FORBIDDEN**. Set it to the
+origin of the browser client that will call this server. **The scheme must
+match the server's TLS configuration**: a plaintext loopback listener takes
+`http://` origins; an HTTPS console origin requires TLS on the listener or the
+reverse proxy in front of it. If there is no browser client yet, the value must
+still be present — any single well-formed origin satisfies that requirement
+with no effect on non-browser MCP clients (curl, SDK calls), which send no
+`Origin` header and are never matched. Replace it with the real client origin
+before a browser client is pointed at the server.
 
 Then:
 
@@ -269,7 +288,7 @@ pid=$(pct exec 616 -- systemctl show -p MainPID --value rust-proxmoxmcp.service)
 pct exec 616 -- grep -E '^Seccomp' /proc/$pid/status                                      # Seccomp: 2
 
 # 4. it is serving, and refusing unauthenticated callers
-curl -s -o /dev/null -w '%{http_code}\n' -X POST http://192.0.2.10:30031/mcp \
+pct exec 616 -- curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:30031/mcp \
      -H 'content-type: application/json' -d '{}'                                          # 401
 ```
 
