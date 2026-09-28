@@ -7,7 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Re-pinned the `mecmcp-*` crates from `v0.23.0` to `v0.24.1`** (MEC-449).
+  Brings in mecmcp#390 (the human-approver gate: `ChangesetCoordinator::approve_change_set`
+  now takes an `approver_actor_type: mecmcp_audit::ActorType` and refuses
+  anything but `Human`), mecmcp#377 (`/healthz` and `/readyz`, unauthenticated
+  and always mounted), mecmcp#387 (`mecmcp-http`'s configured private CA now
+  replaces the public root store instead of adding to it, and
+  `mecmcp-transport`'s `test_harness`/`test_client` moved behind a `test-util`
+  feature -- this server's dev-dependency now enables it), and MEC-347
+  (`LimitsConfig::default()` now rate-limits by default: 50 requests/second and
+  a burst of 100 per IP, 20/s and a burst of 40 per token).
+- **`approve_proxmox_change_set` now passes the caller's server-verified
+  actor type through to mecmcp's `ChangesetCoordinator::approve_change_set`.**
+  A change set cannot be approved by a caller whose token declares
+  `actor_type: agent`, or by an unattributed (stdio) caller -- only a
+  distinct `actor_type: human` principal can approve.
+  **Upgrading:** every token minted before this release has `actor_type:
+  unknown` and can no longer approve change sets. Re-mint each approver's
+  token with `rust-proxmoxmcp token add ... --actor-type human`; other
+  tokens are unaffected. See [README § Change control](README.md#change-control).
 - Raised MSRV to 1.89 (family-wide decision).
+- **Added 14 read-only firewall tools** (MEC-453): rules, options, IPSets,
+  aliases and security groups at cluster, node and guest scope, matching the
+  scopes Proxmox itself exposes (node-level firewall has no aliases, IPSets
+  or security groups — those exist only at cluster and guest scope). All are
+  declared in `catalog.rs` and dispatched through the existing generic read
+  executor; none are in `WRITE_TOOLS`, so read-only is enforced in code, not
+  convention. Prerequisite for governed firewall writes.
 
 ## [0.10.0] - 2026-09-16
 
