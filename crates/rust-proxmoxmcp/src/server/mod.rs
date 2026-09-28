@@ -347,11 +347,20 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "delete_snapshot",
     "delete_vm",
     "download_iso",
+    "get_cluster_firewall_options",
+    "get_cluster_firewall_rules",
     "get_cluster_status",
     "get_container_config",
     "get_container_ip",
     "get_containers",
+    "get_firewall_ipset_entries",
+    "get_firewall_security_group_rules",
+    "get_guest_firewall_ipset_entries",
+    "get_guest_firewall_options",
+    "get_guest_firewall_rules",
     "get_guest_status",
+    "get_node_firewall_options",
+    "get_node_firewall_rules",
     "get_node_status",
     "get_nodes",
     "get_proxmox_change_set",
@@ -360,6 +369,11 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "get_vm_config",
     "get_vms",
     "list_backups",
+    "list_firewall_aliases",
+    "list_firewall_ipsets",
+    "list_firewall_security_groups",
+    "list_guest_firewall_aliases",
+    "list_guest_firewall_ipsets",
     "list_isos",
     "list_snapshots",
     "list_tasks",
@@ -693,6 +707,35 @@ pub struct TaskArgs {
     pub node: String,
     /// Proxmox task UPID.
     pub upid: String,
+}
+
+/// Arguments for a cluster firewall security-group-scoped read.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FirewallGroupArgs {
+    /// Inventory name of the cluster.
+    pub cluster: String,
+    /// Security group name, as reported by `list_firewall_security_groups`.
+    pub group: String,
+}
+
+/// Arguments for a cluster firewall IPSet-scoped read.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FirewallIpsetArgs {
+    /// Inventory name of the cluster.
+    pub cluster: String,
+    /// IPSet name, as reported by `list_firewall_ipsets`.
+    pub name: String,
+}
+
+/// Arguments for a guest firewall IPSet-scoped read.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GuestFirewallIpsetArgs {
+    /// Inventory name of the cluster.
+    pub cluster: String,
+    /// Numeric guest id, unique within the cluster.
+    pub vmid: u32,
+    /// IPSet name, as reported by `list_guest_firewall_ipsets`.
+    pub name: String,
 }
 
 /// The MCP server.
@@ -1891,6 +1934,257 @@ impl ProxmoxServer {
             &args.cluster,
             &[("node", args.node.as_str()), ("upid", args.upid.as_str())],
             None,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "get_cluster_firewall_rules",
+        description = "Cluster-wide firewall rules."
+    )]
+    async fn get_cluster_firewall_rules(
+        &self,
+        Parameters(args): Parameters<ClusterArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "get_cluster_firewall_rules",
+            &args.cluster,
+            &[],
+            None,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "get_cluster_firewall_options",
+        description = "Cluster-wide firewall options (enable flag, default in/out policy)."
+    )]
+    async fn get_cluster_firewall_options(
+        &self,
+        Parameters(args): Parameters<ClusterArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "get_cluster_firewall_options",
+            &args.cluster,
+            &[],
+            None,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "list_firewall_security_groups",
+        description = "Firewall security groups defined on the cluster."
+    )]
+    async fn list_firewall_security_groups(
+        &self,
+        Parameters(args): Parameters<ClusterArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "list_firewall_security_groups",
+            &args.cluster,
+            &[],
+            None,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "get_firewall_security_group_rules",
+        description = "Rules contained in one firewall security group."
+    )]
+    async fn get_firewall_security_group_rules(
+        &self,
+        Parameters(args): Parameters<FirewallGroupArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "get_firewall_security_group_rules",
+            &args.cluster,
+            &[("group", args.group.as_str())],
+            None,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(name = "list_firewall_ipsets", description = "Cluster-wide IPSets.")]
+    async fn list_firewall_ipsets(
+        &self,
+        Parameters(args): Parameters<ClusterArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read("list_firewall_ipsets", &args.cluster, &[], None, &context)
+            .await
+    }
+
+    #[tool(
+        name = "get_firewall_ipset_entries",
+        description = "CIDR entries in one cluster-wide IPSet."
+    )]
+    async fn get_firewall_ipset_entries(
+        &self,
+        Parameters(args): Parameters<FirewallIpsetArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "get_firewall_ipset_entries",
+            &args.cluster,
+            &[("name", args.name.as_str())],
+            None,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "list_firewall_aliases",
+        description = "Cluster-wide firewall address aliases."
+    )]
+    async fn list_firewall_aliases(
+        &self,
+        Parameters(args): Parameters<ClusterArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read("list_firewall_aliases", &args.cluster, &[], None, &context)
+            .await
+    }
+
+    #[tool(
+        name = "get_node_firewall_rules",
+        description = "Firewall rules on one node."
+    )]
+    async fn get_node_firewall_rules(
+        &self,
+        Parameters(args): Parameters<NodeArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "get_node_firewall_rules",
+            &args.cluster,
+            &[("node", args.node.as_str())],
+            None,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "get_node_firewall_options",
+        description = "Firewall options on one node."
+    )]
+    async fn get_node_firewall_options(
+        &self,
+        Parameters(args): Parameters<NodeArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "get_node_firewall_options",
+            &args.cluster,
+            &[("node", args.node.as_str())],
+            None,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "get_guest_firewall_rules",
+        description = "Firewall rules of one guest."
+    )]
+    async fn get_guest_firewall_rules(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "get_guest_firewall_rules",
+            &args.cluster,
+            &[],
+            Some(args.vmid),
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "get_guest_firewall_options",
+        description = "Firewall options of one guest."
+    )]
+    async fn get_guest_firewall_options(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "get_guest_firewall_options",
+            &args.cluster,
+            &[],
+            Some(args.vmid),
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "list_guest_firewall_aliases",
+        description = "Firewall address aliases of one guest."
+    )]
+    async fn list_guest_firewall_aliases(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "list_guest_firewall_aliases",
+            &args.cluster,
+            &[],
+            Some(args.vmid),
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "list_guest_firewall_ipsets",
+        description = "IPSets defined on one guest."
+    )]
+    async fn list_guest_firewall_ipsets(
+        &self,
+        Parameters(args): Parameters<GuestArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "list_guest_firewall_ipsets",
+            &args.cluster,
+            &[],
+            Some(args.vmid),
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "get_guest_firewall_ipset_entries",
+        description = "CIDR entries in one IPSet of one guest."
+    )]
+    async fn get_guest_firewall_ipset_entries(
+        &self,
+        Parameters(args): Parameters<GuestFirewallIpsetArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "get_guest_firewall_ipset_entries",
+            &args.cluster,
+            &[("name", args.name.as_str())],
+            Some(args.vmid),
             &context,
         )
         .await
