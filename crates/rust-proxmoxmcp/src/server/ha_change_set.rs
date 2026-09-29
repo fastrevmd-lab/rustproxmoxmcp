@@ -3,17 +3,16 @@
 //! Mirrors the guest destructive change-set in `change_set.rs` -- plan,
 //! approve, apply, with two-principal control and a fingerprint that refuses
 //! an apply against a rule that changed since the plan -- but for a cluster
-//! resource rather than a guest. There is no guest to resolve or authorize
-//! against, no protection tag, and no vendor task to poll: an HA rule write
-//! answers synchronously. What is kept is the part the acceptance criteria
-//! actually asks for: no write reaches `/cluster/ha/rules` except through
-//! this plan → approve → apply path.
+//! resource rather than a guest. There is no vendor task to poll: an HA rule
+//! write answers synchronously. No write reaches `/cluster/ha/rules` except
+//! through this plan → approve → apply path.
 //!
-//! HA rules are cluster-scoped, not guest-scoped, so these tools authorize
-//! only against the caller's cluster and tool scopes -- the same as
-//! `get_cluster_status` or `get_nodes` -- and do not consult the caller's
-//! guest selector the way a `GuestArgs` tool does. A rule's `services` list
-//! names guests, but the rule itself belongs to no one guest.
+//! The rule itself belongs to no one guest, but it moves the guests it names.
+//! So beyond the cluster and tool scopes, plan and apply both run
+//! `ProxmoxServer::authorize_ha_rule_guests` over every guest the change and
+//! the current rule name: the `destructive` action tier, the caller's guest
+//! selector, and the `protected`-tag/inventory-pin guard, exactly as a
+//! destroy plan of each of those guests would be gated.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -278,6 +277,66 @@ fn build_create_or_update(args: &PlanHaRuleArgs, is_create: bool) -> Result<HaRu
         comment: args.comment.clone(),
         disable: args.disable,
     })
+}
+
+/// The vmids an HA rule change touches: those the action names plus those the
+/// rule currently names.
+///
+/// The current rule is read from `resources` (the PVE 9 field) and, failing
+/// that, `services`; either may be a comma-separated string or an array.
+///
+/// # Errors
+///
+/// Returns a message when a service id, from either source, is not in
+/// `vm:<vmid>`/`ct:<vmid>` form -- a guest this cannot identify is a guest it
+/// cannot authorize, so it is refused rather than skipped.
+pub(crate) fn guests_touched(
+    action: &HaRuleAction,
+    existing: Option<&serde_json::Value>,
+) -> Result<std::collections::BTreeSet<u32>, String> {
+    let mut ids: Vec<String> = action.services.clone().unwrap_or_default();
+
+    if let Some(rule) = existing {
+        let field = rule.get("resources").or_else(|| rule.get("services"));
+        match field {
+            Some(serde_json::Value::String(list)) => ids.extend(
+                list.split(',')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(ToOwned::to_owned),
+            ),
+            Some(serde_json::Value::Array(entries)) => {
+                for entry in entries {
+                    let Some(entry) = entry.as_str() else {
+                        return Err(format!(
+                            "HA rule '{}' lists a non-string resource {entry}",
+                            action.rule
+                        ));
+                    };
+                    ids.push(entry.trim().to_owned());
+                }
+            }
+            Some(serde_json::Value::Null) | None => {}
+            Some(other) => {
+                return Err(format!(
+                    "HA rule '{}' has an unreadable resource list {other}",
+                    action.rule
+                ));
+            }
+        }
+    }
+
+    let mut vmids = std::collections::BTreeSet::new();
+    for id in ids {
+        rust_proxmoxmcp_core::ha_rules::validate_service_id(&id)
+            .map_err(|error| error.to_string())?;
+        let (_, number) = id.split_once(':').expect("validated above");
+        let vmid = number
+            .parse::<u32>()
+            .map_err(|_| format!("service '{id}' names a vmid out of range"))?;
+        vmids.insert(vmid);
+    }
+    Ok(vmids)
 }
 
 /// Validate a `node[:priority]` comma list, the form Proxmox's `nodes` field

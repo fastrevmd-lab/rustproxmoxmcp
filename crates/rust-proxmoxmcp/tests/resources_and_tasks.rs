@@ -49,9 +49,10 @@ fn spec(tools: &[&str], guests: &[&str]) -> common::TokenSpec {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_container_allocation_is_changed() {
-    let h = common::TestServer::start_with_routes(
+    let h = common::TestServer::start_with_direct_commit(
         spec(&["update_container_resources"], &["*"]),
         routes(),
+        true,
     )
     .await;
 
@@ -112,7 +113,9 @@ async fn a_qemu_guest_is_refused_by_name() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_backup_task_can_be_stopped() {
-    let h = common::TestServer::start_with_routes(spec(&["stop_task"], &["*"]), routes()).await;
+    let h =
+        common::TestServer::start_with_direct_commit(spec(&["stop_task"], &["*"]), routes(), true)
+            .await;
 
     let out = common::call(
         &h,
@@ -169,9 +172,12 @@ async fn an_unreadable_task_handle_is_refused() {
 /// token may cancel work on a guest it holds -- and may not on one it does not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_narrowed_token_is_scoped_per_guest_not_shut_out() {
-    let h =
-        common::TestServer::start_with_routes(spec(&["stop_task"], &["vmid:600-699"]), routes())
-            .await;
+    let h = common::TestServer::start_with_direct_commit(
+        spec(&["stop_task"], &["vmid:600-699"]),
+        routes(),
+        true,
+    )
+    .await;
 
     // 617 is inside the scope.
     common::call(
@@ -263,7 +269,9 @@ async fn cancelling_a_protected_guests_task_is_refused() {
 /// nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_cancel_goes_to_the_node_named_in_the_handle() {
-    let h = common::TestServer::start_with_routes(spec(&["stop_task"], &["*"]), routes()).await;
+    let h =
+        common::TestServer::start_with_direct_commit(spec(&["stop_task"], &["*"]), routes(), true)
+            .await;
 
     let out = common::call(
         &h,
@@ -311,7 +319,9 @@ async fn node_work_with_a_guest_shaped_id_still_needs_a_wildcard_scope() {
 /// cancellable — the strict UPID parse rejects those outright.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_node_job_without_a_worker_id_can_be_stopped() {
-    let h = common::TestServer::start_with_routes(spec(&["stop_task"], &["*"]), routes()).await;
+    let h =
+        common::TestServer::start_with_direct_commit(spec(&["stop_task"], &["*"]), routes(), true)
+            .await;
 
     let out = common::call(
         &h,

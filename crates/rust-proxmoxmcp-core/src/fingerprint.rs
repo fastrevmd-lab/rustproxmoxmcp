@@ -131,3 +131,34 @@ pub fn ha_rule_fingerprint(
         .collect::<String>();
     format!("sha256:{}", hex)
 }
+
+/// Computes a stable fingerprint for a VMID that a restore-to-new-vmid plan
+/// targets, before any guest exists there.
+///
+/// There is no guest to fingerprint -- that is the whole point of this
+/// operation -- so what can drift between plan and apply is not a guest's
+/// config but whether the VMID is still free. This value is therefore
+/// constant for a given `(cluster, vmid)` pair; the actual drift check is the
+/// explicit vacancy re-check the apply handler performs against the live
+/// cluster before dispatching the restore. This fingerprint exists so that
+/// check has the same `expected_candidate_fingerprint` plumbing every other
+/// change set uses, rather than a bespoke field.
+///
+/// Returns a string in the format `sha256:<lowercase hex>`, matching
+/// [`fingerprint`] so the two are never confused for one another by shape.
+#[must_use]
+pub fn restore_target_fingerprint(cluster: &str, vmid: u32) -> String {
+    let tuple = (cluster, vmid, "vacant-restore-target");
+    let bytes =
+        serde_json::to_vec(&tuple).expect("tuple serialization cannot fail with these types");
+
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let hash = hasher.finalize();
+
+    let hex = hash
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>();
+    format!("sha256:{}", hex)
+}

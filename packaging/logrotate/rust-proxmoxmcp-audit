@@ -1,0 +1,29 @@
+# rust-proxmoxmcp audit log rotation.
+#
+# Install as /etc/logrotate.d/rust-proxmoxmcp-audit (root:root, mode 0644).
+# Enable the sink by passing --audit-log-file (or PROXMOXMCP_AUDIT_LOG_FILE).
+# The path below matches the packaged systemd unit, which runs as
+# proxmoxmcp:proxmoxmcp with StateDirectory=proxmoxmcp (/var/lib/proxmoxmcp
+# writable under ProtectSystem=strict). Adjust paths/retention to your policy.
+#
+# Rename + reopen, not copytruncate:
+#   The server keeps the AuditFileSink handle mecmcp_audit::init_tracing
+#   returns and reopens it by path on SIGHUP, alongside the existing
+#   clusters.json/tokens.json hot reload. logrotate renames the file below,
+#   sends SIGHUP through `postrotate`, and every write after that point goes
+#   to a fresh inode at the same path. Nothing written before the rename is
+#   truncated and nothing written after it is lost — unlike copytruncate,
+#   which drops whatever lands between its copy and its truncate.
+
+/var/lib/proxmoxmcp/audit.jsonl {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    su proxmoxmcp proxmoxmcp
+    postrotate
+        systemctl kill -s HUP rust-proxmoxmcp.service >/dev/null 2>&1 || true
+    endscript
+}

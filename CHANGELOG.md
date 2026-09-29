@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unknown` and can no longer approve change sets. Re-mint each approver's
   token with `rust-proxmoxmcp token add ... --actor-type human`; other
   tokens are unaffected. See [README § Change control](README.md#change-control).
+- **Container images now publish to `ghcr.io/mechubsec/rustproxmoxmcp`** —
+  the repo moved to the mechubsec organization, and images are renamed to
+  match. Older tags were copied from the previous name.
 - Raised MSRV to 1.89 (family-wide decision).
 - **Added 14 read-only firewall tools** (MEC-453): rules, options, IPSets,
   aliases and security groups at cluster, node and guest scope, matching the
@@ -45,6 +48,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pushed image by digest via GitHub OIDC. `CI` adds an MSRV job that checks
   the workspace at the declared 1.89 floor with a freshly resolved
   lockfile.
+- **BREAKING: added pagination to `get_vms`, `get_containers` and
+  `list_backups`** (MEC-479). A dense large cluster (or a storage backend
+  with a long retention window) could exceed the MCP result's 512 KiB cap
+  and refuse outright with no way to retry at a smaller page (found by
+  MEC-456's lab test at ~1,000 QEMU guests). The three tools now take an
+  optional `offset`/`limit` (default 500, max 700) and return
+  `{items, total, offset, limit, has_more}` instead of a bare array. Pages
+  are sorted by `vmid`/`volid` so records don't shift between calls as the
+  cluster changes. `list_tasks` was evaluated for the same treatment but is
+  *not* paginated (MEC-871): Proxmox's `/nodes/{node}/tasks` already applies
+  its own server-side window with no discoverable total, so a client-side
+  pagination envelope on top of it would misreport a truncated list as
+  complete.
 
 ## [0.10.0] - 2026-09-16
 
@@ -271,7 +287,7 @@ on that deployment is a `probe-verify` / `probe-approver` test targeting guest
 ### Security
 
 - **Takes mecmcp 0.21.0, which stops `RUST_LOG` switching the audit trail off**
-  ([mecmcp#330](https://github.com/fastrevmd-lab/mecmcp/issues/330)). The
+  ([mecmcp#330](https://github.com/mechubsec/mecmcp/issues/330)). The
   environment filter was attached to the tracing registry, where it decides
   whether an event exists at all, so it gated the audit file and journald sinks
   as well as the console. A `RUST_LOG` naming a target — the ordinary way to
@@ -872,5 +888,5 @@ Five defects found by installing and running release 0.1.0 against a live Proxmo
 - A bearer token with no `grant` key is refused for guest-addressed tools. This is fail-closed: a grantless token must not become a wildcard.
 - The `rust-proxmoxmcp-core` crate has a non-default `testing` feature that pulls in mock-server machinery (`rcgen`, `rustls`, `tokio-rustls`, `tempfile`). This is **not** compiled into the release binary.
 
-[0.1.1]: https://github.com/fastrevmd-lab/rustproxmoxmcp/releases/tag/v0.1.1
-[0.1.0]: https://github.com/fastrevmd-lab/rustproxmoxmcp/releases/tag/v0.1.0
+[0.1.1]: https://github.com/mechubsec/rustproxmoxmcp/releases/tag/v0.1.1
+[0.1.0]: https://github.com/mechubsec/rustproxmoxmcp/releases/tag/v0.1.0

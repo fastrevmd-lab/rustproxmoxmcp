@@ -263,7 +263,7 @@ async fn main() -> Result<()> {
     mecmcp_runtime::cli_validate::validate(&args.common)
         .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
 
-    init_audit(&args.common)?;
+    let audit_sink = init_audit(&args.common)?;
 
     if let Some(Command::Token { .. }) = args.common.command.take() {
         // This path fires when a server flag precedes the subcommand
@@ -335,10 +335,32 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(mecmcp_audit::EvidenceService::recorder);
 
+    // Direct-commit tools (the interrupting lifecycle verbs, `stop_task`,
+    // `update_container_resources`, `clone_vm`, `create_vm`,
+    // `create_container`, `resize_disk`, and `create_backup`) mutate a guest
+    // in one call with no change-set approval. Refused by default; logging
+    // here mirrors the lab-mode banner above.
+    let direct_commit = mecmcp_audit::DirectCommitPolicy::new(args.allow_direct_commit);
+    direct_commit.log_startup("rust-proxmoxmcp");
+    if !args.allow_direct_commit {
+        tracing::info!(
+            "direct-commit tools disabled: stop_vm, shutdown_vm, reset_vm, stop_container, \
+             restart_container, stop_task, update_container_resources, clone_vm, create_vm, \
+             create_container, resize_disk and create_backup are refused on stdio and HTTP \
+             alike. Use --allow-direct-commit to enable them."
+        );
+    }
+
     let served = match args.common.transport {
         Transport::Stdio => {
-            // SIGHUP reloads the inventory in place. Stdio has no token store.
-            install_sighup_reload(Arc::clone(&clusters), Arc::clone(&index), None)?;
+            // SIGHUP reopens the audit log and reloads the inventory in
+            // place. Stdio has no token store.
+            install_sighup_reload(
+                Arc::clone(&clusters),
+                Arc::clone(&index),
+                None,
+                audit_sink.clone(),
+            )?;
             serve_stdio(
                 clusters,
                 clients,
@@ -346,6 +368,7 @@ async fn main() -> Result<()> {
                 waivers,
                 args.lab_mode,
                 recorder,
+                direct_commit,
                 args.state_file.clone(),
             )
             .await
@@ -370,11 +393,13 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Install SIGHUP handler that reloads both inventory and token store.
+            // Install SIGHUP handler that reopens the audit log and reloads
+            // both inventory and token store.
             install_sighup_reload(
                 Arc::clone(&clusters),
                 Arc::clone(&index),
                 token_store.clone(),
+                audit_sink.clone(),
             )?;
 
             let tls = load_listener_tls(&args.common)?;
@@ -434,6 +459,7 @@ async fn main() -> Result<()> {
                 waivers,
                 args.lab_mode,
                 recorder,
+                direct_commit,
                 args.state_file.clone(),
             )
             .await
@@ -497,7 +523,7 @@ fn init_token_audit() {
         .try_init();
 }
 
-fn init_audit(args: &mecmcp_runtime::cli::Cli) -> Result<()> {
+fn init_audit(args: &mecmcp_runtime::cli::Cli) -> Result<Option<mecmcp_audit::AuditFileSink>> {
     let redaction = if args.audit_redact.trim().is_empty() {
         None
     } else {
@@ -509,7 +535,7 @@ fn init_audit(args: &mecmcp_runtime::cli::Cli) -> Result<()> {
             .map_err(|error| anyhow::anyhow!("invalid --audit-redact: {error}"))?,
         )
     };
-    mecmcp_audit::init_tracing(&mecmcp_audit::AuditConfig {
+    let sink = mecmcp_audit::init_tracing(&mecmcp_audit::AuditConfig {
         format: mecmcp_audit::AuditFormat::parse(&args.audit_format),
         audit_log_file: args.audit_log_file.clone(),
         redaction,
@@ -517,9 +543,10 @@ fn init_audit(args: &mecmcp_runtime::cli::Cli) -> Result<()> {
     })
     .context("initializing audit tracing")?;
     mecmcp_audit::install_duration_metric_name("rust_proxmoxmcp_tool_duration_seconds");
-    Ok(())
+    Ok(sink)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_stdio(
     clusters: Arc<ClusterInventory>,
     clients: Arc<BTreeMap<String, ProxmoxClient>>,
@@ -527,6 +554,7 @@ async fn serve_stdio(
     waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
     lab_mode: bool,
     evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
+    direct_commit: mecmcp_audit::DirectCommitPolicy,
     state_file: Option<PathBuf>,
 ) -> Result<()> {
     let handler = ProxmoxServer::new_with_default_coordinator(
@@ -536,6 +564,7 @@ async fn serve_stdio(
         waivers,
         lab_mode,
         evidence,
+        direct_commit,
         state_file.as_deref(),
     )
     .context("build server")?;
@@ -643,8 +672,23 @@ fn install_sighup_reload(
     clusters: Arc<ClusterInventory>,
     index: Arc<GuestIndex>,
     token_store: Option<Arc<TokenStoreFile<ProxmoxGrant>>>,
+    audit_sink: Option<mecmcp_audit::AuditFileSink>,
 ) -> std::io::Result<()> {
     mecmcp_runtime::signals::install_hup_handler(move || {
+        // Reopen the audit log first: this is the lossless half of log
+        // rotation (rename the file, signal the process), and a failure here
+        // must not block the reloads below.
+        if let Some(sink) = &audit_sink {
+            match sink.reopen() {
+                Ok(()) => {
+                    tracing::info!(path = %sink.path().display(), "audit log reopened");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, path = %sink.path().display(), "audit log reopen failed; keeping previous sink");
+                }
+            }
+        }
+
         // Reload cluster inventory.
         match clusters.reload() {
             Ok(count) => {
@@ -689,6 +733,7 @@ async fn serve_http(
     waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
     lab_mode: bool,
     evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
+    direct_commit: mecmcp_audit::DirectCommitPolicy,
     state_file: Option<PathBuf>,
 ) -> Result<()> {
     let handler = ProxmoxServer::new_with_default_coordinator(
@@ -698,6 +743,7 @@ async fn serve_http(
         waivers,
         lab_mode,
         evidence,
+        direct_commit,
         state_file.as_deref(),
     )
     .context("build server")?;

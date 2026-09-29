@@ -139,8 +139,8 @@ image first (RepoDigests is empty if the image has not been pulled), then captur
 the complete pinned reference:
 
 ```bash
-docker pull ghcr.io/fastrevmd-lab/rust-proxmoxmcp:0.10.0
-image=$(docker inspect ghcr.io/fastrevmd-lab/rust-proxmoxmcp:0.10.0 \
+docker pull ghcr.io/mechubsec/rustproxmoxmcp:0.10.0
+image=$(docker inspect ghcr.io/mechubsec/rustproxmoxmcp:0.10.0 \
     --format '{{index .RepoDigests 0}}')
 ```
 
@@ -159,7 +159,7 @@ build) fails:
 
 ```bash
 cosign verify \
-  --certificate-identity-regexp '^https://github\.com/fastrevmd-lab/rustproxmoxmcp/\.github/workflows/release-image\.yml@refs/(tags/v[0-9]+\.[0-9]+\.[0-9]+|heads/main)$' \
+  --certificate-identity-regexp '^https://github\.com/mechubsec/rustproxmoxmcp/\.github/workflows/release-image\.yml@refs/(tags/v[0-9]+\.[0-9]+\.[0-9]+|heads/main)$' \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   "$image"
 ```
@@ -278,7 +278,7 @@ The tokens file is mounted to the wrong path. The image expects
 `/var/lib/proxmoxmcp/tokens.json` by default, but some deployments use
 `/etc/proxmoxmcp/tokens.json`. Check which path your `--tokens-file` flag
 points to and mount the file there. This inconsistency is tracked in
-fastrevmd-lab/mecmcp#356.
+mechubsec/mecmcp#356.
 
 **`421` on every request after the server starts cleanly**
 The `--allowed-host` and `--allowed-origin` values do not match the address

@@ -51,9 +51,11 @@ impl Tier {
 /// like a different action class than it is, and an operator who granted `low`
 /// does expect to be able to stop an unprotected guest.
 ///
-/// The complement matters as much as the list: `start_vm`, `create_snapshot`
-/// and `create_backup` *add* something and stay safe on a protected guest.
-/// Snapshotting protected guests before an upgrade is the most common
+/// The complement matters as much as the list: `start_vm` and `create_snapshot`
+/// *add* something and stay safe on a protected guest. `create_backup` is the
+/// same in its default `snapshot` mode, but not in `suspend` or `stop` mode --
+/// see [`backup_interrupts`], which answers the per-call question this list
+/// cannot. Snapshotting protected guests before an upgrade is the most common
 /// operation in this lab, and refusing it would make the tool useless for the
 /// case it exists to serve.
 pub const INTERRUPTING_TOOLS: &[&str] = &[
@@ -75,6 +77,37 @@ pub fn interrupts_service(tool: &str) -> bool {
     INTERRUPTING_TOOLS.contains(&tool)
 }
 
+/// The only `mode` values vzdump's `create_backup` endpoint accepts.
+///
+/// Checked before authorization so an unrecognised value is refused outright
+/// rather than classified by a `.trim() == "stop"`-style comparison that a
+/// value like `"STOP"` or a stray argument could slip past -- see
+/// [`backup_interrupts`]'s fail-closed note.
+pub const VALID_BACKUP_MODES: &[&str] = &["snapshot", "suspend", "stop"];
+
+/// Whether a `create_backup` call with this `mode` takes the guest out of
+/// service for the duration of the backup.
+///
+/// `create_backup` is not, and cannot be, a member of [`INTERRUPTING_TOOLS`]:
+/// that list answers a per-*tool* question, and whether a backup interrupts
+/// the guest depends on `mode`, a per-*call* argument. vzdump's `stop` mode
+/// stops the guest before dumping it, and `suspend` pauses it for longer than
+/// a live snapshot would -- both exactly as disruptive as `stop_vm` -- while
+/// only `snapshot` does not take it out of service. Treating `create_backup`
+/// as uniformly non-interrupting (as [`interrupts_service`] would, since it is
+/// absent from [`INTERRUPTING_TOOLS`]) would let `mode: "stop"` or
+/// `mode: "suspend"` bypass the protection and direct-commit gates that a
+/// plain `stop_vm` call cannot.
+///
+/// Callers must reject any `mode` outside [`VALID_BACKUP_MODES`] before
+/// calling this: an unrecognised value has to fail closed rather than be
+/// guessed at here, so this function assumes it has already been validated
+/// and never itself refuses.
+#[must_use]
+pub fn backup_interrupts(mode: &str) -> bool {
+    matches!(mode.trim(), "stop" | "suspend")
+}
+
 /// Tools excluded from a wildcard tool scope. Complete as of spec §4.3.
 pub const WRITE_TOOLS: &[&str] = &[
     // low
@@ -88,6 +121,7 @@ pub const WRITE_TOOLS: &[&str] = &[
     "download_iso",
     "plan_ha_rule_change",
     "plan_proxmox_destroy",
+    "plan_restore_new_vmid",
     "reset_vm",
     "restart_container",
     "shutdown_vm",
@@ -102,6 +136,7 @@ pub const WRITE_TOOLS: &[&str] = &[
     // destructive
     "apply_ha_rule_change",
     "apply_proxmox_change_set",
+    "apply_restore_new_vmid",
     "create_ha_rule",
     "delete_backup",
     "delete_container",
@@ -112,8 +147,10 @@ pub const WRITE_TOOLS: &[&str] = &[
     "migrate_container",
     "migrate_vm",
     "restore_backup",
+    "restore_backup_new_vmid",
     "rollback_snapshot",
     "update_ha_rule",
+    "update_vm_config",
     // deferred to 0.5, registered here so a wildcard never reaches it
     "execute_vm_command",
 ];
@@ -122,6 +159,7 @@ pub const WRITE_TOOLS: &[&str] = &[
 const DESTRUCTIVE_TOOLS: &[&str] = &[
     "apply_ha_rule_change",
     "apply_proxmox_change_set",
+    "apply_restore_new_vmid",
     "create_ha_rule",
     "delete_backup",
     "delete_container",
@@ -133,8 +171,10 @@ const DESTRUCTIVE_TOOLS: &[&str] = &[
     "migrate_container",
     "migrate_vm",
     "restore_backup",
+    "restore_backup_new_vmid",
     "rollback_snapshot",
     "update_ha_rule",
+    "update_vm_config",
 ];
 
 /// Classify a tool.
@@ -270,6 +310,52 @@ mod interruption_tests {
                 "{tool} is destructive; its tier already refuses a protected guest"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod backup_interrupt_tests {
+    use super::{VALID_BACKUP_MODES, backup_interrupts};
+
+    /// `mode: "stop"` stops the guest before dumping it, and `mode: "suspend"`
+    /// pauses it for the duration of the dump -- both exactly as disruptive as
+    /// `stop_vm` -- so both must classify as interrupting even though
+    /// `create_backup` itself is not in `INTERRUPTING_TOOLS`.
+    #[test]
+    fn stop_and_suspend_modes_interrupt() {
+        assert!(backup_interrupts("stop"));
+        assert!(backup_interrupts("suspend"));
+    }
+
+    /// `snapshot` does not take the guest out of service, which is what keeps
+    /// `create_backup` usable on a protected guest in its default mode.
+    #[test]
+    fn snapshot_mode_does_not_interrupt() {
+        assert!(!backup_interrupts("snapshot"));
+    }
+
+    /// Whitespace must not change the answer, matching `resize_shrinks`'s
+    /// house style for free-text arguments.
+    #[test]
+    fn surrounding_whitespace_does_not_flip_the_classification() {
+        assert!(backup_interrupts("  stop  "));
+        assert!(backup_interrupts("  suspend  "));
+        assert!(!backup_interrupts("  snapshot  "));
+    }
+
+    /// A case variant or stray value is exactly what `VALID_BACKUP_MODES`
+    /// exists to catch before this function ever sees it: `"STOP"` does not
+    /// match the `stop` arm of `backup_interrupts` and would silently
+    /// classify as non-interrupting if a caller skipped the allowlist check.
+    #[test]
+    fn a_mode_outside_the_allowlist_would_misclassify_if_unchecked() {
+        assert!(!VALID_BACKUP_MODES.contains(&"STOP"));
+        assert!(!backup_interrupts("STOP"));
+    }
+
+    #[test]
+    fn the_allowlist_is_exactly_the_three_vzdump_modes() {
+        assert_eq!(VALID_BACKUP_MODES, &["snapshot", "suspend", "stop"]);
     }
 }
 
