@@ -18,8 +18,8 @@ on:
         default: ''
 
 env:
-  # GHCR requires a lowercase image path; the repo name is mixed-case.
-  IMAGE: ghcr.io/fastrevmd-lab/rust-proxmoxmcp
+  # GHCR requires a lowercase image path; github.repository is already lowercase.
+  IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
   sbom:
