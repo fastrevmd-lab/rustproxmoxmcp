@@ -32,7 +32,7 @@ RUN install -d -m 0750 -o 65532 -g 65532 /stage-etc/proxmoxmcp \
 # This is newer than the 2026-08-07 digest junos/mist share; they should be
 # updated to this digest to avoid drift.
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97
-LABEL org.opencontainers.image.source="https://github.com/fastrevmd-lab/rustproxmoxmcp"
+LABEL org.opencontainers.image.source="https://github.com/mechubsec/rustproxmoxmcp"
 LABEL org.opencontainers.image.licenses="MIT"
 
 # CA certificates are shipped in gcr.io/distroless/cc-* at /etc/ssl/certs. The

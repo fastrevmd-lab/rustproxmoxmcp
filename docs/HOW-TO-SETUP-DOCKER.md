@@ -256,7 +256,7 @@ The tokens file is mounted to the wrong path. The image expects
 `/var/lib/proxmoxmcp/tokens.json` by default, but some deployments use
 `/etc/proxmoxmcp/tokens.json`. Check which path your `--tokens-file` flag
 points to and mount the file there. This inconsistency is tracked in
-fastrevmd-lab/mecmcp#356.
+mechubsec/mecmcp#356.
 
 **`421` on every request after the server starts cleanly**
 The `--allowed-host` and `--allowed-origin` values do not match the address

@@ -262,7 +262,7 @@ on that deployment is a `probe-verify` / `probe-approver` test targeting guest
 ### Security
 
 - **Takes mecmcp 0.21.0, which stops `RUST_LOG` switching the audit trail off**
-  ([mecmcp#330](https://github.com/fastrevmd-lab/mecmcp/issues/330)). The
+  ([mecmcp#330](https://github.com/mechubsec/mecmcp/issues/330)). The
   environment filter was attached to the tracing registry, where it decides
   whether an event exists at all, so it gated the audit file and journald sinks
   as well as the console. A `RUST_LOG` naming a target — the ordinary way to
@@ -863,5 +863,5 @@ Five defects found by installing and running release 0.1.0 against a live Proxmo
 - A bearer token with no `grant` key is refused for guest-addressed tools. This is fail-closed: a grantless token must not become a wildcard.
 - The `rust-proxmoxmcp-core` crate has a non-default `testing` feature that pulls in mock-server machinery (`rcgen`, `rustls`, `tokio-rustls`, `tempfile`). This is **not** compiled into the release binary.
 
-[0.1.1]: https://github.com/fastrevmd-lab/rustproxmoxmcp/releases/tag/v0.1.1
-[0.1.0]: https://github.com/fastrevmd-lab/rustproxmoxmcp/releases/tag/v0.1.0
+[0.1.1]: https://github.com/mechubsec/rustproxmoxmcp/releases/tag/v0.1.1
+[0.1.0]: https://github.com/mechubsec/rustproxmoxmcp/releases/tag/v0.1.0

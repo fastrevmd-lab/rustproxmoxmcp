@@ -18,4 +18,4 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # the interfaces stabilise enough to publish. `unknown-git = "deny"` above still
 # rejects every other git source, so this is one named exception rather than a
 # blanket allowance. Remove it once mecmcp-auth is on crates.io.
-allow-git = ["https://github.com/fastrevmd-lab/mecmcp"]
+allow-git = ["https://github.com/mechubsec/mecmcp"]

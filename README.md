@@ -438,7 +438,7 @@ The core crate has a non-default `testing` feature that pulls in `rcgen`, `rustl
 
 ## Sibling servers
 
-| | [rustjunosmcp](https://github.com/fastrevmd-lab/rustjunosmcp) | [rustpanosmcp](https://github.com/fastrevmd-lab/rustpanosmcp) | [rustmistmcp](https://github.com/fastrevmd-lab/rustmistmcp) | [rustunifimcp](https://github.com/fastrevmd-lab/rustunifimcp) | [rustsdcmcp](https://github.com/fastrevmd-lab/rustsdcmcp) | rustproxmoxmcp |
+| | [rustjunosmcp](https://github.com/mechubsec/rustjunosmcp) | [rustpanosmcp](https://github.com/mechubsec/rustpanosmcp) | [rustmistmcp](https://github.com/mechubsec/rustmistmcp) | [rustunifimcp](https://github.com/mechubsec/rustunifimcp) | [rustsdcmcp](https://github.com/mechubsec/rustsdcmcp) | rustproxmoxmcp |
 |---|---|---|---|---|---|---|
 | Vendor | Juniper Junos / SRX | Palo Alto PAN-OS | Juniper Mist | Ubiquiti UniFi Network | HPE Juniper Security Director Cloud | Proxmox VE |
 | Transport | NETCONF over SSH | HTTPS XML-API | HTTPS REST | HTTPS REST | HTTPS REST | HTTPS REST |
@@ -449,7 +449,7 @@ All six consume `mecmcp` — the shared Rust crate family underneath mechub's pe
 ## Audit forwarding to the event store
 
 The audit trail does not stay on this host. This server follows the family
-standard — [AUDIT-FORWARDING-STANDARD.md](https://github.com/fastrevmd-lab/mecmcp/blob/main/docs/AUDIT-FORWARDING-STANDARD.md).
+standard — [AUDIT-FORWARDING-STANDARD.md](https://github.com/mechubsec/mecmcp/blob/main/docs/AUDIT-FORWARDING-STANDARD.md).
 
 An audit record that only exists on the machine that produced it is not an audit
 trail: it is a log file on a box whose operator is the party the record is about.
@@ -469,7 +469,7 @@ server never truncates it.
 
 Records are written directly into SSDF's `ssdf.audit` as **hash-chained** rows,
 per SSDF's merged evidence contract, so that deleting or editing a row is
-detectable. Tracked in [mecmcp#292](https://github.com/fastrevmd-lab/mecmcp/issues/292).
+detectable. Tracked in [mecmcp#292](https://github.com/mechubsec/mecmcp/issues/292).
 
 A cheaper syslog path was designed and rejected: it works, but the records are
 unchained, and every other link here is tamper-evident by construction — plan

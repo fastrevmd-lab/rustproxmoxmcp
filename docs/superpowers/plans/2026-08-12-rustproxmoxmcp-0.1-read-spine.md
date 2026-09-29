@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- **`mecmcp` is read-only.** Consume at pinned `version = "0.8.8"` with `tag = "v0.8.8"`. Never edit `~/Projects/mecmcp`. A genuine gap becomes an issue on `fastrevmd-lab/mecmcp` and is designed around in the consumer.
+- **`mecmcp` is read-only.** Consume at pinned `version = "0.8.8"` with `tag = "v0.8.8"`. Never edit `~/Projects/mecmcp`. A genuine gap becomes an issue on `mechubsec/mecmcp` and is designed around in the consumer.
 - **Edition 2024, `rust-version = "1.88"`, toolchain `1.97.0`** — matches the rest of the family.
 - **`unsafe_code = "forbid"`, `missing_docs = "warn"`, `clippy::all = "warn"`, `dbg_macro = "deny"`, `todo = "deny"`, `unwrap_used = "warn"`** in `[workspace.lints]`. `unwrap` and `expect` are forbidden in non-test code.
 - **Repo name `rustproxmoxmcp`; crate and binary names take dashes** — `rust-proxmoxmcp`, `rust-proxmoxmcp-core`.
@@ -86,7 +86,7 @@ version      = "0.1.0"
 edition      = "2024"
 rust-version = "1.88"
 license      = "MIT"
-repository   = "https://github.com/fastrevmd-lab/rustproxmoxmcp"
+repository   = "https://github.com/mechubsec/rustproxmoxmcp"
 authors      = ["fastrevmd-lab"]
 
 [workspace.lints.rust]
@@ -123,15 +123,15 @@ url         = "2"
 wiremock    = "0.6"
 
 # mecmcp is consumed read-only at an exact pinned version. Do not relax the tag.
-mecmcp-audit     = { version = "0.8.8", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.8.8" }
-mecmcp-auth      = { version = "0.8.8", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.8.8" }
-mecmcp-http      = { version = "0.8.8", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.8.8" }
-mecmcp-inventory = { version = "0.8.8", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.8.8" }
-mecmcp-openapi   = { version = "0.8.8", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.8.8" }
-mecmcp-runtime   = { version = "0.8.8", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.8.8" }
-mecmcp-secret    = { version = "0.8.8", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.8.8" }
-mecmcp-server    = { version = "0.8.8", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.8.8" }
-mecmcp-transport = { version = "0.8.8", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.8.8" }
+mecmcp-audit     = { version = "0.8.8", git = "https://github.com/mechubsec/mecmcp", tag = "v0.8.8" }
+mecmcp-auth      = { version = "0.8.8", git = "https://github.com/mechubsec/mecmcp", tag = "v0.8.8" }
+mecmcp-http      = { version = "0.8.8", git = "https://github.com/mechubsec/mecmcp", tag = "v0.8.8" }
+mecmcp-inventory = { version = "0.8.8", git = "https://github.com/mechubsec/mecmcp", tag = "v0.8.8" }
+mecmcp-openapi   = { version = "0.8.8", git = "https://github.com/mechubsec/mecmcp", tag = "v0.8.8" }
+mecmcp-runtime   = { version = "0.8.8", git = "https://github.com/mechubsec/mecmcp", tag = "v0.8.8" }
+mecmcp-secret    = { version = "0.8.8", git = "https://github.com/mechubsec/mecmcp", tag = "v0.8.8" }
+mecmcp-server    = { version = "0.8.8", git = "https://github.com/mechubsec/mecmcp", tag = "v0.8.8" }
+mecmcp-transport = { version = "0.8.8", git = "https://github.com/mechubsec/mecmcp", tag = "v0.8.8" }
 ```
 
 `rust-toolchain.toml`:
