@@ -96,8 +96,76 @@ async fn an_approved_restore_into_a_free_vmid_issues_the_post_and_follows_the_ta
                 && r.body.contains("vmid=650")
                 && r.body.contains("restore=1")
                 && r.body.contains("archive=")
+                && r.body.contains("force=0")
         }),
-        "the restore POST with the new vmid must actually be issued: {reqs:?}"
+        "the restore POST with the new vmid must actually be issued, and must never pass \
+         force=1: the vacancy re-check and this POST are two separate requests, so \
+         force=1 would let a guest created on this vmid in between them be silently \
+         overwritten. Proxmox itself must refuse the POST atomically if the vmid is no \
+         longer free: {reqs:?}"
+    );
+}
+
+/// A token whose guest scope no longer covers the target vmid at apply time
+/// must be refused, even though it carries every tool scope the applying
+/// call checks by name. Mirrors the generic `apply_proxmox_change_set` path,
+/// which re-runs its full grant check at apply rather than only at plan --
+/// a token can be narrowed (or the vmid subsequently pinned) between a plan
+/// being approved and it being applied, and the apply is the call that
+/// actually acts on the cluster.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_guest_scope_narrowed_before_apply_is_refused() {
+    let h = restore_harness().await;
+
+    let planned = call_with_token(
+        &h,
+        &h.token,
+        "plan_restore_new_vmid",
+        json!({
+            "cluster": "pve3",
+            "node": "pve2",
+            "target_vmid": 650,
+            "kind": "qemu",
+            "volid": "local:backup/vzdump-qemu-100-2024_01_01-00_00_00.vma.zst",
+        }),
+    )
+    .await
+    .expect("plan");
+    let id = planned["change_set_id"].as_str().expect("id").to_owned();
+
+    call_with_token(
+        &h,
+        &h.second_token,
+        "approve_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 650}),
+    )
+    .await
+    .expect("second principal approval should succeed");
+
+    // `h.narrow_token` carries the same tool scopes as `h.token` (including
+    // `apply_restore_new_vmid` and `restore_backup_new_vmid`), but its guest
+    // scope is vmid 1 only -- it stands in for a token whose scope was
+    // narrowed after the plan was approved.
+    let error = call_with_token(
+        &h,
+        &h.narrow_token,
+        "apply_restore_new_vmid",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 650}),
+    )
+    .await
+    .expect_err("a guest scope that no longer covers the target vmid must refuse the apply");
+    assert!(
+        error.contains("outside this token's guest scope"),
+        "{error}"
+    );
+
+    let reqs = h.requests();
+    assert!(
+        !reqs
+            .iter()
+            .any(|r| r.method == "POST" && r.path == "/api2/json/nodes/pve2/qemu"),
+        "nothing may be sent to the cluster when the applying token's scope has narrowed: \
+         {reqs:?}"
     );
 }
 

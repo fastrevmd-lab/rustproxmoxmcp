@@ -60,7 +60,7 @@ async fn config_update_harness() -> TestServer {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_approved_config_update_issues_the_post_and_redacts_cipassword_in_the_preview() {
+async fn an_approved_config_update_issues_the_post_including_cloud_init_fields() {
     let h = config_update_harness().await;
 
     let planned = call_with_token(
@@ -71,7 +71,13 @@ async fn an_approved_config_update_issues_the_post_and_redacts_cipassword_in_the
             "cluster": "pve3",
             "vmid": 650,
             "op": "update_vm_config",
-            "config": {"cores": "4", "ciuser": "admin", "cipassword": "super-secret"},
+            "config": {
+                "cores": "4",
+                "ciuser": "admin",
+                "sshkeys": "ssh-ed25519%20AAAA...",
+                "ipconfig0": "ip=dhcp",
+                "net0": "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=1",
+            },
         }),
     )
     .await
@@ -80,14 +86,6 @@ async fn an_approved_config_update_issues_the_post_and_redacts_cipassword_in_the
     let preview = planned["preview"].as_str().expect("preview").to_owned();
     assert!(preview.contains("cores=4"), "{preview}");
     assert!(preview.contains("ciuser=admin"), "{preview}");
-    assert!(
-        !preview.contains("super-secret"),
-        "the cloud-init password must never appear in the preview: {preview}"
-    );
-    assert!(
-        preview.contains("cipassword=<redacted>"),
-        "the redaction must be visible, not just the secret's absence: {preview}"
-    );
 
     let id = planned["change_set_id"].as_str().expect("id").to_owned();
 
@@ -122,10 +120,110 @@ async fn an_approved_config_update_issues_the_post_and_redacts_cipassword_in_the
             r.method == "POST"
                 && r.path == "/api2/json/nodes/pve2/qemu/650/config"
                 && r.body.contains("cores=4")
-                && r.body.contains("cipassword=super-secret")
+                && r.body.contains("ciuser=admin")
         }),
-        "the config POST must actually be issued, with the real (unredacted) value -- \
-         redaction is a preview-only concern, not a payload change: {reqs:?}"
+        "the config POST must actually be issued with the cloud-init fields: {reqs:?}"
+    );
+}
+
+/// `cipassword` is refused outright, not redacted-then-sent: a plaintext
+/// cloud-init password would otherwise sit in the change-set state file on
+/// disk until the record is pruned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cipassword_is_refused_at_plan_time() {
+    let h = config_update_harness().await;
+
+    let error = call_with_token(
+        &h,
+        &h.token,
+        "plan_proxmox_destroy",
+        json!({
+            "cluster": "pve3",
+            "vmid": 650,
+            "op": "update_vm_config",
+            "config": {"cores": "4", "cipassword": "super-secret"},
+        }),
+    )
+    .await
+    .expect_err("cipassword must be refused");
+    assert!(error.contains("cipassword"), "{error}");
+    assert!(
+        !error.contains("super-secret"),
+        "the refusal message must not echo the secret value: {error}"
+    );
+
+    let reqs = h.requests();
+    assert!(
+        !reqs
+            .iter()
+            .any(|r| r.method == "POST" && r.path.ends_with("/config")),
+        "nothing may be posted: {reqs:?}"
+    );
+}
+
+/// The config-update key check is an allowlist: disk/media keys, `delete`,
+/// and boolean spellings other than the literal `firewall=0` must all be
+/// refused, even though none of them appear on any denylist by name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn allowlist_bypasses_are_refused() {
+    let h = config_update_harness().await;
+
+    for (key, value) in [
+        // `delete=protection` removes the protection flag without ever
+        // naming it as a value.
+        ("delete", "protection"),
+        // Attaching or importing another guest's disk volume.
+        ("scsi5", "local-lvm:vm-101-disk-0"),
+        ("scsi6", "local-lvm:0,import-from=local-lvm:vm-101-disk-0"),
+        // Attaching untrusted boot media.
+        ("ide2", "local:iso/untrusted.iso,media=cdrom"),
+    ] {
+        let error = call_with_token(
+            &h,
+            &h.token,
+            "plan_proxmox_destroy",
+            json!({
+                "cluster": "pve3",
+                "vmid": 650,
+                "op": "update_vm_config",
+                "config": {key: value},
+            }),
+        )
+        .await
+        .expect_err("an allowlist bypass must be refused");
+        assert!(error.contains(key), "the refusal must name {key}: {error}");
+    }
+
+    // `firewall=off`/`firewall=false` are Proxmox-accepted boolean spellings
+    // that a literal `firewall=0` match alone would miss.
+    for value in [
+        "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=off",
+        "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=false",
+        // No `firewall=` field at all -- Proxmox defaults to off.
+        "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0",
+    ] {
+        let error = call_with_token(
+            &h,
+            &h.token,
+            "plan_proxmox_destroy",
+            json!({
+                "cluster": "pve3",
+                "vmid": 650,
+                "op": "update_vm_config",
+                "config": {"net0": value},
+            }),
+        )
+        .await
+        .expect_err("a netN value that does not explicitly enable the firewall must be refused");
+        assert!(error.contains("firewall"), "{error}");
+    }
+
+    let reqs = h.requests();
+    assert!(
+        !reqs
+            .iter()
+            .any(|r| r.method == "POST" && r.path.ends_with("/config")),
+        "nothing may be posted: {reqs:?}"
     );
 }
 

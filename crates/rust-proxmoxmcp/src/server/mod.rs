@@ -636,42 +636,65 @@ const REFUSED_CONFIG_KEYS: &[&str] = &[
 const REFUSED_CONFIG_PREFIXES: &[&str] =
     &["mp", "hostpci", "usb", "dev", "serial", "parallel", "lxc."];
 
-/// Config keys `update_vm_config` refuses.
+/// Config key families `update_vm_config` accepts, by exact match
+/// (case-insensitive).
 ///
-/// A QEMU config update is not a create -- the guest already exists, so
-/// `archive`/`restore`/`force` cannot repeat the create-time attack of
-/// smuggling a restore through a lower tier. They stay refused anyway,
-/// because a config update reaching Proxmox's `POST .../qemu/{vmid}/config`
-/// with those three fields present is indistinguishable from a restore at the
-/// HTTP layer, and this tool's change-set preview never describes that.
+/// An allowlist, not a denylist: `update_vm_config` reaches Proxmox's
+/// `POST .../qemu/{vmid}/config`, which accepts far more than these families
+/// (disk attach/import, `delete`/`revert`, host device passthrough, node-run
+/// scripts, boot-media changes, the protection flag). Enumerating what this
+/// tool refuses missed real cases -- `delete=protection` removes the
+/// protection flag without ever naming it, and a disk key can attach or
+/// `import-from` another guest's volume, going around the guest scope this
+/// server promises. An allowlist of the cloud-init, sizing and metadata
+/// families this tool exists for closes that gap by construction: anything
+/// not named here is refused, whatever Proxmox later adds.
 ///
-/// - `hookscript` and `args` run on the node, not in the guest, same as for
-///   `create_vm`.
-/// - `cicustom` runs cloud-init snippets from storage; the ordinary
-///   cloud-init fields (`ciuser`, `cipassword`, `sshkeys`, `ipconfigN`, ...)
-///   are not here and go through as normal config.
-/// - `boot` changes what device the guest starts from, which can turn a
-///   config update into a boot-order change that lands the guest on
-///   untrusted media. Set it from the Proxmox UI if intended.
-/// - `protection` is Proxmox's own delete-protection flag. Weakening it is
-///   outside a config-update tool's mandate, whatever else the call is doing.
-const REFUSED_VM_CONFIG_KEYS: &[&str] = &[
-    "archive",
-    "restore",
-    "force",
-    "hookscript",
-    "args",
-    "cicustom",
-    "boot",
-    "protection",
+/// `cipassword` is deliberately not here -- see its own refusal in
+/// `reject_unsafe_vm_config`.
+const ALLOWED_VM_CONFIG_KEYS: &[&str] = &[
+    // cloud-init
+    "ciuser",
+    "sshkeys",
+    "nameserver",
+    "searchdomain",
+    "citype",
+    "ciupgrade",
+    // sizing
+    "cores",
+    "sockets",
+    "memory",
+    "balloon",
+    "cpu",
+    "numa",
+    // metadata
+    "name",
+    "description",
+    "tags",
+    "onboot",
+    "startup",
+    "agent",
 ];
 
-/// Key prefixes `update_vm_config` refuses, where Proxmox numbers the key.
+/// Key prefixes `update_vm_config` accepts, where Proxmox numbers the key
+/// (`ipconfig0`, `ipconfig1`, ...).
 ///
-/// `hostpci`/`usb`/`serial`/`parallel` pass host devices through to the
-/// guest, same concern as for `create_vm`. `mp`/`lxc.` are container-only and
-/// are not valid QEMU keys in the first place, so they are not listed here.
-const REFUSED_VM_CONFIG_PREFIXES: &[&str] = &["hostpci", "usb", "serial", "parallel"];
+/// `netN` is handled separately in `reject_unsafe_vm_config`, because it is
+/// accepted only conditionally (firewall left on), not unconditionally like
+/// these.
+const ALLOWED_VM_CONFIG_PREFIXES: &[&str] = &["ipconfig"];
+
+/// Whether `key` is inside `update_vm_config`'s allowlist, either by exact
+/// match or by an allowed prefix followed by a Proxmox index.
+fn is_allowed_vm_config_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    ALLOWED_VM_CONFIG_KEYS.contains(&lower.as_str())
+        || ALLOWED_VM_CONFIG_PREFIXES.iter().any(|prefix| {
+            lower
+                .strip_prefix(prefix)
+                .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+        })
+}
 
 /// Config keys that exact-match `refused_keys` (case-insensitively) or start
 /// with one of `refused_prefixes` followed by digits (`mp0`, `usb1`, ...) or,
@@ -725,13 +748,22 @@ fn config_host_paths(config: &std::collections::BTreeMap<String, String>) -> Vec
 
 /// Refuse config `update_vm_config` must not be able to express.
 ///
-/// Three checks, mirroring `reject_unsafe_config`'s structure for the create
-/// path: a denylist of keys and numbered prefixes outside the tool's
-/// mandate, an absolute host path in any value (a raw block device passed
-/// through under an ordinary-looking disk key), and a scan for any `netN`
-/// value that disables the guest's per-interface firewall -- the one
-/// security-posture change reachable through an otherwise ordinary-looking
-/// key/value pair rather than through a denylisted key name.
+/// Four checks: `cipassword` refused outright, an allowlist of key families
+/// (anything not in `ALLOWED_VM_CONFIG_KEYS`/`ALLOWED_VM_CONFIG_PREFIXES` and
+/// not a `netN` key is refused), `netN` accepted only when its value
+/// explicitly keeps the per-interface firewall on, and an absolute host path
+/// in any surviving value as defense in depth.
+///
+/// The key check is an allowlist rather than a denylist: a denylist here
+/// previously missed `delete=<key>` (removes a key, including `protection`,
+/// without ever naming it as a value), `firewall=off`/`firewall=false`
+/// (Proxmox accepts more boolean spellings than `firewall=0`), a bare `netN`
+/// with no `firewall=` field at all (Proxmox defaults an unspecified
+/// interface firewall to off), and disk/media keys (`scsiN`, `ideN`, ...,
+/// including `import-from`, which can pull another guest's volume into this
+/// one, going around the guest scope this server promises). An allowlist of
+/// the cloud-init, sizing and metadata families this tool exists for closes
+/// all of those by construction instead of enumerating each one.
 ///
 /// Returns the refusal text, or `None` when nothing is refused. A free
 /// function rather than a `ProxmoxServer` method, because `build_destroy_action`
@@ -739,15 +771,48 @@ fn config_host_paths(config: &std::collections::BTreeMap<String, String>) -> Vec
 /// built, before any `CallToolResult` exists to return -- needs to call it
 /// too.
 fn reject_unsafe_vm_config(config: &std::collections::BTreeMap<String, String>) -> Option<String> {
-    let offending =
-        offending_config_keys(config, REFUSED_VM_CONFIG_KEYS, REFUSED_VM_CONFIG_PREFIXES);
-    if !offending.is_empty() {
+    if let Some(key) = config
+        .keys()
+        .find(|key| key.eq_ignore_ascii_case("cipassword"))
+    {
         return Some(format!(
-            "config key(s) {} are refused: they fall outside a config update's mandate -- a \
-             restore control, host code execution, device passthrough, a boot-media change, or \
-             the guest's own protection flag. Set them from the Proxmox UI if you genuinely \
-             need them.",
-            offending.join(", ")
+            "config key '{key}' is refused: a cloud-init password would be stored in \
+             plaintext in the change-set record until it is pruned. Use 'sshkeys' for \
+             cloud-init authentication instead."
+        ));
+    }
+
+    let disallowed: Vec<String> = config
+        .keys()
+        .filter(|key| {
+            let lower = key.to_ascii_lowercase();
+            !lower.starts_with("net") && !is_allowed_vm_config_key(key)
+        })
+        .cloned()
+        .collect();
+    if !disallowed.is_empty() {
+        return Some(format!(
+            "config key(s) {} are refused: a config update accepts only cloud-init, sizing \
+             and metadata keys, plus 'netN' with its firewall left on. Disk, media, device \
+             passthrough, 'delete'/'revert', host-run scripts, boot-media and protection \
+             changes are outside this tool's mandate. Set them from the Proxmox UI if you \
+             genuinely need them.",
+            disallowed.join(", ")
+        ));
+    }
+
+    if let Some(net_key) = config.iter().find_map(|(key, value)| {
+        let is_net = key.to_ascii_lowercase().starts_with("net");
+        let firewall_on = value
+            .split(',')
+            .any(|field| field.trim().eq_ignore_ascii_case("firewall=1"));
+        (is_net && !firewall_on).then(|| key.clone())
+    }) {
+        return Some(format!(
+            "config key '{net_key}' must explicitly set 'firewall=1'. A config update must \
+             not leave the guest's per-interface firewall unset or disabled -- Proxmox \
+             defaults an interface with no 'firewall=' field to off. Change it from the \
+             Proxmox UI if a disabled firewall is intended."
         ));
     }
 
@@ -758,20 +823,6 @@ fn reject_unsafe_vm_config(config: &std::collections::BTreeMap<String, String>) 
              'storage:spec'; a path names the hypervisor's own filesystem, which a config \
              update must not reach.",
             host_pathed.join(", ")
-        ));
-    }
-
-    if let Some(net_key) = config.iter().find_map(|(key, value)| {
-        let is_net = key.to_ascii_lowercase().starts_with("net");
-        let disables_firewall = value
-            .split(',')
-            .any(|field| field.trim().eq_ignore_ascii_case("firewall=0"));
-        (is_net && disables_firewall).then(|| key.clone())
-    }) {
-        return Some(format!(
-            "config key '{net_key}' disables the guest's per-interface firewall \
-             (firewall=0), which changes its security posture outside a config update's \
-             mandate. Change it from the Proxmox UI if intended."
         ));
     }
 
@@ -4656,6 +4707,8 @@ impl ProxmoxServer {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         use restore_change_set::RestoreNewVmidAction;
+        use rust_proxmoxmcp_core::grant::ProxmoxAction;
+        use rust_proxmoxmcp_core::protect::creation_allowed;
 
         let caller = Self::caller(&context);
         let apply_request_id = caller
@@ -4713,7 +4766,13 @@ impl ProxmoxServer {
         }
 
         // Again at apply: a scope can be narrowed between plan and apply, and
-        // the apply is the call that acts.
+        // the apply is the call that acts. This repeats the full grant check
+        // from `plan_restore_new_vmid` -- tool-name authorization alone is
+        // not enough, because a token can hold the `apply_restore_new_vmid`
+        // and `restore_backup_new_vmid` tool scopes while its guest scope no
+        // longer covers this vmid, or while it no longer carries the
+        // `destructive` action tier, or while the vmid has since been pinned
+        // in `clusters.json`.
         if let Err(error) = authorize_call(
             caller.as_ref(),
             "restore_backup_new_vmid",
@@ -4721,6 +4780,33 @@ impl ProxmoxServer {
             WRITE_TOOLS,
         ) {
             return tool_error(error);
+        }
+
+        let grant = match resolve_grant(caller.as_ref()) {
+            Ok(grant) => grant,
+            Err(error) => return *error,
+        };
+
+        if !grant.allows_action(ProxmoxAction::Destructive) {
+            return tool_error(
+                "restoring into a new vmid requires the 'destructive' action tier, which this \
+                 token does not carry",
+            );
+        }
+
+        if !grant.allows_new_vmid(action.target_vmid) {
+            return tool_error(format!(
+                "vmid {} is outside this token's guest scope, so a backup may not be restored \
+                 into it",
+                action.target_vmid
+            ));
+        }
+
+        if !creation_allowed(client.cluster(), action.target_vmid) {
+            return tool_error(format!(
+                "vmid {} is a protected pin on cluster {} and must not receive a restore",
+                action.target_vmid, args.cluster
+            ));
         }
 
         let kind = match action.kind.as_str() {
@@ -4833,13 +4919,17 @@ impl ProxmoxServer {
             });
         }
 
+        // `force=0`, not `force=1`: the vacancy re-check above and this POST
+        // are two separate requests, so a guest created on this vmid in
+        // between them must make Proxmox itself refuse the write atomically
+        // rather than let it silently overwrite whatever now holds the vmid.
         let upid_str = match rust_proxmoxmcp_core::guests::restore_backup(
             client,
             &action.node,
             kind,
             action.target_vmid,
             &action.volid,
-            true,
+            false,
         )
         .await
         {
