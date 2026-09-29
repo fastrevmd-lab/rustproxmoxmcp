@@ -62,6 +62,17 @@ mecmcp-runtime   = { version = "0.24.1", git = "https://github.com/mechubsec/mec
 mecmcp-secret    = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
 mecmcp-server    = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
 mecmcp-transport = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
+# mecmcp-redact landed on mecmcp's main branch after v0.24.1 was tagged and has
+# not shipped in a tagged release yet (checked against upstream: v0.24.1 is
+# still the newest tag). Every other mecmcp-* crate above pins a tag; this one
+# pins the exact commit that finished the crate's trust-boundary review
+# (Untrusted<T> delimiter-forgery fix) instead, since there is no tag to point
+# at. This rev must resolve on a branch or tag, not just exist as a loose
+# object — an unreferenced commit can be garbage-collected upstream and break
+# this build. Swap this to `tag = "vX.Y.Z"` once mecmcp cuts a release that
+# includes the crate, so it matches the pinning discipline of the rest of
+# this block.
+mecmcp-redact    = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", rev = "2e157e0f09894e2a5309408523c0911425eebd20" }
 
 [profile.release]
 lto           = "thin"

@@ -99,8 +99,8 @@ outside the tool call: **there is deliberately no `grant_waiver` tool and no
 | `get_node_status` | node | Detailed status for one node |
 | `get_vms` | cluster | All QEMU guests with node, status, tags |
 | `get_containers` | cluster | All LXC guests with node, status, tags |
-| `get_vm_config` | guest (QEMU only) | Configuration including Proxmox digest |
-| `get_container_config` | guest (LXC only) | Configuration including Proxmox digest |
+| `get_vm_config` | guest (QEMU only) | Configuration including Proxmox digest, with `description`/`cicustom`/`args` content redacted on a best-effort basis -- credential-shaped text is stripped, but this is not a safe place to store secrets (sshkeys and network config preserved) |
+| `get_container_config` | guest (LXC only) | Configuration including Proxmox digest, with `description`/`cicustom`/`args` content redacted on a best-effort basis -- credential-shaped text is stripped, but this is not a safe place to store secrets (sshkeys and network config preserved) |
 | `get_container_ip` | guest (LXC only) | Network interfaces and addresses |
 | `get_guest_status` | guest | Current runtime status |
 | `list_snapshots` | guest | Snapshots of one guest |

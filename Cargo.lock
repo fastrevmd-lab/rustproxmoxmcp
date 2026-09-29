@@ -1567,6 +1567,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mecmcp-redact"
+version = "0.24.1"
+source = "git+https://github.com/mechubsec/mecmcp?rev=2e157e0f09894e2a5309408523c0911425eebd20#2e157e0f09894e2a5309408523c0911425eebd20"
+dependencies = [
+ "hmac",
+ "quick-xml",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "mecmcp-runtime"
 version = "0.24.1"
 source = "git+https://github.com/mechubsec/mecmcp?tag=v0.24.1#f19b3b4c2730b3813304562039132a3d4bb9a6ee"
@@ -1889,6 +1902,15 @@ dependencies = [
  "wasi",
  "web-sys",
  "winapi",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -2223,6 +2245,7 @@ dependencies = [
  "mecmcp-auth",
  "mecmcp-changeset",
  "mecmcp-job",
+ "mecmcp-redact",
  "mecmcp-runtime",
  "mecmcp-server",
  "mecmcp-transport",

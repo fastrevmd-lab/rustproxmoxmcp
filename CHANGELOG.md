@@ -36,6 +36,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declared in `catalog.rs` and dispatched through the existing generic read
   executor; none are in `WRITE_TOOLS`, so read-only is enforced in code, not
   convention. Prerequisite for governed firewall writes.
+- **Supply-chain hardening** (MEC-452): the Docker build now runs
+  `cargo build --locked`; `Release image` SHA-pins every GitHub Action, runs
+  `cargo deny check advisories licenses` in addition to `bans sources`
+  (surfaced and allowed `webpki-root-certs`' CDLA-Permissive-2.0 data
+  license, already allowed by mecmcp and rustjunosmcp), generates a
+  CycloneDX SBOM per release as an artifact, and keylessly cosign-signs the
+  pushed image by digest via GitHub OIDC. `CI` adds an MSRV job that checks
+  the workspace at the declared 1.89 floor with a freshly resolved
+  lockfile.
 
 ## [0.10.0] - 2026-09-16
 
