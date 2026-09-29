@@ -49,7 +49,7 @@ fixed; no example below needs it.
 ## 1. Prepare host paths
 
 ```bash
-mkdir -p proxmox-docker/secrets
+mkdir -p proxmox-docker/secrets proxmox-docker/state
 cd proxmox-docker
 ```
 
@@ -119,7 +119,7 @@ directory.
 **For a real deployment**, give it ownership:
 
 ```bash
-sudo chown -R 65532:65532 clusters.json tokens.json secrets
+sudo chown -R 65532:65532 clusters.json tokens.json secrets state
 ```
 
 **For local testing without root**, run the container as yourself instead. The
@@ -157,9 +157,11 @@ docker run -d --name proxmox-twoperson \
   -v "$PWD/clusters.json:/etc/proxmoxmcp/clusters.json:ro" \
   -v "$PWD/tokens.json:/var/lib/proxmoxmcp/tokens.json:ro" \
   -v "$PWD/secrets:/etc/proxmoxmcp/secrets:ro" \
+  -v "$PWD/state:/var/lib/proxmoxmcp/state:rw" \
   "$image" \
   --transport streamable-http --host 0.0.0.0 --port 30031 \
   --allow-insecure-bind \
+  --state-file /var/lib/proxmoxmcp/state/changeset-state.json \
   --allowed-host 127.0.0.1:30033 --allowed-host localhost:30033 \
   --allowed-origin http://127.0.0.1:30033 --allowed-origin http://localhost:30033
 ```
@@ -171,9 +173,11 @@ updated to the externally dialled authority, or a TLS-terminating reverse proxy
 in front of the loopback endpoint — Host and Origin header validation is not a
 network boundary.
 
-Configuration files are mounted read-only. No state directory is mounted because
-this server persists change-set state only — there are no leases or staged
-transfers like the Junos server has.
+`--state-file` persists change-set and operation state across restarts. Without
+it the coordinator keeps state in memory only, and every approval, preview and
+in-flight apply is lost when the container restarts. The `state` directory is
+mounted read-write for this — configuration files stay read-only, since only
+the state file is written at runtime.
 
 ## 4. Run it — lab mode
 
@@ -187,9 +191,11 @@ docker run -d --name proxmox-labmode \
   -v "$PWD/clusters.json:/etc/proxmoxmcp/clusters.json:ro" \
   -v "$PWD/tokens.json:/var/lib/proxmoxmcp/tokens.json:ro" \
   -v "$PWD/secrets:/etc/proxmoxmcp/secrets:ro" \
+  -v "$PWD/state:/var/lib/proxmoxmcp/state:rw" \
   "$image" \
   --transport streamable-http --host 0.0.0.0 --port 30031 \
   --allow-insecure-bind \
+  --state-file /var/lib/proxmoxmcp/state/changeset-state.json \
   --allowed-host 127.0.0.1:30043 --allowed-host localhost:30043 \
   --allowed-origin http://127.0.0.1:30043 --allowed-origin http://localhost:30043 \
   --lab-mode
