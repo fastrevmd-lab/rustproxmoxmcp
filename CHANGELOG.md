@@ -48,6 +48,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pushed image by digest via GitHub OIDC. `CI` adds an MSRV job that checks
   the workspace at the declared 1.89 floor with a freshly resolved
   lockfile.
+- **BREAKING: added pagination to `get_vms`, `get_containers` and
+  `list_backups`** (MEC-479). A dense large cluster (or a storage backend
+  with a long retention window) could exceed the MCP result's 512 KiB cap
+  and refuse outright with no way to retry at a smaller page (found by
+  MEC-456's lab test at ~1,000 QEMU guests). The three tools now take an
+  optional `offset`/`limit` (default 500, max 700) and return
+  `{items, total, offset, limit, has_more}` instead of a bare array. Pages
+  are sorted by `vmid`/`volid` so records don't shift between calls as the
+  cluster changes. `list_tasks` was evaluated for the same treatment but is
+  *not* paginated (MEC-871): Proxmox's `/nodes/{node}/tasks` already applies
+  its own server-side window with no discoverable total, so a client-side
+  pagination envelope on top of it would misreport a truncated list as
+  complete.
 
 ## [0.10.0] - 2026-09-16
 
