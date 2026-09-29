@@ -222,6 +222,8 @@ if [ -e /var/lib/proxmoxmcp/tokens.json ]; then
     echo "           --name reader --devices '*' --tools '*' --guests '*' --actions read"
     echo "     Omit --guests only for a token that will call cluster-scoped tools alone;"
     echo "     without it the token cannot address individual guests."
+    echo "     For a token that will call approve_proxmox_change_set, add --actor-type human;"
+    echo "     agent and unattributed callers are refused."
 elif [ -e /etc/proxmoxmcp/tokens.json ]; then
     echo "  3. The token store is at the legacy /etc/proxmoxmcp/tokens.json."
     echo "     Migrate it first (see above), or mint tokens directly into the legacy store:"
@@ -229,12 +231,16 @@ elif [ -e /etc/proxmoxmcp/tokens.json ]; then
     echo "           --name reader --devices '*' --tools '*' --guests '*' --actions read"
     echo "     WARNING: Tokens in the legacy store cannot be modified while the service"
     echo "     runs with ProtectSystem=strict. Migrate to /var/lib for full write capability."
+    echo "     For a token that will call approve_proxmox_change_set, add --actor-type human;"
+    echo "     agent and unattributed callers are refused."
 else
     echo "  3. Mint a token, e.g.:"
     echo "       rust-proxmoxmcp token add --tokens-file /var/lib/proxmoxmcp/tokens.json \\"
     echo "           --name reader --devices '*' --tools '*' --guests '*' --actions read"
     echo "     Omit --guests only for a token that will call cluster-scoped tools alone;"
     echo "     without it the token cannot address individual guests."
+    echo "     For a token that will call approve_proxmox_change_set, add --actor-type human;"
+    echo "     agent and unattributed callers are refused."
 fi
 echo "  4. (Optional) Configure TLS certificates at /etc/proxmoxmcp/tls/{fullchain,privkey}.pem"
 echo "  5. Start the service: systemctl start rust-proxmoxmcp"

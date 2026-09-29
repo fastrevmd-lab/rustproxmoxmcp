@@ -16,12 +16,12 @@
 
 ## Status: 0.10.0 — the tool surface is complete but for two gaps
 
-**36 callable tools**: 17 read, 18 `low`, and `apply_proxmox_change_set` as the
+**50 callable tools**: 31 read, 18 `low`, and `apply_proxmox_change_set` as the
 single `destructive` entry point. Seven further names --- `delete_vm`,
 `delete_container`, `delete_snapshot`, `delete_backup`, `delete_iso`,
 `restore_backup`, `rollback_snapshot` --- are **authorization scopes, not
 tools**: a token grants them by name and reaches them through
-`plan_proxmox_destroy`. `KNOWN_TOOLS` therefore holds 43 entries.
+`plan_proxmox_destroy`. `KNOWN_TOOLS` therefore holds 57 entries.
 
 ### What is still missing
 
@@ -68,6 +68,14 @@ service-owned) carries time-boxed operator waivers. Both overrides originate
 outside the tool call: **there is deliberately no `grant_waiver` tool and no
 `force` argument**, because an override a caller can pass is not an override.
 
+- **`approve_proxmox_change_set` requires a human approver token.** The
+  server passes the caller's token `actor_type` through to mecmcp, which
+  refuses any approval from an `agent` or unattributed (stdio) caller --
+  only `actor_type: human` can approve. Mint the approver's token with
+  `rust-proxmoxmcp token add ... --actor-type human`. `actor_type` is a
+  claim the operator makes at mint time, not something the server proves;
+  a token tagged `human` but handed to an LLM agent defeats the gate.
+
 ### What's implemented
 
 - **Multi-cluster inventory:** One server, many clusters. Each cluster gets its own API token and protection policy.
@@ -75,14 +83,14 @@ outside the tool call: **there is deliberately no `grant_waiver` tool and no
   1. **Stage 1** (before the catalog call): Bearer token validation, tool and cluster scope checks.
   2. **Stage 2** (guest-addressed tools only): Guest resolution, grant evaluation (VMID range, tag, pool selectors), and fail-closed protection.
 - **Protection union:** A guest is protected if it appears in `protected_vmids` **or** carries a tag from `protected_tags`. A protected guest is refused by every destructive and service-interrupting tool unless a waiver or lab mode supplies an override. (Read tools see protected guests normally.)
-- **A guest-addressed tool never accepts the node from the caller.** It resolves it on every call, and again at apply, because guests migrate. Node-, storage- and task-scoped tools (`get_node_status`, `get_storage`, `list_backups`, `list_isos`, `list_templates`, `list_tasks`, `get_task_status`, `download_iso`) do take a `node`, because a node is what they address --- there is no guest to resolve one from. The exception that matters is `create_vm`/`create_container`: they name a *guest* but the guest does not exist yet, so the caller supplies the node, and it is the one place a guest-addressed call can reach the wrong host. `stop_task` is deliberately not in that list: it reads the node from the UPID.
+- **A guest-addressed tool never accepts the node from the caller.** It resolves it on every call, and again at apply, because guests migrate. Node-, storage- and task-scoped tools (`get_node_status`, `get_storage`, `list_backups`, `list_isos`, `list_templates`, `list_tasks`, `get_task_status`, `download_iso`, `get_node_firewall_rules`, `get_node_firewall_options`) do take a `node`, because a node is what they address --- there is no guest to resolve one from. The exception that matters is `create_vm`/`create_container`: they name a *guest* but the guest does not exist yet, so the caller supplies the node, and it is the one place a guest-addressed call can reach the wrong host. `stop_task` is deliberately not in that list: it reads the node from the UPID.
 - **Catalog-driven dispatch:** Every read tool's HTTP method, path template, query flag, and type filter is declared once in `catalog.rs`.
 - **In-flight recovery:** A change set left `Applying` with a task handle is re-probed at startup, so an apply interrupted by a restart resolves rather than staying unresolved forever.
 - **SIGHUP reload:** `systemctl reload` reloads `clusters.json` in place without dropping in-flight calls. A failed reload logs and retains the previous snapshot.
 - **Per-cluster CA pinning:** Each cluster can name a `ca_pem_path`. There is **no insecure-skip-verify at any layer**, so a cluster with a private CA needs its CA installed and must be addressed by a name its certificate covers.
 - **Audit logging:** JSON-structured logs with optional PII redaction (HMAC-keyed or drop). Every tool call logs cluster, guest, tier, and protection status.
 
-### The 17 read tools
+### The 31 read tools
 
 | Tool | Scope | Description |
 |------|-------|-------------|
@@ -103,9 +111,30 @@ outside the tool call: **there is deliberately no `grant_waiver` tool and no
 | `list_tasks` | node | Recent tasks on one node |
 | `get_task_status` | task | Status of one task by UPID |
 | `get_proxmox_change_set` | change set | One change set's state and preview |
+| `get_cluster_firewall_rules` | cluster | Cluster-wide firewall rules |
+| `get_cluster_firewall_options` | cluster | Cluster-wide firewall options (enable, default policy) |
+| `list_firewall_security_groups` | cluster | Security groups defined on the cluster |
+| `get_firewall_security_group_rules` | cluster + group | Rules contained in one security group |
+| `list_firewall_ipsets` | cluster | Cluster-wide IPSets |
+| `get_firewall_ipset_entries` | cluster + ipset | CIDR entries in one cluster-wide IPSet |
+| `list_firewall_aliases` | cluster | Cluster-wide firewall address aliases |
+| `get_node_firewall_rules` | node | Firewall rules on one node |
+| `get_node_firewall_options` | node | Firewall options on one node |
+| `get_guest_firewall_rules` | guest | Firewall rules of one guest |
+| `get_guest_firewall_options` | guest | Firewall options of one guest |
+| `list_guest_firewall_aliases` | guest | Firewall address aliases of one guest |
+| `list_guest_firewall_ipsets` | guest | IPSets defined on one guest |
+| `get_guest_firewall_ipset_entries` | guest + ipset | CIDR entries in one IPSet of one guest |
 
 The three type-specific reads refuse the other guest type by name rather than
 addressing an endpoint that cannot exist.
+
+Firewall reads mirror the scopes Proxmox itself exposes: node-level firewall
+config has rules and options but no aliases, IPSets or security groups —
+those exist only at cluster and guest scope. All fourteen firewall tools are
+read-only: none of them appear in `WRITE_TOOLS`, so nothing here can create,
+edit or delete a rule, alias, IPSet or security group. That capability is
+tracked separately as governed firewall writes.
 
 ### The 18 low tools
 
@@ -282,8 +311,8 @@ privileges guard.
 
 | Privilege | Tool(s) that need it |
 |-----------|----------------------|
-| `VM.Audit` | Every guest-scoped read: `get_vms`, `get_containers`, `get_vm_config`, `get_container_config`, `get_container_ip`, `get_guest_status`, `list_snapshots`, and the guest resolve/fingerprint read every plan and apply performs |
-| `Sys.Audit` | `get_cluster_status`, `get_nodes`, `get_node_status`, `list_tasks`, `get_task_status` |
+| `VM.Audit` | Every guest-scoped read: `get_vms`, `get_containers`, `get_vm_config`, `get_container_config`, `get_container_ip`, `get_guest_status`, `list_snapshots`, `get_guest_firewall_rules`, `get_guest_firewall_options`, `list_guest_firewall_aliases`, `list_guest_firewall_ipsets`, `get_guest_firewall_ipset_entries`, and the guest resolve/fingerprint read every plan and apply performs |
+| `Sys.Audit` | `get_cluster_status`, `get_nodes`, `get_node_status`, `list_tasks`, `get_task_status`, `get_cluster_firewall_rules`, `get_cluster_firewall_options`, `list_firewall_security_groups`, `get_firewall_security_group_rules`, `list_firewall_ipsets`, `get_firewall_ipset_entries`, `list_firewall_aliases`, `get_node_firewall_rules`, `get_node_firewall_options` |
 | `Datastore.Audit` | `get_storage`, `list_backups`, `list_isos`, `list_templates` |
 | `VM.PowerMgmt` | `start_vm`, `stop_vm`, `shutdown_vm`, `reset_vm`, `start_container`, `stop_container`, `restart_container` |
 | `VM.Snapshot` | `create_snapshot`, `delete_snapshot` (an apply-time `plan_proxmox_destroy` op) |
@@ -362,7 +391,7 @@ only spent when `apply_proxmox_change_set` actually executes it.
 }
 ```
 
-Mint a token with `rust-proxmoxmcp token add <name>`. The plaintext token is printed once and never recoverable.
+Mint a token with `rust-proxmoxmcp token add <name>`. The plaintext token is printed once and never recoverable. Pass `--actor-type human` for any token that will approve change sets -- see [Change control](#change-control).
 
 **IMPORTANT:** A token without a `grant` key is refused for guest-addressed tools. To grant read access to all guests:
 
@@ -409,13 +438,13 @@ The core crate has a non-default `testing` feature that pulls in `rcgen`, `rustl
 
 ## Sibling servers
 
-| | [rustjunosmcp](https://github.com/fastrevmd-lab/rustjunosmcp) | [rustpanosmcp](https://github.com/fastrevmd-lab/rustpanosmcp) | rustproxmoxmcp |
-|---|---|---|---|
-| Vendor | Juniper Junos / SRX | Palo Alto PAN-OS | Proxmox VE |
-| Transport | NETCONF over SSH | HTTPS XML-API | HTTPS REST |
-| Status | shipping | shipping | shipping, 0.8.0 |
+| | [rustjunosmcp](https://github.com/fastrevmd-lab/rustjunosmcp) | [rustpanosmcp](https://github.com/fastrevmd-lab/rustpanosmcp) | [rustmistmcp](https://github.com/fastrevmd-lab/rustmistmcp) | [rustunifimcp](https://github.com/fastrevmd-lab/rustunifimcp) | [rustsdcmcp](https://github.com/fastrevmd-lab/rustsdcmcp) | rustproxmoxmcp |
+|---|---|---|---|---|---|---|
+| Vendor | Juniper Junos / SRX | Palo Alto PAN-OS | Juniper Mist | Ubiquiti UniFi Network | HPE Juniper Security Director Cloud | Proxmox VE |
+| Transport | NETCONF over SSH | HTTPS XML-API | HTTPS REST | HTTPS REST | HTTPS REST | HTTPS REST |
+| Status | shipping, v0.25.0 | shipping, v0.14.0 | foundation built, read-only live-tenant acceptance passed | in production | pre-release (v0.1.0-lab) | shipping, v0.10.0 |
 
-All three consume `mecmcp` — the shared Rust crate family underneath mechub's per-vendor MCP servers.
+All six consume `mecmcp` — the shared Rust crate family underneath mechub's per-vendor MCP servers.
 
 ## Audit forwarding to the event store
 

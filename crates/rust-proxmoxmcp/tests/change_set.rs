@@ -1040,3 +1040,46 @@ async fn an_approval_is_spent_by_the_first_apply_and_cannot_destroy_twice() {
         "the second apply must not reach the cluster, but {after_second} destroys were sent: {err}"
     );
 }
+
+/// MEC-449: mecmcp's `approve_change_set` refuses an approval from any
+/// principal whose token declares `actor_type: agent` -- the house rule is
+/// that a human approves, and an agent must not be able to stand in as the
+/// second principal even when it is a distinct token from the planner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_actor_type_approver_is_refused() {
+    let h = common::handler_with_guest(617, false).await;
+    let planned = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect("plan");
+    let id = planned["change_set_id"].as_str().expect("id");
+
+    let err = common::call_with_token(
+        &h,
+        &h.agent_token,
+        "approve_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect_err("an agent-actor-type approver must be refused");
+    assert!(
+        err.to_string().to_lowercase().contains("human"),
+        "the refusal must name the human-approver requirement: {err}"
+    );
+
+    // The change set must still be unapproved: apply must refuse it too.
+    let apply_err = common::call(
+        &h,
+        "apply_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect_err("apply must still refuse after a refused approval attempt");
+    assert!(
+        apply_err.to_string().to_lowercase().contains("approv"),
+        "{apply_err}"
+    );
+}

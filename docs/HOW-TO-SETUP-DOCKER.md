@@ -7,14 +7,14 @@ with their exact error text.
 
 | mode | approvals | use it for |
 |---|---|---|
-| **lab mode** (`--lab-mode`) | waived on creation, recorded as `approval_waiver=lab-mode` | ordinary tool work, reads, single-operator change sets |
+| **lab mode** (`--lab-mode`) | waived on creation for **protected** guests only; ordinary guests still require a second principal | single-operator work on protected guests |
 | **two-person** (no flag) | a second principal must approve before apply | anything that must prove the approval gate holds |
 
 The server announces lab mode at startup, as a `WARN`:
 
 ```
-lab mode enabled: change sets are approved on creation with no second principal.
-Records carry approval_waiver=lab-mode. Do not run this against production clusters.
+lab mode enabled: change sets for protected guests are approved on creation with no second principal.
+Records carry approval_waiver=lab-mode. Do not run this against production devices.
 ```
 
 If you see that line and did not intend it, stop and fix the flag.
@@ -49,7 +49,7 @@ fixed; no example below needs it.
 ## 1. Prepare host paths
 
 ```bash
-mkdir -p proxmox-docker/secrets
+mkdir -p proxmox-docker/secrets proxmox-docker/state
 cd proxmox-docker
 ```
 
@@ -101,6 +101,10 @@ The secret prints **once** and is stored hashed. Note the CLI's hint: a token
 minted without `--guests` cannot use guest-addressed tools. Grant that with
 `--guests '*'` or a selector (`vmid:X`, `tag:Y`, `pool:Z`).
 
+If this token will call `approve_proxmox_change_set`, add `--actor-type
+human`: the server refuses approvals from any token whose actor type is
+`agent` or unset. See [README § Change control](../README.md#change-control).
+
 Then lock the modes down:
 
 ```bash
@@ -115,7 +119,7 @@ directory.
 **For a real deployment**, give it ownership:
 
 ```bash
-sudo chown -R 65532:65532 clusters.json tokens.json secrets
+sudo chown -R 65532:65532 clusters.json tokens.json secrets state
 ```
 
 **For local testing without root**, run the container as yourself instead. The
@@ -169,9 +173,11 @@ docker run -d --name proxmox-twoperson \
   -v "$PWD/clusters.json:/etc/proxmoxmcp/clusters.json:ro" \
   -v "$PWD/tokens.json:/var/lib/proxmoxmcp/tokens.json:ro" \
   -v "$PWD/secrets:/etc/proxmoxmcp/secrets:ro" \
+  -v "$PWD/state:/var/lib/proxmoxmcp/state:rw" \
   "$image" \
   --transport streamable-http --host 0.0.0.0 --port 30031 \
   --allow-insecure-bind \
+  --state-file /var/lib/proxmoxmcp/state/changeset-state.json \
   --allowed-host 127.0.0.1:30033 --allowed-host localhost:30033 \
   --allowed-origin http://127.0.0.1:30033 --allowed-origin http://localhost:30033
 ```
@@ -183,9 +189,11 @@ updated to the externally dialled authority, or a TLS-terminating reverse proxy
 in front of the loopback endpoint — Host and Origin header validation is not a
 network boundary.
 
-Configuration files are mounted read-only. No state directory is mounted because
-this server persists change-set state only — there are no leases or staged
-transfers like the Junos server has.
+`--state-file` persists change-set and operation state across restarts. Without
+it the coordinator keeps state in memory only, and every approval, preview and
+in-flight apply is lost when the container restarts. The `state` directory is
+mounted read-write for this — configuration files stay read-only, since only
+the state file is written at runtime.
 
 ## 4. Run it — lab mode
 
@@ -199,9 +207,11 @@ docker run -d --name proxmox-labmode \
   -v "$PWD/clusters.json:/etc/proxmoxmcp/clusters.json:ro" \
   -v "$PWD/tokens.json:/var/lib/proxmoxmcp/tokens.json:ro" \
   -v "$PWD/secrets:/etc/proxmoxmcp/secrets:ro" \
+  -v "$PWD/state:/var/lib/proxmoxmcp/state:rw" \
   "$image" \
   --transport streamable-http --host 0.0.0.0 --port 30031 \
   --allow-insecure-bind \
+  --state-file /var/lib/proxmoxmcp/state/changeset-state.json \
   --allowed-host 127.0.0.1:30043 --allowed-host localhost:30043 \
   --allowed-origin http://127.0.0.1:30043 --allowed-origin http://localhost:30043 \
   --lab-mode
@@ -215,8 +225,9 @@ talking to 30043. So those flags carry the *published* port, not the internal
 one. Get this wrong and the server starts cleanly and then refuses every request
 with `421`.
 
-Lab mode waives approval on creation and records `approval_waiver=lab-mode`.
-Never point it at a production cluster.
+Lab mode waives approval on creation for **protected** guests and records
+`approval_waiver=lab-mode`; an ordinary guest still requires a second
+principal. Never point it at a production cluster.
 
 ## 5. Verify
 
