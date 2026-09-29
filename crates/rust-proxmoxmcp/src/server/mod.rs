@@ -879,6 +879,57 @@ fn scope_desc(caller: Option<&CallerCtx<ProxmoxGrant>>) -> &'static str {
         .unwrap_or("stdio")
 }
 
+/// Object keys whose *value*, wherever it appears in a read response, is
+/// free text an operator controls rather than structure this server relies
+/// on. Proxmox does not distinguish "operator note" from "secret dump" in
+/// any of these: guest `description`/`cicustom`/`args`, snapshot and backup
+/// `description`/`notes`, and the `comment` field on firewall rules,
+/// aliases, IPSets and security groups. All of them are seen in practice
+/// carrying pasted credentials.
+const FREE_TEXT_KEYS: &[&str] = &[
+    "description",
+    "comment",
+    "comments",
+    "notes",
+    "cicustom",
+    "args",
+];
+
+/// Redact every [`FREE_TEXT_KEYS`] value anywhere in a read response before
+/// it reaches the model, recursing through nested objects and arrays so a
+/// single call covers both a single guest config and a list of firewall
+/// rules or IPSet entries.
+///
+/// Each matching string is run through `mecmcp_redact::redact_text` rather
+/// than dropped outright, so a legitimate non-secret note survives while a
+/// credential-shaped substring does not; `redact_text` is a denylist-and-
+/// shape scrubber, so content in a format it does not recognise still
+/// passes through (see the tool descriptions this feeds).
+///
+/// `sshkeys` is deliberately excluded: it carries a guest's authorized
+/// public keys, which are not secret.
+fn redact_free_text_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, field) in map.iter_mut() {
+                if FREE_TEXT_KEYS.contains(&key.as_str())
+                    && let Some(text) = field.as_str()
+                {
+                    *field = serde_json::Value::String(mecmcp_redact::redact_text(text));
+                    continue;
+                }
+                redact_free_text_fields(field);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                redact_free_text_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl ProxmoxServer {
     /// Execute one catalog-declared read.
     ///
@@ -981,6 +1032,7 @@ impl ProxmoxServer {
                             .is_some_and(|t| t == filter_type.path_segment())
                     });
                 }
+                redact_free_text_fields(&mut value);
                 Ok(value)
             }
             Err(error) => Err(error),
@@ -1072,7 +1124,11 @@ impl ProxmoxServer {
 
     #[tool(
         name = "get_vm_config",
-        description = "Configuration of one QEMU guest, including its Proxmox digest."
+        description = "Configuration of one QEMU guest, including its Proxmox digest. \
+                        `description`, `cicustom` and `args` content is redacted on a \
+                        best-effort basis (do not store secrets there); sshkeys, \
+                        hostname/name, resource allocation, disks and network config \
+                        are preserved."
     )]
     async fn get_vm_config(
         &self,
@@ -1091,7 +1147,11 @@ impl ProxmoxServer {
 
     #[tool(
         name = "get_container_config",
-        description = "Configuration of one LXC guest, including its Proxmox digest."
+        description = "Configuration of one LXC guest, including its Proxmox digest. \
+                        `description`, `cicustom` and `args` content is redacted on a \
+                        best-effort basis (do not store secrets there); sshkeys, \
+                        hostname, resource allocation, disks and network config are \
+                        preserved."
     )]
     async fn get_container_config(
         &self,
@@ -1809,7 +1869,10 @@ impl ProxmoxServer {
         .await
     }
 
-    #[tool(name = "list_snapshots", description = "Snapshots of one guest.")]
+    #[tool(
+        name = "list_snapshots",
+        description = "Snapshots of one guest. `description` content is redacted (best-effort; do not store secrets here)."
+    )]
     async fn list_snapshots(
         &self,
         Parameters(args): Parameters<GuestArgs>,
@@ -1846,7 +1909,7 @@ impl ProxmoxServer {
 
     #[tool(
         name = "list_backups",
-        description = "Backup archives on one storage backend."
+        description = "Backup archives on one storage backend. `notes` content is redacted (best-effort; do not store secrets here)."
     )]
     async fn list_backups(
         &self,
@@ -1941,7 +2004,7 @@ impl ProxmoxServer {
 
     #[tool(
         name = "get_cluster_firewall_rules",
-        description = "Cluster-wide firewall rules."
+        description = "Cluster-wide firewall rules. `comment` content is redacted (best-effort; do not store secrets here)."
     )]
     async fn get_cluster_firewall_rules(
         &self,
@@ -1979,7 +2042,7 @@ impl ProxmoxServer {
 
     #[tool(
         name = "list_firewall_security_groups",
-        description = "Firewall security groups defined on the cluster."
+        description = "Firewall security groups defined on the cluster. `comment` content is redacted (best-effort; do not store secrets here)."
     )]
     async fn list_firewall_security_groups(
         &self,
@@ -1998,7 +2061,7 @@ impl ProxmoxServer {
 
     #[tool(
         name = "get_firewall_security_group_rules",
-        description = "Rules contained in one firewall security group."
+        description = "Rules contained in one firewall security group. `comment` content is redacted (best-effort; do not store secrets here)."
     )]
     async fn get_firewall_security_group_rules(
         &self,
@@ -2015,7 +2078,10 @@ impl ProxmoxServer {
         .await
     }
 
-    #[tool(name = "list_firewall_ipsets", description = "Cluster-wide IPSets.")]
+    #[tool(
+        name = "list_firewall_ipsets",
+        description = "Cluster-wide IPSets. `comment` content is redacted (best-effort; do not store secrets here)."
+    )]
     async fn list_firewall_ipsets(
         &self,
         Parameters(args): Parameters<ClusterArgs>,
@@ -2027,7 +2093,7 @@ impl ProxmoxServer {
 
     #[tool(
         name = "get_firewall_ipset_entries",
-        description = "CIDR entries in one cluster-wide IPSet."
+        description = "CIDR entries in one cluster-wide IPSet. `comment` content is redacted (best-effort; do not store secrets here)."
     )]
     async fn get_firewall_ipset_entries(
         &self,
@@ -2046,7 +2112,7 @@ impl ProxmoxServer {
 
     #[tool(
         name = "list_firewall_aliases",
-        description = "Cluster-wide firewall address aliases."
+        description = "Cluster-wide firewall address aliases. `comment` content is redacted (best-effort; do not store secrets here)."
     )]
     async fn list_firewall_aliases(
         &self,
@@ -2059,7 +2125,7 @@ impl ProxmoxServer {
 
     #[tool(
         name = "get_node_firewall_rules",
-        description = "Firewall rules on one node."
+        description = "Firewall rules on one node. `comment` content is redacted (best-effort; do not store secrets here)."
     )]
     async fn get_node_firewall_rules(
         &self,
@@ -2097,7 +2163,7 @@ impl ProxmoxServer {
 
     #[tool(
         name = "get_guest_firewall_rules",
-        description = "Firewall rules of one guest."
+        description = "Firewall rules of one guest. `comment` content is redacted (best-effort; do not store secrets here)."
     )]
     async fn get_guest_firewall_rules(
         &self,
@@ -2135,7 +2201,7 @@ impl ProxmoxServer {
 
     #[tool(
         name = "list_guest_firewall_aliases",
-        description = "Firewall address aliases of one guest."
+        description = "Firewall address aliases of one guest. `comment` content is redacted (best-effort; do not store secrets here)."
     )]
     async fn list_guest_firewall_aliases(
         &self,
@@ -2154,7 +2220,7 @@ impl ProxmoxServer {
 
     #[tool(
         name = "list_guest_firewall_ipsets",
-        description = "IPSets defined on one guest."
+        description = "IPSets defined on one guest. `comment` content is redacted (best-effort; do not store secrets here)."
     )]
     async fn list_guest_firewall_ipsets(
         &self,
@@ -2173,7 +2239,7 @@ impl ProxmoxServer {
 
     #[tool(
         name = "get_guest_firewall_ipset_entries",
-        description = "CIDR entries in one IPSet of one guest."
+        description = "CIDR entries in one IPSet of one guest. `comment` content is redacted (best-effort; do not store secrets here)."
     )]
     async fn get_guest_firewall_ipset_entries(
         &self,

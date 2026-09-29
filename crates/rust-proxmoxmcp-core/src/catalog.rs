@@ -88,7 +88,10 @@ pub const READ_TOOLS: &[ReadTool] = &[
         method: Method::Get,
         path: "/api2/json/nodes/{node}/qemu/{vmid}/config",
         needs_guest: true,
-        description: "Configuration of one QEMU guest, including its Proxmox digest.",
+        description: "Configuration of one QEMU guest, including its Proxmox digest. \
+                      `description`/`cicustom`/`args` content redacted on a best-effort \
+                      basis (do not store secrets there); sshkeys and network \
+                      config preserved.",
         type_filter: None,
         query: &[],
     },
@@ -97,7 +100,10 @@ pub const READ_TOOLS: &[ReadTool] = &[
         method: Method::Get,
         path: "/api2/json/nodes/{node}/lxc/{vmid}/config",
         needs_guest: true,
-        description: "Configuration of one LXC guest, including its Proxmox digest.",
+        description: "Configuration of one LXC guest, including its Proxmox digest. \
+                      `description`/`cicustom`/`args` content redacted on a best-effort \
+                      basis (do not store secrets there); sshkeys and network \
+                      config preserved.",
         type_filter: None,
         query: &[],
     },
