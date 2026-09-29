@@ -37,6 +37,29 @@ pub struct ProxmoxCli {
     #[arg(long = "lab-mode")]
     pub lab_mode: bool,
 
+    /// Allow direct-commit tools that mutate a guest in one call with no
+    /// change-set approval.
+    ///
+    /// The interrupting lifecycle verbs (`stop_vm`, `shutdown_vm`, `reset_vm`,
+    /// `stop_container`, `restart_container`), `clone_vm`, `create_vm`,
+    /// `create_container`, `resize_disk`, and `create_backup` act on Proxmox
+    /// immediately -- there is no change-set flow to route an operational
+    /// command like "stop this guest" through. By default this server refuses
+    /// those calls rather than let a model commit a guest mutation alone.
+    ///
+    /// This applies identically over stdio and HTTP: stdio carries no caller
+    /// context at all, so it is refused on exactly the same terms as an
+    /// authenticated HTTP session.
+    ///
+    /// **Residual risk**: an operator can set this flag. Doing so is logged
+    /// loudly at startup and every direct-commit call is recorded in the audit
+    /// trail (`direct_commit_allowed=true`), but no second-principal review
+    /// happens.
+    ///
+    /// Defaults to false (refuse). Spelled identically on every mecmcp server.
+    #[arg(long = "allow-direct-commit")]
+    pub allow_direct_commit: bool,
+
     /// Absolute path to the change-set and operation state file.
     ///
     /// Spelled `--state-file` on every mecmcp server, per
@@ -310,6 +333,21 @@ mod tests {
     fn lab_mode_defaults_to_false() {
         let cli = ProxmoxCli::parse_from(["rust-proxmoxmcp"]);
         assert!(!cli.lab_mode, "the default must be false");
+    }
+
+    #[test]
+    fn allow_direct_commit_flag_is_observable_when_passed() {
+        let cli = ProxmoxCli::parse_from(["rust-proxmoxmcp", "--allow-direct-commit"]);
+        assert!(
+            cli.allow_direct_commit,
+            "a flag that parses but never converts is the defect that took a sibling server down"
+        );
+    }
+
+    #[test]
+    fn allow_direct_commit_defaults_to_false() {
+        let cli = ProxmoxCli::parse_from(["rust-proxmoxmcp"]);
+        assert!(!cli.allow_direct_commit, "the default must be false");
     }
 
     #[test]

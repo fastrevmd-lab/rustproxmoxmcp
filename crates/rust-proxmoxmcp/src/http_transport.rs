@@ -279,7 +279,14 @@ mod tests {
         let waivers = Arc::new(rust_proxmoxmcp_core::waiver::WaiverFile::empty());
 
         let handler = ProxmoxServer::new_with_default_coordinator(
-            clusters, clients, index, waivers, false, None, None,
+            clusters,
+            clients,
+            index,
+            waivers,
+            false,
+            None,
+            mecmcp_audit::DirectCommitPolicy::new(false),
+            None,
         )
         .expect("build server");
 
