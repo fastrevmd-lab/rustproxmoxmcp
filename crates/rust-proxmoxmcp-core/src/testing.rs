@@ -299,7 +299,7 @@ impl TlsMockServer {
             .lock()
             .expect("lock requests")
             .push(RecordedRequest {
-                method,
+                method: method.clone(),
                 target: target.clone(),
                 path,
                 authorization,
@@ -309,9 +309,21 @@ impl TlsMockServer {
         // Match a route by path (ignoring query string).
         let path = target.split('?').next().expect("split target");
 
+        // A route is matched by path alone, exactly as before, *unless* a
+        // route was registered whose `path` is `"{METHOD} {path}"` -- an
+        // opt-in convention for the rare case where the same path answers a
+        // read and a write differently (e.g. GET vs POST on a Proxmox
+        // `/config` endpoint). No existing route's `path` contains a space,
+        // so this is additive: every route registered the old way matches
+        // exactly as it always has.
+        let method_scoped = format!("{method} {path}");
+
         let (status, body) = {
             let routes_guard = routes.lock().expect("lock routes");
-            let route = routes_guard.iter().find(|r| r.path == path);
+            let route = routes_guard
+                .iter()
+                .find(|r| r.path == method_scoped)
+                .or_else(|| routes_guard.iter().find(|r| r.path == path));
             if let Some(r) = route {
                 (r.status, r.body)
             } else {

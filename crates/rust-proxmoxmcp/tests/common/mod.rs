@@ -63,6 +63,13 @@ pub struct TestServer {
     /// A third bearer token carrying `actor_type: Agent`, for tests that
     /// prove an agent cannot stand in as the human approver.
     pub agent_token: String,
+    /// A fourth token with the same clusters/tools as `token`, but scoped to
+    /// vmid 1 only -- outside any guest a fixture test actually uses. For
+    /// proving a guest-scope check is repeated at apply time rather than
+    /// only at plan time: plan and approve with `token`, then apply with
+    /// this one, and the apply must refuse it even though it carries every
+    /// tool scope `token` does.
+    pub narrow_token: String,
     /// The mock Proxmox server.
     mock: TlsMockServer,
     /// Guest index for cache invalidation in tests.
@@ -279,6 +286,31 @@ impl TestServer {
         )
         .expect("mint agent-actor-type token");
 
+        // A fourth token, same clusters/tools as `token` but scoped to a
+        // guest no fixture test targets. See the `narrow_token` field doc.
+        let narrow_grant = ProxmoxGrant {
+            guests: vec!["vmid:1-1".to_owned()],
+            actions: vec![
+                ProxmoxAction::Read,
+                ProxmoxAction::Low,
+                ProxmoxAction::Destructive,
+            ],
+        };
+        let narrow_plaintext = TokenStoreFile::<ProxmoxGrant>::add_with_options(
+            &tokens_path,
+            "test-token-narrow",
+            parse_scope(&spec.clusters),
+            parse_scope(&spec.tools),
+            None,
+            Some(narrow_grant),
+            None,
+            None,
+            None,
+            None,
+            &known,
+        )
+        .expect("mint narrow-scoped token");
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -339,6 +371,7 @@ impl TestServer {
             token: plaintext.expose_secret().to_owned(),
             second_token: second_plaintext.expose_secret().to_owned(),
             agent_token: agent_plaintext.expose_secret().to_owned(),
+            narrow_token: narrow_plaintext.expose_secret().to_owned(),
             mock,
             index,
             _temp_dir: temp_dir,
