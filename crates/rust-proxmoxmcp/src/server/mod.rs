@@ -451,6 +451,150 @@ const RESULT_LIMITS: ResultLimits = ResultLimits {
     max_json_bytes: 512 * 1024,
 };
 
+/// Records returned by a paginated list tool when `limit` is omitted.
+///
+/// MEC-479: `get_vms`/`get_containers` and `list_backups` have no
+/// server-side page size of their own -- Proxmox's `/cluster/resources` and
+/// storage `content` endpoints don't take `start`/`limit`, so this executor
+/// fetches the full upstream array and pages it here rather than pushing
+/// pagination down per-endpoint (which would give the one generic
+/// `serve_read` two different behaviors for no real gain, since fetching the
+/// full array is what `MAX_RESPONSE_BYTES` already tolerates -- the binding
+/// constraint is the *result* cap below, not the upstream fetch).
+///
+/// `list_tasks` is deliberately not in this list: `/nodes/{node}/tasks` *is*
+/// server-side windowed by Proxmox (a few hundred most recent, by default),
+/// with no way for this client to learn the true total. A client-side
+/// pagination envelope on top of that window would report `has_more: false`
+/// once Proxmox's own cutoff is reached, claiming a complete task history
+/// that silently drops everything Proxmox already dropped. `list_tasks`
+/// stays a bare array (MEC-871, from Percy's review of MEC-479's PR); pushing
+/// real `start`/`limit` down to Proxmox for this endpoint is tracked as a
+/// separate follow-up.
+///
+/// At ~540 bytes per pretty-printed `get_vms` record (MEC-456's lab
+/// measurement), 500 records is ~270 KB, leaving headroom under
+/// `RESULT_LIMITS.max_json_bytes` for the pagination envelope and any wider
+/// record shape (`list_backups` entries run larger).
+const DEFAULT_PAGE_LIMIT: u32 = 500;
+
+/// Largest `limit` a caller may request explicitly.
+///
+/// 700 records is ~378 KB of `get_vms`-shaped pretty JSON -- comfortably
+/// under the 512 KiB cap, with room to spare for narrower record shapes to
+/// use if they choose. A caller asking for more is refused rather than
+/// silently clamped, so a page size that would risk crossing the cap is
+/// never issued without the caller having asked for it, and refused, in
+/// plain terms.
+const MAX_PAGE_LIMIT: u32 = 700;
+
+/// Resolve and validate `offset`/`limit` for a paginated read tool.
+///
+/// # Errors
+///
+/// Returns a tool error when `limit` is zero or exceeds [`MAX_PAGE_LIMIT`].
+fn resolve_page(
+    offset: Option<u32>,
+    limit: Option<u32>,
+) -> Result<(u32, u32), Box<CallToolResult>> {
+    let limit = limit.unwrap_or(DEFAULT_PAGE_LIMIT);
+    if limit == 0 {
+        return Err(Box::new(tool_error("limit must be at least 1")));
+    }
+    if limit > MAX_PAGE_LIMIT {
+        return Err(Box::new(tool_error(format!(
+            "limit {limit} exceeds the maximum of {MAX_PAGE_LIMIT}; request a smaller page"
+        ))));
+    }
+    Ok((offset.unwrap_or(0), limit))
+}
+
+/// One page of a list tool's results.
+///
+/// `total` and `has_more` are what let a caller stop paging: a MCP client
+/// cannot otherwise tell a short list from a truncated one, and this server's
+/// house rule is to fail closed rather than truncate silently -- so a page
+/// says exactly how much was left out, and lets the caller ask for it.
+#[derive(Debug, serde::Serialize)]
+struct Page {
+    items: Vec<serde_json::Value>,
+    /// Total records available upstream, after any type/content filter.
+    total: usize,
+    offset: u32,
+    limit: u32,
+    /// Whether records remain beyond this page.
+    has_more: bool,
+}
+
+/// Sort a page-bound array by a stable per-record key, so a record's
+/// position (and therefore which page it lands on) doesn't depend on
+/// Proxmox's undocumented, unstable array order.
+///
+/// Without this, a guest created, destroyed or migrated between two
+/// `offset` calls -- or a backup pruned by vzdump -- can shift the window
+/// and skip or duplicate a record across pages with no sign to the caller
+/// (MEC-871, finding 2). Sorting cannot fix a record deleted between page
+/// calls; it only stops *reordering* from causing skips.
+///
+/// Dispatches on which key field the first record carries: `vmid` for
+/// `get_vms`/`get_containers`, `volid` for `list_backups`. Records missing
+/// the key sort last rather than panicking on a shape this code doesn't
+/// expect.
+fn sort_for_paging(array: &mut [serde_json::Value]) {
+    let Some(first) = array.first() else {
+        return;
+    };
+    if first.get("vmid").is_some() {
+        array.sort_by_key(|item| {
+            item.get("vmid")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::MAX)
+        });
+    } else if first.get("volid").is_some() {
+        array.sort_by(|a, b| {
+            let key = |v: &serde_json::Value| {
+                v.get("volid")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            key(a).cmp(&key(b))
+        });
+    }
+}
+
+/// Slice a filtered upstream array into one page.
+///
+/// # Errors
+///
+/// Returns a tool error if `value` is not a JSON array -- defensive, since
+/// every catalog entry this is called for returns one, but a Proxmox
+/// response shape changing underneath this code must not panic on `expect`.
+fn paginate(
+    value: serde_json::Value,
+    offset: u32,
+    limit: u32,
+) -> Result<Page, Box<CallToolResult>> {
+    let Some(mut array) = value.as_array().cloned() else {
+        return Err(Box::new(tool_error(
+            "upstream response is not a list; cannot paginate",
+        )));
+    };
+    sort_for_paging(&mut array);
+    let total = array.len();
+    let start = (offset as usize).min(total);
+    let end = start.saturating_add(limit as usize).min(total);
+    let items = array[start..end].to_vec();
+    let has_more = end < total;
+    Ok(Page {
+        items,
+        total,
+        offset,
+        limit,
+        has_more,
+    })
+}
+
 /// Every tool registered by this release. Kept sorted; asserted against the
 /// catalog by a test so the two cannot drift.
 pub const KNOWN_TOOLS: &[&str] = &[
@@ -531,6 +675,26 @@ pub struct NodeArgs {
     pub cluster: String,
     /// Node name as reported by `get_nodes`.
     pub node: String,
+}
+
+/// Arguments for a cluster-scoped, paginated read.
+///
+/// Kept separate from [`ClusterArgs`] rather than adding `offset`/`limit`
+/// there, so `get_cluster_status` and `get_nodes` -- which return a handful
+/// of records and cannot exceed the result cap -- don't advertise pagination
+/// parameters that would do nothing.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PagedClusterArgs {
+    /// Inventory name of the cluster.
+    pub cluster: String,
+    /// Zero-based index of the first record to return. Defaults to 0.
+    #[serde(default)]
+    pub offset: Option<u32>,
+    /// Maximum records to return. Defaults to 500, capped at 700 so a
+    /// pretty-printed page stays comfortably under the MCP result's 512 KiB
+    /// limit.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 /// Arguments for a guest-scoped read.
@@ -1015,6 +1179,29 @@ pub struct StorageArgs {
     pub storage: String,
 }
 
+/// Arguments for a storage-scoped, paginated read.
+///
+/// Kept separate from [`StorageArgs`]: `list_isos` and `list_templates` share
+/// this endpoint but are out of MEC-479's scope, and should not carry unused
+/// pagination parameters until they need them too.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PagedStorageArgs {
+    /// Inventory name of the cluster.
+    pub cluster: String,
+    /// Node name as reported by `get_nodes`.
+    pub node: String,
+    /// Storage backend name.
+    pub storage: String,
+    /// Zero-based index of the first record to return. Defaults to 0.
+    #[serde(default)]
+    pub offset: Option<u32>,
+    /// Maximum records to return. Defaults to 500, capped at 700 so a
+    /// pretty-printed page stays comfortably under the MCP result's 512 KiB
+    /// limit.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
 /// Arguments for a task-scoped read.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TaskArgs {
@@ -1301,12 +1488,17 @@ impl ProxmoxServer {
     /// Guest-scoped tools resolve the guest and run stage-2 authorization,
     /// yielding an `AuthorizedGuest` whose node fills the `{node}` parameter.
     /// Cluster- and node-scoped tools take their parameters from the request.
+    ///
+    /// `page`, when `Some`, slices the filtered upstream array into one page
+    /// (see [`paginate`]) rather than returning it whole. `None` preserves the
+    /// original behavior for tools too small to ever need it.
     async fn serve_read(
         &self,
         tool: &'static str,
         cluster: &str,
         extra_params: &[(&str, &str)],
         vmid: Option<u32>,
+        page: Option<(u32, u32)>,
         context: &RequestContext<RoleServer>,
     ) -> CallToolResult {
         let caller = Self::caller(context);
@@ -1403,13 +1595,26 @@ impl ProxmoxServer {
             Err(error) => Err(error),
         };
 
-        match result {
-            Ok(value) => tool_result(
+        let value = match result {
+            Ok(value) => value,
+            Err(error) => return tool_error(error),
+        };
+
+        let Some((offset, limit)) = page else {
+            return tool_result(
                 Ok::<_, String>(value),
                 ResultFormat::PrettyJson,
                 RESULT_LIMITS,
+            );
+        };
+
+        match paginate(value, offset, limit) {
+            Ok(page) => tool_result(
+                Ok::<_, String>(page),
+                ResultFormat::PrettyJson,
+                RESULT_LIMITS,
             ),
-            Err(error) => tool_error(error),
+            Err(error) => *error,
         }
     }
 }
@@ -1425,8 +1630,15 @@ impl ProxmoxServer {
         Parameters(args): Parameters<ClusterArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        self.serve_read("get_cluster_status", &args.cluster, &[], None, &context)
-            .await
+        self.serve_read(
+            "get_cluster_status",
+            &args.cluster,
+            &[],
+            None,
+            None,
+            &context,
+        )
+        .await
     }
 
     #[tool(
@@ -1438,7 +1650,7 @@ impl ProxmoxServer {
         Parameters(args): Parameters<ClusterArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        self.serve_read("get_nodes", &args.cluster, &[], None, &context)
+        self.serve_read("get_nodes", &args.cluster, &[], None, None, &context)
             .await
     }
 
@@ -1456,6 +1668,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("node", args.node.as_str())],
             None,
+            None,
             &context,
         )
         .await
@@ -1463,28 +1676,47 @@ impl ProxmoxServer {
 
     #[tool(
         name = "get_vms",
-        description = "All QEMU guests across the cluster, with node, status and tags."
+        description = "QEMU guests across the cluster, with node, status and tags. Paginated: \
+                       returns up to `limit` (default 500, max 700) starting at `offset` \
+                       (default 0), plus `total` and `has_more` to page through the rest."
     )]
     async fn get_vms(
         &self,
-        Parameters(args): Parameters<ClusterArgs>,
+        Parameters(args): Parameters<PagedClusterArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        self.serve_read("get_vms", &args.cluster, &[], None, &context)
+        let page = match resolve_page(args.offset, args.limit) {
+            Ok(page) => page,
+            Err(error) => return *error,
+        };
+        self.serve_read("get_vms", &args.cluster, &[], None, Some(page), &context)
             .await
     }
 
     #[tool(
         name = "get_containers",
-        description = "All LXC guests across the cluster, with node, status and tags."
+        description = "LXC guests across the cluster, with node, status and tags. Paginated: \
+                       returns up to `limit` (default 500, max 700) starting at `offset` \
+                       (default 0), plus `total` and `has_more` to page through the rest."
     )]
     async fn get_containers(
         &self,
-        Parameters(args): Parameters<ClusterArgs>,
+        Parameters(args): Parameters<PagedClusterArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        self.serve_read("get_containers", &args.cluster, &[], None, &context)
-            .await
+        let page = match resolve_page(args.offset, args.limit) {
+            Ok(page) => page,
+            Err(error) => return *error,
+        };
+        self.serve_read(
+            "get_containers",
+            &args.cluster,
+            &[],
+            None,
+            Some(page),
+            &context,
+        )
+        .await
     }
 
     #[tool(
@@ -1505,6 +1737,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             Some(args.vmid),
+            None,
             &context,
         )
         .await
@@ -1528,6 +1761,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             Some(args.vmid),
+            None,
             &context,
         )
         .await
@@ -2241,6 +2475,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             Some(args.vmid),
+            None,
             &context,
         )
         .await
@@ -2260,6 +2495,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             Some(args.vmid),
+            None,
             &context,
         )
         .await
@@ -2279,6 +2515,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("node", args.node.as_str())],
             None,
+            None,
             &context,
         )
         .await
@@ -2286,13 +2523,20 @@ impl ProxmoxServer {
 
     #[tool(
         name = "list_backups",
-        description = "Backup archives on one storage backend. `notes` content is redacted (best-effort; do not store secrets here)."
+        description = "Backup archives on one storage backend. `notes` content is redacted \
+                       (best-effort; do not store secrets here). Paginated: returns up to \
+                       `limit` (default 500, max 700) starting at `offset` (default 0), plus \
+                       `total` and `has_more` to page through the rest."
     )]
     async fn list_backups(
         &self,
-        Parameters(args): Parameters<StorageArgs>,
+        Parameters(args): Parameters<PagedStorageArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
+        let page = match resolve_page(args.offset, args.limit) {
+            Ok(page) => page,
+            Err(error) => return *error,
+        };
         self.serve_read(
             "list_backups",
             &args.cluster,
@@ -2301,6 +2545,7 @@ impl ProxmoxServer {
                 ("storage", args.storage.as_str()),
             ],
             None,
+            Some(page),
             &context,
         )
         .await
@@ -2319,6 +2564,7 @@ impl ProxmoxServer {
                 ("node", args.node.as_str()),
                 ("storage", args.storage.as_str()),
             ],
+            None,
             None,
             &context,
         )
@@ -2342,12 +2588,20 @@ impl ProxmoxServer {
                 ("storage", args.storage.as_str()),
             ],
             None,
+            None,
             &context,
         )
         .await
     }
 
-    #[tool(name = "list_tasks", description = "Recent tasks on one node.")]
+    #[tool(
+        name = "list_tasks",
+        description = "Recent tasks on one node. Not paginated: Proxmox's \
+                       `/nodes/{node}/tasks` endpoint applies its own server-side \
+                       default (typically the 50 most recent) and this tool does not \
+                       send `start`/`limit`, so a full page here is Proxmox's default \
+                       window, not a complete history."
+    )]
     async fn list_tasks(
         &self,
         Parameters(args): Parameters<NodeArgs>,
@@ -2357,6 +2611,7 @@ impl ProxmoxServer {
             "list_tasks",
             &args.cluster,
             &[("node", args.node.as_str())],
+            None,
             None,
             &context,
         )
@@ -2373,6 +2628,7 @@ impl ProxmoxServer {
             "get_task_status",
             &args.cluster,
             &[("node", args.node.as_str()), ("upid", args.upid.as_str())],
+            None,
             None,
             &context,
         )
@@ -2393,6 +2649,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             None,
+            None,
             &context,
         )
         .await
@@ -2411,6 +2668,7 @@ impl ProxmoxServer {
             "get_cluster_firewall_options",
             &args.cluster,
             &[],
+            None,
             None,
             &context,
         )
@@ -2431,6 +2689,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             None,
+            None,
             &context,
         )
         .await
@@ -2450,6 +2709,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("group", args.group.as_str())],
             None,
+            None,
             &context,
         )
         .await
@@ -2464,8 +2724,15 @@ impl ProxmoxServer {
         Parameters(args): Parameters<ClusterArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        self.serve_read("list_firewall_ipsets", &args.cluster, &[], None, &context)
-            .await
+        self.serve_read(
+            "list_firewall_ipsets",
+            &args.cluster,
+            &[],
+            None,
+            None,
+            &context,
+        )
+        .await
     }
 
     #[tool(
@@ -2482,6 +2749,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("name", args.name.as_str())],
             None,
+            None,
             &context,
         )
         .await
@@ -2496,8 +2764,15 @@ impl ProxmoxServer {
         Parameters(args): Parameters<ClusterArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        self.serve_read("list_firewall_aliases", &args.cluster, &[], None, &context)
-            .await
+        self.serve_read(
+            "list_firewall_aliases",
+            &args.cluster,
+            &[],
+            None,
+            None,
+            &context,
+        )
+        .await
     }
 
     #[tool(
@@ -2513,6 +2788,7 @@ impl ProxmoxServer {
             "get_node_firewall_rules",
             &args.cluster,
             &[("node", args.node.as_str())],
+            None,
             None,
             &context,
         )
@@ -2533,6 +2809,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("node", args.node.as_str())],
             None,
+            None,
             &context,
         )
         .await
@@ -2552,6 +2829,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             Some(args.vmid),
+            None,
             &context,
         )
         .await
@@ -2571,6 +2849,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             Some(args.vmid),
+            None,
             &context,
         )
         .await
@@ -2590,6 +2869,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             Some(args.vmid),
+            None,
             &context,
         )
         .await
@@ -2609,6 +2889,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             Some(args.vmid),
+            None,
             &context,
         )
         .await
@@ -2628,6 +2909,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("name", args.name.as_str())],
             Some(args.vmid),
+            None,
             &context,
         )
         .await
