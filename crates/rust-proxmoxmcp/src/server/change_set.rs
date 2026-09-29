@@ -10,6 +10,7 @@ use mecmcp_changeset::{ChangesetCoordinator, CoordinatorError, OperationLimits};
 use rust_proxmoxmcp_core::ProxmoxGrant;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,7 +46,7 @@ pub struct PlanDestroyArgs {
     ///
     /// `destroy_guest` (the default, and what 0.3 planned),
     /// `delete_snapshot`, `rollback_snapshot`, `delete_backup`, `delete_iso`,
-    /// or `restore_backup`.
+    /// `restore_backup`, or `update_vm_config`.
     ///
     /// Defaults to `destroy_guest` so a caller written against 0.3 keeps
     /// working: this argument did not exist, and every plan meant a destroy.
@@ -67,6 +68,15 @@ pub struct PlanDestroyArgs {
     /// two nodes names two different volumes.
     #[serde(default)]
     pub storage_node: Option<String>,
+    /// Proxmox QEMU config keys to set, for `update_vm_config`. Merged into
+    /// the guest's existing config; keys not named here are unchanged.
+    ///
+    /// Cloud-init fields (`ciuser`, `cipassword`, `sshkeys`, `ipconfigN`, ...)
+    /// are ordinary QEMU config keys from Proxmox's point of view, so they
+    /// travel through this same map rather than a separate cloud-init
+    /// argument -- there is no vendor distinction for this tool to preserve.
+    #[serde(default)]
+    pub config: BTreeMap<String, String>,
 }
 
 /// What a plan means when the caller does not say.
@@ -134,6 +144,10 @@ pub(crate) struct DestroyAction {
     /// the wrong host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_node: Option<String>,
+    /// Config keys to set, for `update_vm_config`. See
+    /// [`PlanDestroyArgs::config`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<BTreeMap<String, String>>,
 }
 
 /// Build a coordinator for change-set lifecycle operations.

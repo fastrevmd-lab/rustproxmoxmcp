@@ -86,6 +86,7 @@ pub const WRITE_TOOLS: &[&str] = &[
     "create_vm",
     "download_iso",
     "plan_proxmox_destroy",
+    "plan_restore_new_vmid",
     "reset_vm",
     "restart_container",
     "shutdown_vm",
@@ -99,13 +100,16 @@ pub const WRITE_TOOLS: &[&str] = &[
     "resize_disk",
     // destructive
     "apply_proxmox_change_set",
+    "apply_restore_new_vmid",
     "delete_backup",
     "delete_container",
     "delete_iso",
     "delete_snapshot",
     "delete_vm",
     "restore_backup",
+    "restore_backup_new_vmid",
     "rollback_snapshot",
+    "update_vm_config",
     // deferred to 0.5, registered here so a wildcard never reaches it
     "execute_vm_command",
 ];
@@ -113,6 +117,7 @@ pub const WRITE_TOOLS: &[&str] = &[
 /// Tools whose tier is `Destructive`.
 const DESTRUCTIVE_TOOLS: &[&str] = &[
     "apply_proxmox_change_set",
+    "apply_restore_new_vmid",
     "delete_backup",
     "delete_container",
     "delete_iso",
@@ -120,7 +125,9 @@ const DESTRUCTIVE_TOOLS: &[&str] = &[
     "delete_vm",
     "execute_vm_command",
     "restore_backup",
+    "restore_backup_new_vmid",
     "rollback_snapshot",
+    "update_vm_config",
 ];
 
 /// Classify a tool.
