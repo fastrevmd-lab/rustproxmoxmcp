@@ -21,6 +21,7 @@ fn every_catalog_path_templates_only_known_parameters() {
         "{upid}",
         "{group}",
         "{name}",
+        "{rule}",
     ];
     for tool in READ_TOOLS {
         let mut rest = tool.path;

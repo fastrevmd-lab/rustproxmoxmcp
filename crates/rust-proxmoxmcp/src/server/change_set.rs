@@ -46,7 +46,7 @@ pub struct PlanDestroyArgs {
     ///
     /// `destroy_guest` (the default, and what 0.3 planned),
     /// `delete_snapshot`, `rollback_snapshot`, `delete_backup`, `delete_iso`,
-    /// `restore_backup`, or `update_vm_config`.
+    /// `restore_backup`, `migrate`, or `update_vm_config`.
     ///
     /// Defaults to `destroy_guest` so a caller written against 0.3 keeps
     /// working: this argument did not exist, and every plan meant a destroy.
@@ -68,6 +68,22 @@ pub struct PlanDestroyArgs {
     /// two nodes names two different volumes.
     #[serde(default)]
     pub storage_node: Option<String>,
+    /// Destination node, for `migrate`. Required for that operation.
+    #[serde(default)]
+    pub target_node: Option<String>,
+    /// Live-migrate, for `migrate`. Defaults to `false` (offline).
+    ///
+    /// For a QEMU guest this is Proxmox's own `online` migration. For an LXC
+    /// guest, stock Proxmox has no live migration path; this instead requests
+    /// Proxmox's `restart` mode, which stops, migrates and restarts the
+    /// container as one operation rather than refusing because it is running.
+    #[serde(default)]
+    pub online: bool,
+    /// Copy node-local disks along with the guest, for `migrate` of a QEMU
+    /// guest whose disks are not on shared storage. Ignored for LXC, which
+    /// always migrates its volumes. Defaults to `false`.
+    #[serde(default)]
+    pub with_local_disks: bool,
     /// Proxmox QEMU config keys to set, for `update_vm_config`. Merged into
     /// the guest's existing config; keys not named here are unchanged.
     ///
@@ -144,6 +160,15 @@ pub(crate) struct DestroyAction {
     /// the wrong host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_node: Option<String>,
+    /// Destination node, for `migrate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_node: Option<String>,
+    /// Live-migrate, for `migrate`. See [`PlanDestroyArgs::online`].
+    #[serde(default)]
+    pub online: bool,
+    /// Copy node-local disks, for `migrate` of a QEMU guest.
+    #[serde(default)]
+    pub with_local_disks: bool,
     /// Config keys to set, for `update_vm_config`. See
     /// [`PlanDestroyArgs::config`].
     #[serde(default, skip_serializing_if = "Option::is_none")]

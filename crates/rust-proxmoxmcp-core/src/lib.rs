@@ -19,6 +19,7 @@ pub mod error;
 pub mod fingerprint;
 pub mod grant;
 pub mod guests;
+pub mod ha_rules;
 pub mod inventory;
 pub mod preview;
 pub mod protect;
