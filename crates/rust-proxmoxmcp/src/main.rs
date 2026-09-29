@@ -335,6 +335,22 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(mecmcp_audit::EvidenceService::recorder);
 
+    // Direct-commit tools (the interrupting lifecycle verbs, `stop_task`,
+    // `update_container_resources`, `clone_vm`, `create_vm`,
+    // `create_container`, `resize_disk`, and `create_backup`) mutate a guest
+    // in one call with no change-set approval. Refused by default; logging
+    // here mirrors the lab-mode banner above.
+    let direct_commit = mecmcp_audit::DirectCommitPolicy::new(args.allow_direct_commit);
+    direct_commit.log_startup("rust-proxmoxmcp");
+    if !args.allow_direct_commit {
+        tracing::info!(
+            "direct-commit tools disabled: stop_vm, shutdown_vm, reset_vm, stop_container, \
+             restart_container, stop_task, update_container_resources, clone_vm, create_vm, \
+             create_container, resize_disk and create_backup are refused on stdio and HTTP \
+             alike. Use --allow-direct-commit to enable them."
+        );
+    }
+
     let served = match args.common.transport {
         Transport::Stdio => {
             // SIGHUP reopens the audit log and reloads the inventory in
@@ -352,6 +368,7 @@ async fn main() -> Result<()> {
                 waivers,
                 args.lab_mode,
                 recorder,
+                direct_commit,
                 args.state_file.clone(),
             )
             .await
@@ -442,6 +459,7 @@ async fn main() -> Result<()> {
                 waivers,
                 args.lab_mode,
                 recorder,
+                direct_commit,
                 args.state_file.clone(),
             )
             .await
@@ -528,6 +546,7 @@ fn init_audit(args: &mecmcp_runtime::cli::Cli) -> Result<Option<mecmcp_audit::Au
     Ok(sink)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_stdio(
     clusters: Arc<ClusterInventory>,
     clients: Arc<BTreeMap<String, ProxmoxClient>>,
@@ -535,6 +554,7 @@ async fn serve_stdio(
     waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
     lab_mode: bool,
     evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
+    direct_commit: mecmcp_audit::DirectCommitPolicy,
     state_file: Option<PathBuf>,
 ) -> Result<()> {
     let handler = ProxmoxServer::new_with_default_coordinator(
@@ -544,6 +564,7 @@ async fn serve_stdio(
         waivers,
         lab_mode,
         evidence,
+        direct_commit,
         state_file.as_deref(),
     )
     .context("build server")?;
@@ -712,6 +733,7 @@ async fn serve_http(
     waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
     lab_mode: bool,
     evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
+    direct_commit: mecmcp_audit::DirectCommitPolicy,
     state_file: Option<PathBuf>,
 ) -> Result<()> {
     let handler = ProxmoxServer::new_with_default_coordinator(
@@ -721,6 +743,7 @@ async fn serve_http(
         waivers,
         lab_mode,
         evidence,
+        direct_commit,
         state_file.as_deref(),
     )
     .context("build server")?;
