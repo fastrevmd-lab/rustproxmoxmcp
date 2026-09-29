@@ -7,7 +7,7 @@ version      = "0.10.0"
 edition      = "2024"
 rust-version = "1.89"
 license      = "MIT"
-repository   = "https://github.com/fastrevmd-lab/rustproxmoxmcp"
+repository   = "https://github.com/mechubsec/rustproxmoxmcp"
 authors      = ["fastrevmd-lab"]
 
 [workspace.lints.rust]
@@ -51,17 +51,17 @@ tokio-rustls = "0.26"
 rust-proxmoxmcp-core = { path = "crates/rust-proxmoxmcp-core", version = "0.10.0" }
 
 # mecmcp is consumed read-only at an exact pinned version. Do not relax the tag.
-mecmcp-audit     = { version = "0.24.1", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.24.1" }
-mecmcp-auth      = { version = "0.24.1", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.24.1" }
-mecmcp-changeset = { version = "0.24.1", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.24.1" }
-mecmcp-http      = { version = "0.24.1", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.24.1" }
-mecmcp-inventory = { version = "0.24.1", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.24.1" }
-mecmcp-job       = { version = "0.24.1", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.24.1" }
-mecmcp-openapi   = { version = "0.24.1", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.24.1" }
-mecmcp-runtime   = { version = "0.24.1", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.24.1" }
-mecmcp-secret    = { version = "0.24.1", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.24.1" }
-mecmcp-server    = { version = "0.24.1", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.24.1" }
-mecmcp-transport = { version = "0.24.1", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.24.1" }
+mecmcp-audit     = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
+mecmcp-auth      = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
+mecmcp-changeset = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
+mecmcp-http      = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
+mecmcp-inventory = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
+mecmcp-job       = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
+mecmcp-openapi   = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
+mecmcp-runtime   = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
+mecmcp-secret    = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
+mecmcp-server    = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
+mecmcp-transport = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
 # mecmcp-redact landed on mecmcp's main branch after v0.24.1 was tagged and has
 # not shipped in a tagged release yet (checked against upstream: v0.24.1 is
 # still the newest tag). Every other mecmcp-* crate above pins a tag; this one
@@ -72,7 +72,7 @@ mecmcp-transport = { version = "0.24.1", git = "https://github.com/fastrevmd-lab
 # this build. Swap this to `tag = "vX.Y.Z"` once mecmcp cuts a release that
 # includes the crate, so it matches the pinning discipline of the rest of
 # this block.
-mecmcp-redact    = { version = "0.24.1", git = "https://github.com/fastrevmd-lab/mecmcp", rev = "2e157e0f09894e2a5309408523c0911425eebd20" }
+mecmcp-redact    = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", rev = "2e157e0f09894e2a5309408523c0911425eebd20" }
 
 [profile.release]
 lto           = "thin"

@@ -1,7 +1,7 @@
 # `mecmcp` issue candidates found while building rustproxmoxmcp 0.1
 
 `mecmcp` is consumed read-only at `v0.8.8`. Nothing below was patched locally;
-each is written up here to be filed against `fastrevmd-lab/mecmcp`.
+each is written up here to be filed against `mechubsec/mecmcp`.
 
 Ordered by consequence.
 

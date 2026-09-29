@@ -31,7 +31,7 @@ Eleven of the fourteen crates apply. `mecmcp-device` and `mecmcp-scp` do not
 ### `mecmcp` is read-only
 
 This project consumes `mecmcp` at a pinned exact version and does not modify it.
-Gaps become issues on `fastrevmd-lab/mecmcp` and are designed around in the
+Gaps become issues on `mechubsec/mecmcp` and are designed around in the
 consumer meanwhile. `mecmcp` is the foundation under four servers; a change made
 to suit Proxmox lands in all of them, and the extraction programme existed
 precisely to stop each repo being the private reference implementation for
