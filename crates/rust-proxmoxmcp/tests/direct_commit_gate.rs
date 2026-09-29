@@ -2,7 +2,8 @@
 //! call with no independent second-principal approval.
 //!
 //! The interrupting lifecycle verbs (`stop_vm`, `shutdown_vm`, `reset_vm`,
-//! `stop_container`, `restart_container`), `clone_vm`, `create_vm`,
+//! `stop_container`, `restart_container`, `stop_task`,
+//! `update_container_resources`), `clone_vm`, `create_vm`,
 //! `create_container`, `resize_disk`, and `create_backup` act on Proxmox
 //! immediately -- there is no change-set flow to route an operational command
 //! like "stop this guest" through. Without the flag, the server must refuse
@@ -71,6 +72,17 @@ fn gated_calls() -> Vec<GatedCall> {
         GatedCall {
             tool: "create_backup",
             args: json!({"cluster": "pve3", "vmid": 600, "storage": "local", "mode": "snapshot"}),
+        },
+        GatedCall {
+            tool: "update_container_resources",
+            args: json!({"cluster": "pve3", "vmid": 617, "cores": 4}),
+        },
+        GatedCall {
+            tool: "stop_task",
+            args: json!({
+                "cluster": "pve3",
+                "upid": "UPID:pve2:0000000c:0000000c:0000000c:vzdump:617:root@pam:"
+            }),
         },
     ]
 }
@@ -163,6 +175,16 @@ fn gate_routes() -> Vec<Route> {
             status: 200,
             body: br#"{"data":"UPID:pve2:0000000b:0000000b:0000000b:vzdump:600:root@pam:"}"#,
         },
+        Route {
+            path: "/api2/json/nodes/pve2/lxc/617/config",
+            status: 200,
+            body: br#"{"data":null}"#,
+        },
+        Route {
+            path: "/api2/json/nodes/pve2/tasks/UPID%3Apve2%3A0000000c%3A0000000c%3A0000000c%3Avzdump%3A617%3Aroot%40pam%3A",
+            status: 200,
+            body: br#"{"data":null}"#,
+        },
     ]
 }
 
@@ -195,12 +217,16 @@ async fn refused_calls_never_reach_proxmox_and_name_the_flag() {
 
         // The gate runs after the guest is resolved (a read against
         // `/cluster/resources`) but before the mutating call, so a refused
-        // call may still have made a GET. It must never have POSTed -- every
-        // gated tool's actual mutation is a POST.
-        let posted = h.requests().into_iter().any(|r| r.method == "POST");
+        // call may still have made a GET. It must never have mutated --
+        // most gated tools' actual mutation is a POST, `stop_task`'s is a
+        // DELETE, and `update_container_resources`'s is a PUT.
+        let mutated = h
+            .requests()
+            .into_iter()
+            .any(|r| matches!(r.method.as_str(), "POST" | "PUT" | "DELETE"));
         assert!(
-            !posted,
-            "{}: a refused direct-commit call must not POST to Proxmox",
+            !mutated,
+            "{}: a refused direct-commit call must not mutate Proxmox",
             call.tool
         );
     }
@@ -276,4 +302,90 @@ async fn create_backup_with_stop_mode_is_refused_under_the_same_gate() {
     )
     .await
     .expect("mode: stop must succeed with --allow-direct-commit");
+}
+
+/// Regression test for the `authorize_low_with_interrupts` wiring itself,
+/// independent of the direct-commit gate above: with the flag on and no
+/// waiver or lab mode, a protected guest's interruption still has to be
+/// checked. `mode: "stop"` takes the guest out of service and must be
+/// refused by the protection gate, exactly like a plain `stop_vm` would be,
+/// while the default `mode: "snapshot"` is additive and must succeed.
+///
+/// If `create_backup` reverted to passing `None` for `interrupts_override`
+/// (so every mode is treated as non-interrupting, as it was before this
+/// fix), `intent.interrupts` would stay `false` regardless of `mode` and the
+/// `mode: "stop"` call below would wrongly succeed -- this test would fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_backup_interruption_is_checked_against_protection() {
+    let routes = vec![
+        Route {
+            path: "/api2/json/nodes",
+            status: 200,
+            body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+        },
+        Route {
+            path: "/api2/json/cluster/resources",
+            status: 200,
+            body: br#"{"data":[
+                {"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"}
+            ]}"#,
+        },
+        Route {
+            path: "/api2/json/nodes/pve2/vzdump",
+            status: 200,
+            body: br#"{"data":"UPID:pve2:0000000d:0000000d:0000000d:vzdump:905:root@pam:"}"#,
+        },
+    ];
+
+    let spec = TokenSpec {
+        clusters: vec!["pve3".to_owned()],
+        tools: vec!["create_backup".to_owned()],
+        guests: vec!["*".to_owned()],
+    };
+
+    let h = TestServer::start_with_direct_commit(spec, routes, true).await;
+
+    let err = common::call(
+        &h,
+        "create_backup",
+        json!({"cluster": "pve3", "vmid": 905, "storage": "local", "mode": "stop"}),
+    )
+    .await
+    .expect_err("mode: stop interrupts a protected guest and must be refused");
+    assert!(
+        err.to_lowercase().contains("protect"),
+        "refusal must name protection, got: {err}"
+    );
+
+    common::call(
+        &h,
+        "create_backup",
+        json!({"cluster": "pve3", "vmid": 905, "storage": "local", "mode": "snapshot"}),
+    )
+    .await
+    .expect("mode: snapshot is additive and must succeed on a protected guest");
+}
+
+/// `create_backup` fails closed on a `mode` vzdump does not accept, before
+/// authorization ever runs: `"STOP"` does not match `backup_interrupts`'s
+/// `"stop"` arm, so an unvalidated mode would be silently misclassified as
+/// non-interrupting rather than refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_backup_refuses_a_mode_outside_the_allowlist() {
+    let h = TestServer::start_with_direct_commit(spec(), gate_routes(), true).await;
+
+    let err = common::call(
+        &h,
+        "create_backup",
+        json!({"cluster": "pve3", "vmid": 600, "storage": "local", "mode": "STOP"}),
+    )
+    .await
+    .expect_err("an unrecognised mode must be refused, not forwarded to vzdump");
+    assert!(err.contains("mode"), "refusal must name the mode: {err}");
+
+    let posted = h
+        .requests()
+        .into_iter()
+        .any(|r| r.method == "POST" && r.path.ends_with("/vzdump"));
+    assert!(!posted, "an invalid mode must never reach Proxmox");
 }

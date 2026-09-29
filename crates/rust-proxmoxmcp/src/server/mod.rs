@@ -2816,13 +2816,23 @@ impl ProxmoxServer {
 
     #[tool(
         name = "create_backup",
-        description = "Back up one guest with vzdump. Additive, so permitted on a protected guest."
+        description = "Back up one guest with vzdump. mode: \"snapshot\" (default) is additive and \
+                        permitted on a protected guest; \"suspend\" and \"stop\" take the guest out \
+                        of service for the duration of the backup and are refused on a protected \
+                        guest exactly like stop_vm."
     )]
     async fn create_backup(
         &self,
         Parameters(args): Parameters<BackupArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
+        if !rust_proxmoxmcp_core::tier::VALID_BACKUP_MODES.contains(&args.mode.as_str()) {
+            return tool_error(format!(
+                "mode '{}' is not one of snapshot, suspend, or stop",
+                args.mode
+            ));
+        }
+
         let guest_args = GuestArgs {
             cluster: args.cluster.clone(),
             vmid: args.vmid,
@@ -3131,6 +3141,20 @@ impl ProxmoxServer {
             ));
         }
 
+        // Direct-commit tools run immediately with no change-set approval.
+        // `update_container_resources` is in `tier::INTERRUPTING_TOOLS` --
+        // changing cores takes effect immediately, so it interrupts the
+        // container's current allocation the same way stopping it would.
+        let caller = Self::caller(&context);
+        if let Err(result) = self.gate_direct_commit(
+            caller.as_ref(),
+            "update_container_resources",
+            "interrupt",
+            &guest.vmid.to_string(),
+        ) {
+            return *result;
+        }
+
         if let Err(error) = rust_proxmoxmcp_core::guests::update_container_resources(
             client,
             &guest.node,
@@ -3267,6 +3291,21 @@ impl ProxmoxServer {
                 None
             }
         };
+
+        // Direct-commit tools run immediately with no change-set approval.
+        // `stop_task` is in `tier::INTERRUPTING_TOOLS`: it aborts work in
+        // progress, guest-addressed or not, so both branches above are gated
+        // the same way the lifecycle verbs are -- the target names the guest
+        // when there is one, and the node otherwise.
+        let target = match authorized.as_ref() {
+            Some(authorized) => authorized.guest().vmid.to_string(),
+            None => node.clone(),
+        };
+        if let Err(result) =
+            self.gate_direct_commit(caller.as_ref(), "stop_task", "interrupt", &target)
+        {
+            return *result;
+        }
 
         if let Err(error) = rust_proxmoxmcp_core::guests::stop_task(client, &node, &args.upid).await
         {
@@ -5467,6 +5506,105 @@ mod tests {
             "read_only grant should have one selector"
         );
         // The read_only grant is constructed as guests: ["*"], actions: [Read]
+    }
+
+    /// A minimal server for exercising `gate_direct_commit` directly. No test
+    /// here ever sends a request to the fake endpoint: the gate itself never
+    /// touches `clients`, `index` or the coordinator, so this just needs to
+    /// satisfy the constructor.
+    fn minimal_server(direct_commit: mecmcp_audit::DirectCommitPolicy) -> ProxmoxServer {
+        static CRYPTO_PROVIDER: std::sync::Once = std::sync::Once::new();
+        CRYPTO_PROVIDER.call_once(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let clusters_path = temp_dir.path().join("clusters.json");
+        let secret_path = temp_dir.path().join("secret.txt");
+        std::fs::write(&secret_path, "test-secret").expect("write secret file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600))
+                .expect("set secret file permissions");
+        }
+
+        let inventory_json = serde_json::json!({
+            "version": 1,
+            "devices": {
+                "test": {
+                    "endpoint": "https://127.0.0.1:8006",
+                    "token_id": "test@pam!test",
+                    "token_secret_file": secret_path.to_str().expect("secret path"),
+                    "protected_vmids": []
+                }
+            },
+            "policy": { "resource_cache_ttl_secs": 300 }
+        });
+        std::fs::write(
+            &clusters_path,
+            serde_json::to_string_pretty(&inventory_json).expect("serialize"),
+        )
+        .expect("write clusters.json");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&clusters_path, std::fs::Permissions::from_mode(0o600))
+                .expect("set clusters.json permissions");
+        }
+
+        let clusters =
+            Arc::new(ClusterInventory::load(&clusters_path).expect("load clusters.json"));
+        let mut clients = BTreeMap::new();
+        for name in clusters.names() {
+            let cluster = clusters.get(&name).expect("get cluster");
+            clients.insert(
+                name.clone(),
+                ProxmoxClient::new(cluster).expect("build client"),
+            );
+        }
+        let index = Arc::new(GuestIndex::new(std::time::Duration::from_secs(300)));
+        let waivers = Arc::new(rust_proxmoxmcp_core::waiver::WaiverFile::empty());
+
+        ProxmoxServer::new_with_default_coordinator(
+            clusters,
+            Arc::new(clients),
+            index,
+            waivers,
+            false,
+            None,
+            direct_commit,
+            None,
+        )
+        .expect("build server")
+    }
+
+    /// `gate_direct_commit`'s `caller == None` branch builds an
+    /// `AuditScope::stdio` rather than `AuditScope::from_caller` -- the path a
+    /// real stdio session (no bearer token, so `Self::caller` returns `None`)
+    /// takes. Every end-to-end direct-commit test drives HTTP with a bearer
+    /// token, so without this, that branch never runs at all.
+    #[test]
+    fn gate_direct_commit_refuses_over_stdio_with_no_caller_context() {
+        let server = minimal_server(mecmcp_audit::DirectCommitPolicy::new(false));
+
+        let result = server.gate_direct_commit(None, "stop_vm", "interrupt", "600");
+        assert!(
+            result.is_err(),
+            "the stdio path must be refused with no --allow-direct-commit, same as HTTP"
+        );
+    }
+
+    /// The same stdio path succeeds once the operator has accepted the risk.
+    #[test]
+    fn gate_direct_commit_allows_over_stdio_with_the_flag_on() {
+        let server = minimal_server(mecmcp_audit::DirectCommitPolicy::new(true));
+
+        let result = server.gate_direct_commit(None, "stop_vm", "interrupt", "600");
+        assert!(
+            result.is_ok(),
+            "the stdio path must succeed with --allow-direct-commit, same as HTTP"
+        );
     }
 }
 

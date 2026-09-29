@@ -335,18 +335,19 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(mecmcp_audit::EvidenceService::recorder);
 
-    // Direct-commit tools (the interrupting lifecycle verbs, `clone_vm`,
-    // `create_vm`, `create_container`, `resize_disk`, and `create_backup`)
-    // mutate a guest in one call with no change-set approval. Refused by
-    // default; logging here mirrors the lab-mode banner above.
+    // Direct-commit tools (the interrupting lifecycle verbs, `stop_task`,
+    // `update_container_resources`, `clone_vm`, `create_vm`,
+    // `create_container`, `resize_disk`, and `create_backup`) mutate a guest
+    // in one call with no change-set approval. Refused by default; logging
+    // here mirrors the lab-mode banner above.
     let direct_commit = mecmcp_audit::DirectCommitPolicy::new(args.allow_direct_commit);
     direct_commit.log_startup("rust-proxmoxmcp");
     if !args.allow_direct_commit {
         tracing::info!(
             "direct-commit tools disabled: stop_vm, shutdown_vm, reset_vm, stop_container, \
-             restart_container, clone_vm, create_vm, create_container, resize_disk and \
-             create_backup are refused on stdio and HTTP alike. Use --allow-direct-commit to \
-             enable them."
+             restart_container, stop_task, update_container_resources, clone_vm, create_vm, \
+             create_container, resize_disk and create_backup are refused on stdio and HTTP \
+             alike. Use --allow-direct-commit to enable them."
         );
     }
 
