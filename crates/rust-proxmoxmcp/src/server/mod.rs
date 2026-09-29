@@ -879,6 +879,31 @@ fn scope_desc(caller: Option<&CallerCtx<ProxmoxGrant>>) -> &'static str {
         .unwrap_or("stdio")
 }
 
+/// Redact the free-form fields of a `get_vm_config` / `get_container_config`
+/// response before it reaches the model.
+///
+/// Proxmox's guest config does not distinguish "operator note" from "secret
+/// dump": `description` is a free-text field operators routinely use for
+/// both, and `cicustom` names cloud-init snippets whose content this server
+/// never fetches but which is still an arbitrary vendor string. Both are run
+/// through `mecmcp_redact::redact_text` rather than dropped outright, so a
+/// legitimate non-secret note survives while an embedded credential does not.
+///
+/// `sshkeys` is deliberately left untouched: it carries the guest's
+/// authorized public keys, which are not secret.
+fn redact_guest_config(value: &mut serde_json::Value) {
+    let Some(config) = value.as_object_mut() else {
+        return;
+    };
+    for key in ["description", "cicustom"] {
+        if let Some(field) = config.get_mut(key)
+            && let Some(text) = field.as_str()
+        {
+            *field = serde_json::Value::String(mecmcp_redact::redact_text(text));
+        }
+    }
+}
+
 impl ProxmoxServer {
     /// Execute one catalog-declared read.
     ///
@@ -981,6 +1006,9 @@ impl ProxmoxServer {
                             .is_some_and(|t| t == filter_type.path_segment())
                     });
                 }
+                if matches!(tool, "get_vm_config" | "get_container_config") {
+                    redact_guest_config(&mut value);
+                }
                 Ok(value)
             }
             Err(error) => Err(error),
@@ -1072,7 +1100,10 @@ impl ProxmoxServer {
 
     #[tool(
         name = "get_vm_config",
-        description = "Configuration of one QEMU guest, including its Proxmox digest."
+        description = "Configuration of one QEMU guest, including its Proxmox digest. \
+                        `description` and `cicustom` content are redacted; sshkeys, \
+                        hostname/name, resource allocation, disks and network config \
+                        are preserved."
     )]
     async fn get_vm_config(
         &self,
@@ -1091,7 +1122,10 @@ impl ProxmoxServer {
 
     #[tool(
         name = "get_container_config",
-        description = "Configuration of one LXC guest, including its Proxmox digest."
+        description = "Configuration of one LXC guest, including its Proxmox digest. \
+                        `description` and `cicustom` content are redacted; sshkeys, \
+                        hostname, resource allocation, disks and network config are \
+                        preserved."
     )]
     async fn get_container_config(
         &self,
