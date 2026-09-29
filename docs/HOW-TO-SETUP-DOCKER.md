@@ -150,6 +150,22 @@ digest directly (`image=ghcr.io/...@sha256:<recorded digest>`) or compare the
 freshly resolved one against it and stop on mismatch — re-resolving the tag runs
 whatever that tag points at today, which may be different bytes.
 
+**Verify the signature before running it.** Every image pushed by the
+`Release image` workflow is signed keylessly with
+[cosign](https://github.com/sigstore/cosign) via GitHub Actions OIDC — no key
+pair exists anywhere. Verification pins the signing identity to that exact
+workflow, so a signature from anywhere else (a fork, a different repo, a local
+build) fails:
+
+```bash
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/fastrevmd-lab/rustproxmoxmcp/\.github/workflows/release-image\.yml@refs/(tags/v[0-9]+\.[0-9]+\.[0-9]+|heads/main)$' \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  "$image"
+```
+
+A failure here means do not run it, not "probably fine."
+
 ```bash
 docker run -d --name proxmox-twoperson \
   --user "$(id -u):$(id -g)" \

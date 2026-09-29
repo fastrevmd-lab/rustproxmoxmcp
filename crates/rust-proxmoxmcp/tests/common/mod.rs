@@ -119,6 +119,49 @@ impl TestServer {
         lab_mode: bool,
         state_path: Option<std::path::PathBuf>,
     ) -> Self {
+        Self::start_with_config_on_state_and_limits(
+            spec,
+            routes,
+            waivers,
+            lab_mode,
+            state_path,
+            LimitsConfig::default(),
+        )
+        .await
+    }
+
+    /// Start the test server with the production default request limits
+    /// replaced by `limits`.
+    ///
+    /// For a test that legitimately drives many calls back-to-back on one
+    /// token -- a catalog sweep, say -- rather than one that probes rate
+    /// limiting itself, which should keep the production default.
+    pub async fn start_with_limits(
+        spec: TokenSpec,
+        routes: Vec<Route>,
+        limits: LimitsConfig,
+    ) -> Self {
+        Self::start_with_config_on_state_and_limits(
+            spec,
+            routes,
+            Arc::new(rust_proxmoxmcp_core::waiver::WaiverFile::empty()),
+            false,
+            None,
+            limits,
+        )
+        .await
+    }
+
+    /// As [`Self::start_with_config_on_state`], with the request limits also
+    /// caller-supplied instead of hardcoded to [`LimitsConfig::default`].
+    pub async fn start_with_config_on_state_and_limits(
+        spec: TokenSpec,
+        routes: Vec<Route>,
+        waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
+        lab_mode: bool,
+        state_path: Option<std::path::PathBuf>,
+        limits: LimitsConfig,
+    ) -> Self {
         // Install crypto provider once for the test binary.
         ensure_crypto_provider();
 
@@ -281,7 +324,7 @@ impl TestServer {
             Some(token_store_arc),
             vec![],
             vec![],
-            LimitsConfig::default(),
+            limits,
             false,
             false,
             shutdown.clone(),
@@ -589,34 +632,85 @@ pub async fn call_with_token(
         let session_id = client
             .initialize()
             .map_err(|e| format!("initialize: {e}"))?;
-        let result = client
-            .tools_call(&session_id, &tool, args)
-            .map_err(|e| format!("call: {e}"))?;
+        call_on_session(&client, &session_id, &tool, args)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {e}"))?
+}
 
-        eprintln!(
-            "Full MCP result: {}",
-            serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"))
-        );
+/// Parse one `tools/call` response into the same `Ok(json)` / `Err(message)`
+/// shape [`call_with_token`] returns, without opening a new client or
+/// session. Extracted so a caller that needs to make many calls -- a
+/// catalog sweep, say -- can `initialize()` once and reuse the session,
+/// instead of paying a fresh MCP handshake per call.
+fn call_on_session(
+    client: &mecmcp_transport::test_client::McpClient,
+    session_id: &str,
+    tool: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let result = client
+        .tools_call(session_id, tool, args)
+        .map_err(|e| format!("call: {e}"))?;
 
-        // Check if this is an error response
-        let is_error = result
-            .get("isError")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+    eprintln!(
+        "Full MCP result: {}",
+        serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"))
+    );
 
-        // Extract the text content from the MCP response
-        let text = result
-            .get("content")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("text"))
-            .and_then(|t| t.as_str())
-            .ok_or_else(|| format!("no result text, response: {result}"))?;
+    let is_error = result
+        .get("isError")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-        if is_error {
-            Err(text.to_owned())
-        } else {
-            serde_json::from_str(text).map_err(|e| format!("json parse: {e}"))
-        }
+    let text = result
+        .get("content")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("text"))
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| format!("no result text, response: {result}"))?;
+
+    if is_error {
+        Err(text.to_owned())
+    } else {
+        serde_json::from_str(text).map_err(|e| format!("json parse: {e}"))
+    }
+}
+
+/// Make many `tools/call` requests over a single MCP session (one
+/// `initialize()`, not one per call). Each element of `calls` is
+/// `(tool, args)`; results come back in the same order, each as `Ok(json)`
+/// on success or `Err(message)` on an MCP-level or transport-level error --
+/// a caller that wants to fail on transport errors rather than treat them as
+/// "no leak found" should check the error text itself.
+///
+/// # Errors
+///
+/// Returns an error only if the session itself cannot be established
+/// (client construction or `initialize()`); a failure of one call in
+/// `calls` is reported in that call's own `Result`, not here.
+pub async fn call_many_on_one_session(
+    server: &TestServer,
+    token: &str,
+    calls: Vec<(&'static str, serde_json::Value)>,
+) -> Result<Vec<Result<serde_json::Value, String>>, String> {
+    use mecmcp_transport::test_client::McpClient;
+
+    let url = server.url.clone();
+    let token = token.to_owned();
+
+    tokio::task::spawn_blocking(move || {
+        let client = McpClient::new(&url)
+            .map_err(|e| format!("create client: {e}"))?
+            .with_bearer(&token);
+        let session_id = client
+            .initialize()
+            .map_err(|e| format!("initialize: {e}"))?;
+
+        Ok(calls
+            .into_iter()
+            .map(|(tool, args)| call_on_session(&client, &session_id, tool, args))
+            .collect())
     })
     .await
     .map_err(|e| format!("spawn_blocking: {e}"))?
