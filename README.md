@@ -463,7 +463,36 @@ trail: it is a log file on a box whose operator is the party the record is about
 
 JSON is mandatory. The `text` format is for reading in a terminal and is not a
 parse target. The file is the operator-facing artifact and must be rotated — the
-server never truncates it.
+server never truncates it itself, but it keeps the file handle
+`mecmcp_audit::init_tracing` returns and reopens it by path on `SIGHUP`, so
+rotation is lossless as long as the rotator renames the file and signals the
+process.
+
+A ready-to-install fragment ships at
+[`packaging/logrotate/rust-proxmoxmcp-audit`](packaging/logrotate/rust-proxmoxmcp-audit):
+
+```
+/var/lib/proxmoxmcp/audit.jsonl {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    su proxmoxmcp proxmoxmcp
+    postrotate
+        systemctl kill -s HUP rust-proxmoxmcp.service >/dev/null 2>&1 || true
+    endscript
+}
+```
+
+**Rename + reopen, not `copytruncate`.** `SIGHUP` reopens the audit file by
+path alongside the existing `clusters.json`/`tokens.json` hot reload, so
+`postrotate` renames the file and signals the process; every write after that
+lands in a fresh inode at the same path. Nothing written before the rename is
+truncated and nothing written after it is lost — `copytruncate` copies the
+file and then truncates it in place, which drops whatever is written in the
+gap between those two steps.
 
 ### Transport (specified, not yet implemented)
 
