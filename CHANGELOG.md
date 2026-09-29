@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unknown` and can no longer approve change sets. Re-mint each approver's
   token with `rust-proxmoxmcp token add ... --actor-type human`; other
   tokens are unaffected. See [README § Change control](README.md#change-control).
+- **Container images now publish to `ghcr.io/mechubsec/rustproxmoxmcp`** —
+  the repo moved to the mechubsec organization, and images are renamed to
+  match. Older tags were copied from the previous name.
 - Raised MSRV to 1.89 (family-wide decision).
 - **Added 14 read-only firewall tools** (MEC-453): rules, options, IPSets,
   aliases and security groups at cluster, node and guest scope, matching the
