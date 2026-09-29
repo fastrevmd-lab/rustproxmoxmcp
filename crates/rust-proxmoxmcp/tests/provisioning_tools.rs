@@ -50,9 +50,10 @@ fn spec_with(tools: &[&str], guests: &[&str]) -> common::TokenSpec {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_vm_is_created_at_a_free_vmid() {
-    let h = common::TestServer::start_with_routes(
+    let h = common::TestServer::start_with_direct_commit(
         spec_with(&["create_vm"], &["*"]),
         provisioning_routes(),
+        true,
     )
     .await;
 
@@ -71,9 +72,10 @@ async fn a_vm_is_created_at_a_free_vmid() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_container_is_created_through_the_lxc_endpoint() {
-    let h = common::TestServer::start_with_routes(
+    let h = common::TestServer::start_with_direct_commit(
         spec_with(&["create_container"], &["*"]),
         provisioning_routes(),
+        true,
     )
     .await;
 
@@ -340,9 +342,10 @@ async fn host_mounts_and_device_passthrough_are_refused() {
 /// allowed for `local-lvm:32` and refused for `/dev/sdb`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_host_path_in_any_value_is_refused() {
-    let h = common::TestServer::start_with_routes(
+    let h = common::TestServer::start_with_direct_commit(
         spec_with(&["create_vm"], &["*"]),
         provisioning_routes(),
+        true,
     )
     .await;
 
@@ -370,9 +373,10 @@ async fn a_host_path_in_any_value_is_refused() {
 /// opposite of the intent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_container_defaults_to_unprivileged() {
-    let h = common::TestServer::start_with_routes(
+    let h = common::TestServer::start_with_direct_commit(
         spec_with(&["create_container"], &["*"]),
         provisioning_routes(),
+        true,
     )
     .await;
 
@@ -399,9 +403,10 @@ async fn a_container_defaults_to_unprivileged() {
 /// `unprivileged=1` is the safe setting and must be accepted; 0 is refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unprivileged_one_is_allowed_and_zero_is_not() {
-    let h = common::TestServer::start_with_routes(
+    let h = common::TestServer::start_with_direct_commit(
         spec_with(&["create_container"], &["*"]),
         provisioning_routes(),
+        true,
     )
     .await;
 

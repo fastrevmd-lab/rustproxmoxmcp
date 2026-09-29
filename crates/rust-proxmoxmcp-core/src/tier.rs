@@ -75,6 +75,23 @@ pub fn interrupts_service(tool: &str) -> bool {
     INTERRUPTING_TOOLS.contains(&tool)
 }
 
+/// Whether a `create_backup` call with this `mode` takes the guest out of
+/// service for the duration of the backup.
+///
+/// `create_backup` is not, and cannot be, a member of [`INTERRUPTING_TOOLS`]:
+/// that list answers a per-*tool* question, and whether a backup interrupts
+/// the guest depends on `mode`, a per-*call* argument. vzdump's `stop` mode
+/// stops the guest before dumping it -- exactly as disruptive as `stop_vm` --
+/// while `snapshot` and `suspend` do not take it out of service. Treating
+/// `create_backup` as uniformly non-interrupting (as [`interrupts_service`]
+/// would, since it is absent from [`INTERRUPTING_TOOLS`]) would let
+/// `mode: "stop"` bypass the protection and direct-commit gates that a plain
+/// `stop_vm` call cannot.
+#[must_use]
+pub fn backup_interrupts(mode: &str) -> bool {
+    mode.trim() == "stop"
+}
+
 /// Tools excluded from a wildcard tool scope. Complete as of spec §4.3.
 pub const WRITE_TOOLS: &[&str] = &[
     // low
@@ -263,6 +280,36 @@ mod interruption_tests {
                 "{tool} is destructive; its tier already refuses a protected guest"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod backup_interrupt_tests {
+    use super::backup_interrupts;
+
+    /// `mode: "stop"` stops the guest before dumping it -- exactly as
+    /// disruptive as `stop_vm` -- so it must classify as interrupting even
+    /// though `create_backup` itself is not in `INTERRUPTING_TOOLS`.
+    #[test]
+    fn stop_mode_interrupts() {
+        assert!(backup_interrupts("stop"));
+    }
+
+    /// `snapshot` and `suspend` do not take the guest out of service, which
+    /// is what keeps `create_backup` usable on a protected guest for every
+    /// mode except `stop`.
+    #[test]
+    fn snapshot_and_suspend_modes_do_not_interrupt() {
+        assert!(!backup_interrupts("snapshot"));
+        assert!(!backup_interrupts("suspend"));
+    }
+
+    /// Whitespace must not change the answer, matching `resize_shrinks`'s
+    /// house style for free-text arguments.
+    #[test]
+    fn surrounding_whitespace_does_not_flip_the_classification() {
+        assert!(backup_interrupts("  stop  "));
+        assert!(!backup_interrupts("  snapshot  "));
     }
 }
 

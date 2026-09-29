@@ -1073,6 +1073,11 @@ pub struct ProxmoxServer {
     evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
     waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
     lab_mode: bool,
+    /// Whether direct-commit tools (the interrupting lifecycle verbs,
+    /// `clone_vm`, `create_vm`, `create_container`, `resize_disk`, and
+    /// `create_backup`) may run without change-set approval. Set via
+    /// `--allow-direct-commit`; off by default.
+    direct_commit: mecmcp_audit::DirectCommitPolicy,
     tool_router: ToolRouter<Self>,
 }
 
@@ -1089,6 +1094,7 @@ impl ProxmoxServer {
     /// [`new_with_default_coordinator`](Self::new_with_default_coordinator)
     /// builds both from one recorder and is the safe entry point.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         clusters: Arc<ClusterInventory>,
         clients: Arc<BTreeMap<String, ProxmoxClient>>,
@@ -1097,6 +1103,7 @@ impl ProxmoxServer {
         waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
         lab_mode: bool,
         evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
+        direct_commit: mecmcp_audit::DirectCommitPolicy,
     ) -> Self {
         Self {
             clusters: clusters.clone(),
@@ -1106,6 +1113,7 @@ impl ProxmoxServer {
             evidence,
             waivers,
             lab_mode,
+            direct_commit,
             tool_router: Self::proxmox_tool_router(),
         }
     }
@@ -1115,6 +1123,7 @@ impl ProxmoxServer {
     /// # Errors
     ///
     /// Returns an error if the coordinator cannot be created.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_default_coordinator(
         clusters: Arc<ClusterInventory>,
         clients: Arc<BTreeMap<String, ProxmoxClient>>,
@@ -1122,6 +1131,7 @@ impl ProxmoxServer {
         waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
         lab_mode: bool,
         evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
+        direct_commit: mecmcp_audit::DirectCommitPolicy,
         state_file: Option<&std::path::Path>,
     ) -> Result<Self, mecmcp_changeset::CoordinatorError> {
         let coordinator = change_set::build_coordinator(state_file, lab_mode, evidence.clone())?;
@@ -1133,6 +1143,7 @@ impl ProxmoxServer {
             waivers,
             lab_mode,
             evidence,
+            direct_commit,
         ))
     }
 
@@ -1159,6 +1170,43 @@ impl ProxmoxServer {
         self.clients
             .get(cluster)
             .ok_or_else(|| Box::new(tool_error(format!("unknown cluster: {cluster}"))))
+    }
+
+    /// Enforce the direct-commit gate for a tool that mutates a guest in one
+    /// call with no change-set approval, and audit the outcome.
+    ///
+    /// Refuses unless the server was started with `--allow-direct-commit`.
+    /// Unlike the tier/grant/protection authorization above, which logs
+    /// through this crate's own `tracing`-based audit convention, this emits
+    /// its event through `mecmcp_audit::AuditScope` -- the same mechanism
+    /// `mecmcp_audit::DirectCommitPolicy::check` requires and the one every
+    /// other mecmcp server uses for the identical gate, so direct-commit
+    /// records share one shape across the fleet. The `AuditScope` is dropped
+    /// (and so emits) whether `check` allows or refuses the call.
+    ///
+    /// # Errors
+    /// Returns the boxed `CallToolResult` [`tool_error`] renders for
+    /// [`mecmcp_audit::DirectCommitRefused`], for a handler to `return *result`.
+    fn gate_direct_commit(
+        &self,
+        caller: Option<&CallerCtx<ProxmoxGrant>>,
+        tool: &'static str,
+        action: &'static str,
+        target: &str,
+    ) -> Result<(), Box<CallToolResult>> {
+        let mut scope = match caller {
+            Some(ctx) => {
+                mecmcp_audit::AuditScope::from_caller(ctx, tool, action, vec![target.to_owned()])
+            }
+            None => mecmcp_audit::AuditScope::stdio(tool, action, vec![target.to_owned()]),
+        };
+        match self.direct_commit.check(&mut scope) {
+            Ok(()) => {
+                scope.succeed();
+                Ok(())
+            }
+            Err(error) => Err(Box::new(tool_error(error))),
+        }
     }
 }
 
@@ -1898,11 +1946,21 @@ impl ProxmoxServer {
         None
     }
 
-    async fn authorize_low(
+    /// As [`Self::authorize_low`], but the caller supplies whether this
+    /// specific call interrupts the guest rather than letting `Intent::low`
+    /// derive it from the tool name.
+    ///
+    /// Only `create_backup` needs this: whether a backup interrupts the guest
+    /// depends on its `mode` argument (`tier::backup_interrupts`), not on the
+    /// tool name, so `Intent::low_with_override`'s tool-name-derived
+    /// `interrupts` would be wrong for `mode: "stop"`. Every other caller
+    /// passes `None` and gets the tool-name-derived answer unchanged.
+    async fn authorize_low_with_interrupts(
         &self,
         tool: &'static str,
         args: &GuestArgs,
         context: &RequestContext<RoleServer>,
+        interrupts_override: Option<bool>,
     ) -> Result<rust_proxmoxmcp_core::AuthorizedGuest, Box<CallToolResult>> {
         use rust_proxmoxmcp_core::protect::{Override, destructive_allowed, protection_of};
 
@@ -1936,16 +1994,31 @@ impl ProxmoxServer {
         );
         let override_applies = !matches!(override_, Override::None);
 
+        let mut intent = Intent::low_with_override(tool, override_applies);
+        if let Some(interrupts) = interrupts_override {
+            intent.interrupts = interrupts;
+        }
+
         self.index
-            .authorize(
-                client,
-                &args.cluster,
-                args.vmid,
-                &grant,
-                Intent::low_with_override(tool, override_applies),
-            )
+            .authorize(client, &args.cluster, args.vmid, &grant, intent)
             .await
             .map_err(|error| Box::new(tool_error(error)))
+    }
+
+    /// Stage 1 + stage 2 authorization for a low-tier guest call, with
+    /// interruption derived from the tool name via `Intent::low`.
+    ///
+    /// A thin wrapper over [`Self::authorize_low_with_interrupts`] for every
+    /// caller except `create_backup`, whose interruption depends on its
+    /// `mode` argument rather than its tool name.
+    async fn authorize_low(
+        &self,
+        tool: &'static str,
+        args: &GuestArgs,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<rust_proxmoxmcp_core::AuthorizedGuest, Box<CallToolResult>> {
+        self.authorize_low_with_interrupts(tool, args, context, None)
+            .await
     }
 
     /// Serve one low-tier lifecycle verb.
@@ -2030,6 +2103,16 @@ impl ProxmoxServer {
                 args.vmid,
                 guest.r#type.path_segment()
             ));
+        }
+
+        // Direct-commit tools run immediately with no change-set approval.
+        // Only the interrupting verbs are gated -- `start_vm`/`start_container`
+        // are additive, not disruptive, and stay ungated.
+        if rust_proxmoxmcp_core::tier::interrupts_service(tool)
+            && let Err(result) =
+                self.gate_direct_commit(caller.as_ref(), tool, "interrupt", &guest.vmid.to_string())
+        {
+            return *result;
         }
 
         let upid = match rust_proxmoxmcp_core::guests::lifecycle(
@@ -2744,8 +2827,9 @@ impl ProxmoxServer {
             cluster: args.cluster.clone(),
             vmid: args.vmid,
         };
+        let interrupts = rust_proxmoxmcp_core::tier::backup_interrupts(&args.mode);
         let authorized = match self
-            .authorize_low("create_backup", &guest_args, &context)
+            .authorize_low_with_interrupts("create_backup", &guest_args, &context, Some(interrupts))
             .await
         {
             Ok(authorized) => authorized,
@@ -2753,11 +2837,26 @@ impl ProxmoxServer {
         };
         let guest = authorized.guest();
 
+        let client = match self.client_for(&args.cluster) {
+            Ok(client) => client,
+            Err(result) => return *result,
+        };
+
+        // Direct-commit tools run immediately with no change-set approval.
+        // Gated unconditionally, not only when `mode: "stop"` interrupts the
+        // guest: every mode is in the issue's named scope.
+        let caller = Self::caller(&context);
+        if let Err(result) = self.gate_direct_commit(
+            caller.as_ref(),
+            "create_backup",
+            "backup",
+            &guest.vmid.to_string(),
+        ) {
+            return *result;
+        }
+
         let upid = match rust_proxmoxmcp_core::guests::create_backup(
-            match self.client_for(&args.cluster) {
-                Ok(client) => client,
-                Err(result) => return *result,
-            },
+            client,
             &guest.node,
             guest.vmid,
             &args.storage,
@@ -2777,7 +2876,7 @@ impl ProxmoxServer {
             vmid = guest.vmid,
             node = %guest.node,
             tier = "low",
-            interrupts = false,
+            interrupts = interrupts,
             protection = %authorized.protection().summary(),
             storage = %args.storage,
             mode = %args.mode,
@@ -2845,6 +2944,17 @@ impl ProxmoxServer {
                 "vmid {} is a protected pin in cluster {}; a clone may not claim it",
                 args.newid, args.cluster
             ));
+        }
+
+        // Direct-commit tools run immediately with no change-set approval.
+        let caller = Self::caller(&context);
+        if let Err(result) = self.gate_direct_commit(
+            caller.as_ref(),
+            "clone_vm",
+            "clone",
+            &args.newid.to_string(),
+        ) {
+            return *result;
         }
 
         let guest = authorized.guest();
@@ -2925,6 +3035,14 @@ impl ProxmoxServer {
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();
+
+        // Direct-commit tools run immediately with no change-set approval.
+        let caller = Self::caller(&context);
+        if let Err(result) =
+            self.gate_direct_commit(caller.as_ref(), tool, "create", &args.vmid.to_string())
+        {
+            return *result;
+        }
 
         let upid = match rust_proxmoxmcp_core::guests::create_guest(
             client, &args.node, kind, args.vmid, &config,
@@ -3388,6 +3506,17 @@ impl ProxmoxServer {
             Err(result) => return *result,
         };
         let guest = authorized.guest();
+
+        // Direct-commit tools run immediately with no change-set approval.
+        let caller = Self::caller(&context);
+        if let Err(result) = self.gate_direct_commit(
+            caller.as_ref(),
+            "resize_disk",
+            "resize",
+            &guest.vmid.to_string(),
+        ) {
+            return *result;
+        }
 
         let upid = match rust_proxmoxmcp_core::guests::resize_disk(
             client,
