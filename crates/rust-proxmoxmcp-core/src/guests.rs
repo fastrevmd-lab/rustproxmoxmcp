@@ -1053,6 +1053,50 @@ pub async fn update_container_resources(
     client.put_form(path_template, params, &form).await
 }
 
+/// Update a QEMU guest's config and return the UPID.
+///
+/// `config` carries whatever Proxmox config keys the caller wants set,
+/// including cloud-init fields (`ciuser`, `cipassword`, `sshkeys`,
+/// `ipconfigN`, ...): Proxmox has no separate cloud-init endpoint, those are
+/// ordinary keys on this same `/config` object, so there is no vendor seam
+/// for this function to model separately. The caller (the change-set apply
+/// handler) is responsible for having refused any key outside the tool's
+/// mandate before this is reached — this function forwards the map as given.
+///
+/// Posted rather than PUT, unlike [`update_container_resources`]: Proxmox's
+/// POST to this endpoint performs the update asynchronously and answers with
+/// a UPID, which lets this reuse the same task-polling path every other
+/// destructive apply already has, instead of a second synchronous-vs-async
+/// branch existing only for this one operation.
+///
+/// # Errors
+///
+/// As [`destroy_container`].
+pub async fn update_vm_config(
+    client: &ProxmoxClient,
+    node: &str,
+    vmid: u32,
+    config: &std::collections::BTreeMap<String, String>,
+) -> Result<String, ProxmoxError> {
+    let path_template = "/api2/json/nodes/{node}/qemu/{vmid}/config";
+    let vmid_string = vmid.to_string();
+    let params = &[("node", node), ("vmid", vmid_string.as_str())];
+
+    if config.is_empty() {
+        return Err(ProxmoxError::Malformed(
+            "no config fields given: set at least one key".into(),
+        ));
+    }
+
+    let form: Vec<(&str, &str)> = config
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+
+    let data = client.post_form(path_template, params, &form).await?;
+    upid_from(data)
+}
+
 /// Whether interrupting this task leaves the guest in a partial state.
 ///
 /// A UPID carries its worker type: `UPID:node:pid:pstart:starttime:TYPE:id:user:`.

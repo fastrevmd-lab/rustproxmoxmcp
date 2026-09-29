@@ -48,8 +48,8 @@ fn spec(tools: &[&str], guests: &[&str]) -> common::TokenSpec {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_narrowed_token_may_not_list_storage_content() {
     for tool in ["list_backups", "list_isos", "list_templates"] {
-        let h = common::TestServer::start_with_routes(spec(&[tool], &["vmid:600-699"]), routes())
-            .await;
+        let h =
+            common::TestServer::start_with_routes(spec(&[tool], &["vmid:600-699"]), routes()).await;
 
         let err = common::call(
             &h,
@@ -57,7 +57,9 @@ async fn a_narrowed_token_may_not_list_storage_content() {
             json!({"cluster":"pve3","node":"pve2","storage":"local"}),
         )
         .await
-        .expect_err(&format!("{tool}: a guest-scoped token must not reach storage"));
+        .expect_err(&format!(
+            "{tool}: a guest-scoped token must not reach storage"
+        ));
         assert!(
             err.contains('*'),
             "{tool}: the refusal must name the required scope: {err}"
@@ -67,7 +69,10 @@ async fn a_narrowed_token_may_not_list_storage_content() {
             .requests()
             .into_iter()
             .any(|r| r.path.ends_with("/storage/local/content"));
-        assert!(!reached_storage, "{tool}: the request must not reach Proxmox");
+        assert!(
+            !reached_storage,
+            "{tool}: the request must not reach Proxmox"
+        );
     }
 }
 
@@ -101,10 +106,7 @@ async fn a_narrowed_token_may_not_list_tasks() {
         .expect_err("a guest-scoped token must not list a node's tasks");
     assert!(err.contains('*'), "{err}");
 
-    let reached_tasks = h
-        .requests()
-        .into_iter()
-        .any(|r| r.path.ends_with("/tasks"));
+    let reached_tasks = h.requests().into_iter().any(|r| r.path.ends_with("/tasks"));
     assert!(!reached_tasks, "the request must not reach Proxmox");
 }
 

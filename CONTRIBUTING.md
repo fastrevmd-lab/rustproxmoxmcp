@@ -1,6 +1,6 @@
 # Contributing to rustproxmoxmcp
 
-Thanks for considering a contribution. rustproxmoxmcp is a Rust MCP server that fronts many Proxmox VE clusters behind one process — part of the [mechub](https://github.com/fastrevmd-lab) family of open-source, self-hosted network-security automation tooling. See [README.md](README.md) for what the server does.
+Thanks for considering a contribution. rustproxmoxmcp is a Rust MCP server that fronts many Proxmox VE clusters behind one process — part of the [mechub](https://github.com/mechubsec) family of open-source, self-hosted network-security automation tooling. See [README.md](README.md) for what the server does.
 
 ## Before you start
 

@@ -63,6 +63,13 @@ pub struct TestServer {
     /// A third bearer token carrying `actor_type: Agent`, for tests that
     /// prove an agent cannot stand in as the human approver.
     pub agent_token: String,
+    /// A fourth token with the same clusters/tools as `token`, but scoped to
+    /// vmid 1 only -- outside any guest a fixture test actually uses. For
+    /// proving a guest-scope check is repeated at apply time rather than
+    /// only at plan time: plan and approve with `token`, then apply with
+    /// this one, and the apply must refuse it even though it carries every
+    /// tool scope `token` does.
+    pub narrow_token: String,
     /// The mock Proxmox server.
     mock: TlsMockServer,
     /// Guest index for cache invalidation in tests.
@@ -152,6 +159,29 @@ impl TestServer {
         .await
     }
 
+    /// As [`Self::start_with_routes`], with `--allow-direct-commit` set
+    /// according to `allow_direct_commit` rather than left off.
+    ///
+    /// For the direct-commit gate tests, which need to prove both that the
+    /// gate refuses by default and that it steps aside when the operator has
+    /// explicitly accepted the risk.
+    pub async fn start_with_direct_commit(
+        spec: TokenSpec,
+        routes: Vec<Route>,
+        allow_direct_commit: bool,
+    ) -> Self {
+        Self::start_with_config_on_state_and_limits_and_direct_commit(
+            spec,
+            routes,
+            Arc::new(rust_proxmoxmcp_core::waiver::WaiverFile::empty()),
+            false,
+            None,
+            LimitsConfig::default(),
+            mecmcp_audit::DirectCommitPolicy::new(allow_direct_commit),
+        )
+        .await
+    }
+
     /// As [`Self::start_with_config_on_state`], with the request limits also
     /// caller-supplied instead of hardcoded to [`LimitsConfig::default`].
     pub async fn start_with_config_on_state_and_limits(
@@ -161,6 +191,30 @@ impl TestServer {
         lab_mode: bool,
         state_path: Option<std::path::PathBuf>,
         limits: LimitsConfig,
+    ) -> Self {
+        Self::start_with_config_on_state_and_limits_and_direct_commit(
+            spec,
+            routes,
+            waivers,
+            lab_mode,
+            state_path,
+            limits,
+            mecmcp_audit::DirectCommitPolicy::new(false),
+        )
+        .await
+    }
+
+    /// As [`Self::start_with_config_on_state_and_limits`], with
+    /// `--allow-direct-commit` also caller-supplied instead of hardcoded off.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_config_on_state_and_limits_and_direct_commit(
+        spec: TokenSpec,
+        routes: Vec<Route>,
+        waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
+        lab_mode: bool,
+        state_path: Option<std::path::PathBuf>,
+        limits: LimitsConfig,
+        direct_commit: mecmcp_audit::DirectCommitPolicy,
     ) -> Self {
         // Install crypto provider once for the test binary.
         ensure_crypto_provider();
@@ -279,6 +333,31 @@ impl TestServer {
         )
         .expect("mint agent-actor-type token");
 
+        // A fourth token, same clusters/tools as `token` but scoped to a
+        // guest no fixture test targets. See the `narrow_token` field doc.
+        let narrow_grant = ProxmoxGrant {
+            guests: vec!["vmid:1-1".to_owned()],
+            actions: vec![
+                ProxmoxAction::Read,
+                ProxmoxAction::Low,
+                ProxmoxAction::Destructive,
+            ],
+        };
+        let narrow_plaintext = TokenStoreFile::<ProxmoxGrant>::add_with_options(
+            &tokens_path,
+            "test-token-narrow",
+            parse_scope(&spec.clusters),
+            parse_scope(&spec.tools),
+            None,
+            Some(narrow_grant),
+            None,
+            None,
+            None,
+            None,
+            &known,
+        )
+        .expect("mint narrow-scoped token");
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -311,6 +390,7 @@ impl TestServer {
             waivers,
             lab_mode,
             None,
+            direct_commit,
             state_path.as_deref(),
         )
         .expect("build server");
@@ -339,6 +419,7 @@ impl TestServer {
             token: plaintext.expose_secret().to_owned(),
             second_token: second_plaintext.expose_secret().to_owned(),
             agent_token: agent_plaintext.expose_secret().to_owned(),
+            narrow_token: narrow_plaintext.expose_secret().to_owned(),
             mock,
             index,
             _temp_dir: temp_dir,
