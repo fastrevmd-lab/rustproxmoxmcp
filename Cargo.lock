@@ -1569,7 +1569,7 @@ dependencies = [
 [[package]]
 name = "mecmcp-redact"
 version = "0.24.1"
-source = "git+https://github.com/fastrevmd-lab/mecmcp?rev=ff32a5a30956823bb4c7a928b556b6c821af3005#ff32a5a30956823bb4c7a928b556b6c821af3005"
+source = "git+https://github.com/fastrevmd-lab/mecmcp?rev=2e157e0f09894e2a5309408523c0911425eebd20#2e157e0f09894e2a5309408523c0911425eebd20"
 dependencies = [
  "hmac",
  "quick-xml",

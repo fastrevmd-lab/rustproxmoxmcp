@@ -31,6 +31,24 @@ fn secret_bearing_description() -> String {
 const EMPTY_ARRAY: &[u8] = br#"{"data":[]}"#;
 const EMPTY_OBJECT: &[u8] = br#"{"data":{}}"#;
 
+/// Serialize `data` as a Proxmox `{"data": ...}` envelope and leak it to get
+/// a `'static` body for a [`Route`]. The mock server never frees routes, so
+/// this matches the existing pattern for the guest-config fixtures below
+/// rather than adding a new lifetime story.
+fn leaked_data(data: serde_json::Value) -> &'static [u8] {
+    let body = serde_json::json!({ "data": data }).to_string();
+    Box::leak(body.into_boxed_str()).as_bytes()
+}
+
+/// A one-element array whose single object carries `key: FAKE_SECRET` in a
+/// free-text field, used for every list-shaped fixture below (snapshots,
+/// backups, firewall rules/aliases/ipsets/groups) so the sweep test can
+/// prove each of those response shapes gets redacted too, not just guest
+/// config.
+fn secret_bearing_list(extra: serde_json::Value) -> &'static [u8] {
+    leaked_data(serde_json::Value::Array(vec![extra]))
+}
+
 /// Routes for a mock Proxmox with one QEMU guest (905) and one LXC guest
 /// (617) on node `pve2`, each carrying a `description` with an embedded fake
 /// secret and a `cicustom` cloud-init snippet reference (never itself
@@ -109,12 +127,12 @@ fn routes_with_embedded_secret() -> Vec<Route> {
         Route {
             path: "/api2/json/nodes/pve2/qemu/905/snapshot",
             status: 200,
-            body: EMPTY_ARRAY,
+            body: secret_bearing_list(serde_json::json!({"name": "pre-upgrade", "description": description.clone()})),
         },
         Route {
             path: "/api2/json/nodes/pve2/lxc/617/snapshot",
             status: 200,
-            body: EMPTY_ARRAY,
+            body: secret_bearing_list(serde_json::json!({"name": "pre-upgrade", "description": description.clone()})),
         },
         Route {
             path: "/api2/json/nodes/pve2/lxc/617/interfaces",
@@ -129,7 +147,7 @@ fn routes_with_embedded_secret() -> Vec<Route> {
         Route {
             path: "/api2/json/nodes/pve2/storage/local/content",
             status: 200,
-            body: EMPTY_ARRAY,
+            body: secret_bearing_list(serde_json::json!({"volid": "local:backup/vzdump-qemu-905.vma.zst", "content": "backup", "notes": description.clone()})),
         },
         Route {
             path: "/api2/json/nodes/pve2/tasks",
@@ -144,7 +162,7 @@ fn routes_with_embedded_secret() -> Vec<Route> {
         Route {
             path: "/api2/json/cluster/firewall/rules",
             status: 200,
-            body: EMPTY_ARRAY,
+            body: secret_bearing_list(serde_json::json!({"pos": 0, "action": "ACCEPT", "type": "in", "comment": description.clone()})),
         },
         Route {
             path: "/api2/json/cluster/firewall/options",
@@ -154,32 +172,32 @@ fn routes_with_embedded_secret() -> Vec<Route> {
         Route {
             path: "/api2/json/cluster/firewall/groups",
             status: 200,
-            body: EMPTY_ARRAY,
+            body: secret_bearing_list(serde_json::json!({"group": "test-group", "comment": description.clone()})),
         },
         Route {
             path: "/api2/json/cluster/firewall/groups/test-group",
             status: 200,
-            body: EMPTY_ARRAY,
+            body: secret_bearing_list(serde_json::json!({"pos": 0, "action": "ACCEPT", "type": "in", "comment": description.clone()})),
         },
         Route {
             path: "/api2/json/cluster/firewall/ipset",
             status: 200,
-            body: EMPTY_ARRAY,
+            body: secret_bearing_list(serde_json::json!({"name": "test-ipset", "comment": description.clone()})),
         },
         Route {
             path: "/api2/json/cluster/firewall/ipset/test-ipset",
             status: 200,
-            body: EMPTY_ARRAY,
+            body: secret_bearing_list(serde_json::json!({"cidr": "192.0.2.0/24", "comment": description.clone()})),
         },
         Route {
             path: "/api2/json/cluster/firewall/aliases",
             status: 200,
-            body: EMPTY_ARRAY,
+            body: secret_bearing_list(serde_json::json!({"name": "test-alias", "cidr": "192.0.2.0/24", "comment": description.clone()})),
         },
         Route {
             path: "/api2/json/nodes/pve2/firewall/rules",
             status: 200,
-            body: EMPTY_ARRAY,
+            body: secret_bearing_list(serde_json::json!({"pos": 0, "action": "ACCEPT", "type": "in", "comment": description.clone()})),
         },
         Route {
             path: "/api2/json/nodes/pve2/firewall/options",
@@ -189,12 +207,12 @@ fn routes_with_embedded_secret() -> Vec<Route> {
         Route {
             path: "/api2/json/nodes/pve2/qemu/905/firewall/rules",
             status: 200,
-            body: EMPTY_ARRAY,
+            body: secret_bearing_list(serde_json::json!({"pos": 0, "action": "ACCEPT", "type": "in", "comment": description.clone()})),
         },
         Route {
             path: "/api2/json/nodes/pve2/lxc/617/firewall/rules",
             status: 200,
-            body: EMPTY_ARRAY,
+            body: secret_bearing_list(serde_json::json!({"pos": 0, "action": "ACCEPT", "type": "in", "comment": description.clone()})),
         },
         Route {
             path: "/api2/json/nodes/pve2/qemu/905/firewall/options",
@@ -209,32 +227,32 @@ fn routes_with_embedded_secret() -> Vec<Route> {
         Route {
             path: "/api2/json/nodes/pve2/qemu/905/firewall/aliases",
             status: 200,
-            body: EMPTY_ARRAY,
+            body: secret_bearing_list(serde_json::json!({"name": "test-alias", "cidr": "192.0.2.0/24", "comment": description.clone()})),
         },
         Route {
             path: "/api2/json/nodes/pve2/lxc/617/firewall/aliases",
             status: 200,
-            body: EMPTY_ARRAY,
+            body: secret_bearing_list(serde_json::json!({"name": "test-alias", "cidr": "192.0.2.0/24", "comment": description.clone()})),
         },
         Route {
             path: "/api2/json/nodes/pve2/qemu/905/firewall/ipset",
             status: 200,
-            body: EMPTY_ARRAY,
+            body: secret_bearing_list(serde_json::json!({"name": "test-ipset", "comment": description.clone()})),
         },
         Route {
             path: "/api2/json/nodes/pve2/lxc/617/firewall/ipset",
             status: 200,
-            body: EMPTY_ARRAY,
+            body: secret_bearing_list(serde_json::json!({"name": "test-ipset", "comment": description.clone()})),
         },
         Route {
             path: "/api2/json/nodes/pve2/qemu/905/firewall/ipset/test-ipset",
             status: 200,
-            body: EMPTY_ARRAY,
+            body: secret_bearing_list(serde_json::json!({"cidr": "192.0.2.0/24", "comment": description.clone()})),
         },
         Route {
             path: "/api2/json/nodes/pve2/lxc/617/firewall/ipset/test-ipset",
             status: 200,
-            body: EMPTY_ARRAY,
+            body: secret_bearing_list(serde_json::json!({"cidr": "192.0.2.0/24", "comment": description.clone()})),
         },
     ]
 }
@@ -307,13 +325,28 @@ async fn get_container_config_redacts_description_and_cicustom() {
 /// maintains by hand.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_read_tool_leaks_the_fake_secret() {
-    let harness = common::TestServer::start_with_routes(
+    // The sweep below drives ~120 calls (60 catalog tools x 2 guests) back
+    // to back on one token, which is exactly what the production per-token
+    // rate limit (`LimitsConfig::default()`: burst 40, 20 req/s) exists to
+    // throttle. That is correct behaviour for a real client; it also means
+    // the default limit would report most of this sweep as a transport
+    // error rather than exercising the handler, so this test raises the
+    // limit instead of disabling redaction coverage.
+    let limits = mecmcp_transport::LimitsConfig {
+        max_requests_per_second_per_token: 1000,
+        max_request_burst_per_token: 1000,
+        max_requests_per_second_per_ip: 1000,
+        max_request_burst_per_ip: 1000,
+        ..mecmcp_transport::LimitsConfig::default()
+    };
+    let harness = common::TestServer::start_with_limits(
         common::TokenSpec::full(),
         routes_with_embedded_secret(),
+        limits,
     )
     .await;
 
-    let tool_names: Vec<&str> = rust_proxmoxmcp_core::catalog::READ_TOOLS
+    let tool_names: Vec<&'static str> = rust_proxmoxmcp_core::catalog::READ_TOOLS
         .iter()
         .map(|tool| tool.name)
         .collect();
@@ -322,8 +355,16 @@ async fn no_read_tool_leaks_the_fake_secret() {
         "the catalog must not be empty, or this sweep proves nothing"
     );
 
-    for vmid in [905u32, 617] {
-        for &tool in &tool_names {
+    // (vmid, tool) pairs to call, in a fixed order so results can be zipped
+    // back up after the sweep runs.
+    let plan: Vec<(u32, &'static str)> = [905u32, 617]
+        .into_iter()
+        .flat_map(|vmid| tool_names.iter().map(move |&tool| (vmid, tool)))
+        .collect();
+
+    let calls: Vec<(&'static str, serde_json::Value)> = plan
+        .iter()
+        .map(|&(vmid, tool)| {
             // A superset of every field any read tool's argument struct
             // names. None of the read-argument structs deny unknown fields
             // (only the write ones do), so passing all of them to every
@@ -338,16 +379,47 @@ async fn no_read_tool_leaks_the_fake_secret() {
                 "name": "test-ipset",
                 "upid": "fake-upid-1",
             });
+            (tool, args)
+        })
+        .collect();
 
-            let outcome = common::call(&harness, tool, args).await;
-            let rendered = match outcome {
-                Ok(value) => value.to_string(),
-                Err(message) => message,
-            };
-            assert!(
-                !rendered.contains(FAKE_SECRET),
-                "tool '{tool}' (vmid {vmid}) leaked the fake secret: {rendered}"
-            );
-        }
+    // One MCP session for the whole sweep (120 calls: 60 tools x 2 guests).
+    // The first cut of this test opened a fresh session per call, which
+    // tripped the per-IP rate limiter after ~15 `initialize`s -- every call
+    // past that point returned a transport error that the test treated as
+    // "no leak found", so roughly three quarters of the catalog was never
+    // actually exercised.
+    let results = common::call_many_on_one_session(&harness, &harness.token, calls)
+        .await
+        .expect("session for the sweep should establish");
+    assert_eq!(
+        results.len(),
+        plan.len(),
+        "sweep must return one result per planned call"
+    );
+
+    for ((vmid, tool), outcome) in plan.into_iter().zip(results) {
+        let rendered = match outcome {
+            Ok(value) => value.to_string(),
+            Err(message) => {
+                // A transport-level failure (session drop, rate limit, a
+                // connection error) means this call never reached a
+                // handler, so it proves nothing about redaction -- unlike a
+                // tool-level error (bad vmid/guest-type mismatch, unknown
+                // parameter), which is real, redacted output and belongs in
+                // the leak check below.
+                assert!(
+                    !message.starts_with("initialize:")
+                        && !message.starts_with("call:")
+                        && !message.starts_with("spawn_blocking:"),
+                    "tool '{tool}' (vmid {vmid}) never reached a handler: {message}"
+                );
+                message
+            }
+        };
+        assert!(
+            !rendered.contains(FAKE_SECRET),
+            "tool '{tool}' (vmid {vmid}) leaked the fake secret: {rendered}"
+        );
     }
 }

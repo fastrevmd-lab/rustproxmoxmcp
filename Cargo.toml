@@ -67,9 +67,12 @@ mecmcp-transport = { version = "0.24.1", git = "https://github.com/fastrevmd-lab
 # still the newest tag). Every other mecmcp-* crate above pins a tag; this one
 # pins the exact commit that finished the crate's trust-boundary review
 # (Untrusted<T> delimiter-forgery fix) instead, since there is no tag to point
-# at. Swap this to `tag = "vX.Y.Z"` once mecmcp cuts a release that includes
-# the crate, so it matches the pinning discipline of the rest of this block.
-mecmcp-redact    = { version = "0.24.1", git = "https://github.com/fastrevmd-lab/mecmcp", rev = "ff32a5a30956823bb4c7a928b556b6c821af3005" }
+# at. This rev must resolve on a branch or tag, not just exist as a loose
+# object — an unreferenced commit can be garbage-collected upstream and break
+# this build. Swap this to `tag = "vX.Y.Z"` once mecmcp cuts a release that
+# includes the crate, so it matches the pinning discipline of the rest of
+# this block.
+mecmcp-redact    = { version = "0.24.1", git = "https://github.com/fastrevmd-lab/mecmcp", rev = "2e157e0f09894e2a5309408523c0911425eebd20" }
 
 [profile.release]
 lto           = "thin"
