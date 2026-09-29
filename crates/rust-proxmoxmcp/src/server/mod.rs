@@ -453,14 +453,24 @@ const RESULT_LIMITS: ResultLimits = ResultLimits {
 
 /// Records returned by a paginated list tool when `limit` is omitted.
 ///
-/// MEC-479: `get_vms`/`get_containers`, `list_tasks` and `list_backups` have
-/// no server-side page size of their own -- Proxmox's `/cluster/resources`
-/// and storage `content` endpoints don't take `start`/`limit`, so this
-/// executor fetches the full upstream array and pages it here rather than
-/// pushing pagination down per-endpoint (which would give the one generic
+/// MEC-479: `get_vms`/`get_containers` and `list_backups` have no
+/// server-side page size of their own -- Proxmox's `/cluster/resources` and
+/// storage `content` endpoints don't take `start`/`limit`, so this executor
+/// fetches the full upstream array and pages it here rather than pushing
+/// pagination down per-endpoint (which would give the one generic
 /// `serve_read` two different behaviors for no real gain, since fetching the
 /// full array is what `MAX_RESPONSE_BYTES` already tolerates -- the binding
 /// constraint is the *result* cap below, not the upstream fetch).
+///
+/// `list_tasks` is deliberately not in this list: `/nodes/{node}/tasks` *is*
+/// server-side windowed by Proxmox (a few hundred most recent, by default),
+/// with no way for this client to learn the true total. A client-side
+/// pagination envelope on top of that window would report `has_more: false`
+/// once Proxmox's own cutoff is reached, claiming a complete task history
+/// that silently drops everything Proxmox already dropped. `list_tasks`
+/// stays a bare array (MEC-871, from Percy's review of MEC-479's PR); pushing
+/// real `start`/`limit` down to Proxmox for this endpoint is tracked as a
+/// separate follow-up.
 ///
 /// At ~540 bytes per pretty-printed `get_vms` record (MEC-456's lab
 /// measurement), 500 records is ~270 KB, leaving headroom under
@@ -516,6 +526,43 @@ struct Page {
     has_more: bool,
 }
 
+/// Sort a page-bound array by a stable per-record key, so a record's
+/// position (and therefore which page it lands on) doesn't depend on
+/// Proxmox's undocumented, unstable array order.
+///
+/// Without this, a guest created, destroyed or migrated between two
+/// `offset` calls -- or a backup pruned by vzdump -- can shift the window
+/// and skip or duplicate a record across pages with no sign to the caller
+/// (MEC-871, finding 2). Sorting cannot fix a record deleted between page
+/// calls; it only stops *reordering* from causing skips.
+///
+/// Dispatches on which key field the first record carries: `vmid` for
+/// `get_vms`/`get_containers`, `volid` for `list_backups`. Records missing
+/// the key sort last rather than panicking on a shape this code doesn't
+/// expect.
+fn sort_for_paging(array: &mut [serde_json::Value]) {
+    let Some(first) = array.first() else {
+        return;
+    };
+    if first.get("vmid").is_some() {
+        array.sort_by_key(|item| {
+            item.get("vmid")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::MAX)
+        });
+    } else if first.get("volid").is_some() {
+        array.sort_by(|a, b| {
+            let key = |v: &serde_json::Value| {
+                v.get("volid")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            key(a).cmp(&key(b))
+        });
+    }
+}
+
 /// Slice a filtered upstream array into one page.
 ///
 /// # Errors
@@ -528,11 +575,12 @@ fn paginate(
     offset: u32,
     limit: u32,
 ) -> Result<Page, Box<CallToolResult>> {
-    let Some(array) = value.as_array() else {
+    let Some(mut array) = value.as_array().cloned() else {
         return Err(Box::new(tool_error(
             "upstream response is not a list; cannot paginate",
         )));
     };
+    sort_for_paging(&mut array);
     let total = array.len();
     let start = (offset as usize).min(total);
     let end = start.saturating_add(limit as usize).min(total);
@@ -639,27 +687,6 @@ pub struct NodeArgs {
 pub struct PagedClusterArgs {
     /// Inventory name of the cluster.
     pub cluster: String,
-    /// Zero-based index of the first record to return. Defaults to 0.
-    #[serde(default)]
-    pub offset: Option<u32>,
-    /// Maximum records to return. Defaults to 500, capped at 700 so a
-    /// pretty-printed page stays comfortably under the MCP result's 512 KiB
-    /// limit.
-    #[serde(default)]
-    pub limit: Option<u32>,
-}
-
-/// Arguments for a node-scoped, paginated read.
-///
-/// Kept separate from [`NodeArgs`] for the same reason as
-/// [`PagedClusterArgs`]: `get_node_status` and `get_storage` return a handful
-/// of records and should not carry unused pagination parameters.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct PagedNodeArgs {
-    /// Inventory name of the cluster.
-    pub cluster: String,
-    /// Node name as reported by `get_nodes`.
-    pub node: String,
     /// Zero-based index of the first record to return. Defaults to 0.
     #[serde(default)]
     pub offset: Option<u32>,
@@ -2486,25 +2513,23 @@ impl ProxmoxServer {
 
     #[tool(
         name = "list_tasks",
-        description = "Recent tasks on one node. Paginated: returns up to `limit` (default \
-                       500, max 700) starting at `offset` (default 0), plus `total` and \
-                       `has_more` to page through the rest."
+        description = "Recent tasks on one node. Not paginated: Proxmox's \
+                       `/nodes/{node}/tasks` endpoint applies its own server-side \
+                       default (typically the 50 most recent) and this tool does not \
+                       send `start`/`limit`, so a full page here is Proxmox's default \
+                       window, not a complete history."
     )]
     async fn list_tasks(
         &self,
-        Parameters(args): Parameters<PagedNodeArgs>,
+        Parameters(args): Parameters<NodeArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        let page = match resolve_page(args.offset, args.limit) {
-            Ok(page) => page,
-            Err(error) => return *error,
-        };
         self.serve_read(
             "list_tasks",
             &args.cluster,
             &[("node", args.node.as_str())],
             None,
-            Some(page),
+            None,
             &context,
         )
         .await

@@ -13,10 +13,16 @@
 //! style). MEC-456 found that a legitimate list call stopped working
 //! outright at realistic cluster sizes, with no way to retry at a smaller
 //! page. MEC-479 added client-side offset/limit pagination to `get_vms`,
-//! `get_containers`, `list_tasks` and `list_backups`, sized (500 default,
-//! 700 max) so a full page stays under the 512 KiB cap -- these tests now
-//! prove a cluster too large for one page still returns every record, across
-//! as many `offset` pages as it takes, rather than refusing outright.
+//! `get_containers` and `list_backups`, sized (500 default, 700 max) so a
+//! full page stays under the 512 KiB cap -- these tests now prove a cluster
+//! too large for one page still returns every record, across as many
+//! `offset` pages as it takes, rather than refusing outright.
+//!
+//! `list_tasks` is deliberately excluded (MEC-871): Proxmox's
+//! `/nodes/{node}/tasks` is itself server-side windowed with no `total` this
+//! client can learn, so a client-side pagination envelope on top of it would
+//! report a complete list that is actually truncated by Proxmox's own
+//! default. See `list_tasks_stays_a_bare_unpaginated_array` below.
 //!
 //! Each generator below mirrors the real Proxmox field set for its endpoint
 //! (`/cluster/resources`, `/nodes/{node}/tasks`,
@@ -225,50 +231,41 @@ async fn get_vms_refuses_a_limit_above_the_page_ceiling() {
     );
 }
 
-/// Same shape of fix for `list_tasks` -- the other list tool with no
-/// server-side page size, now paginated client-side per MEC-479.
+/// `list_tasks` is *not* paginated (MEC-871, reversing MEC-479's original
+/// treatment): Proxmox's `/nodes/{node}/tasks` applies its own server-side
+/// window, so this client has no way to learn the true total, and a
+/// pagination envelope on top of an already-truncated upstream list would
+/// report `has_more: false` on a list that silently dropped everything past
+/// Proxmox's own cutoff. This fixture mimics that cutoff directly: the mock
+/// route returns only 50 tasks (Proxmox's typical default) regardless of
+/// how many exist, and `list_tasks` must hand that back as a bare array with
+/// no `offset`/`limit`/`has_more` envelope -- an `offset` argument is simply
+/// unknown to the tool's schema.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn list_tasks_pages_through_a_node_that_would_exceed_the_result_cap() {
+async fn list_tasks_stays_a_bare_unpaginated_array() {
     let route = leak_route(
         "/api2/json/nodes/pve-node01/tasks".to_owned(),
-        json_array_body((0..2_500u32).map(task_json)),
+        json_array_body((0..50u32).map(task_json)),
     );
     let server = TestServer::start_with_routes(TokenSpec::full(), vec![NODES_ROUTE, route]).await;
 
-    let mut seen = std::collections::HashSet::new();
-    let mut offset = 0u32;
-    loop {
-        let (is_error, text) = call(
-            &server,
-            "list_tasks",
-            serde_json::json!({ "cluster": "pve3", "node": "pve-node01", "offset": offset }),
-        )
-        .await;
-        assert!(!is_error, "page at offset {offset} should succeed: {text}");
-
-        // Count via substring rather than parsing the escaped MCP envelope:
-        // each task fixture's `id` is unique, so counting matches is an exact
-        // page census.
-        for n in 0..2_500u32 {
-            if text.contains(&format!("\\\"id\\\": \\\"{n}\\\"")) {
-                seen.insert(n);
-            }
-        }
-
-        let has_more = text.contains(r#"\"has_more\": true"#);
-        if !has_more {
-            break;
-        }
-        offset += 500;
-        assert!(offset <= 3_000, "pagination should terminate: {text}");
-    }
-
-    assert_eq!(
-        seen.len(),
-        2_500,
-        "every task should be recovered across pages, got {} of 2,500",
-        seen.len()
+    let (is_error, text) = call(
+        &server,
+        "list_tasks",
+        serde_json::json!({ "cluster": "pve3", "node": "pve-node01" }),
+    )
+    .await;
+    assert!(!is_error, "list_tasks should succeed: {text}");
+    assert!(
+        !text.contains("has_more") && !text.contains(r#"\"total\":"#),
+        "list_tasks must stay a bare array, not a pagination envelope: {text}"
     );
+    for n in 0..50u32 {
+        assert!(
+            text.contains(&format!("\\\"id\\\": \\\"{n}\\\"")),
+            "task {n} missing from the unpaginated response: {text}"
+        );
+    }
 }
 
 /// Same shape of fix for `list_backups` -- a storage backend holding a
