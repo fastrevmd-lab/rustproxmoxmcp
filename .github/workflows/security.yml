@@ -18,6 +18,8 @@ jobs:
   # license needed, unlike gitleaks-action on org repos).
   secrets:
     uses: mechubsec/.github/.github/workflows/gitleaks.yml@fb1a159c596bf2c57b9f6f1ff99f546463a6a84a
+    with:
+      full-history: true
 
   cargo:
     name: cargo-audit + cargo-deny
