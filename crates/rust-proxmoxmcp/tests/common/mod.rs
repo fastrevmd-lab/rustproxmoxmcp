@@ -159,6 +159,29 @@ impl TestServer {
         .await
     }
 
+    /// As [`Self::start_with_routes`], with `--allow-direct-commit` set
+    /// according to `allow_direct_commit` rather than left off.
+    ///
+    /// For the direct-commit gate tests, which need to prove both that the
+    /// gate refuses by default and that it steps aside when the operator has
+    /// explicitly accepted the risk.
+    pub async fn start_with_direct_commit(
+        spec: TokenSpec,
+        routes: Vec<Route>,
+        allow_direct_commit: bool,
+    ) -> Self {
+        Self::start_with_config_on_state_and_limits_and_direct_commit(
+            spec,
+            routes,
+            Arc::new(rust_proxmoxmcp_core::waiver::WaiverFile::empty()),
+            false,
+            None,
+            LimitsConfig::default(),
+            mecmcp_audit::DirectCommitPolicy::new(allow_direct_commit),
+        )
+        .await
+    }
+
     /// As [`Self::start_with_config_on_state`], with the request limits also
     /// caller-supplied instead of hardcoded to [`LimitsConfig::default`].
     pub async fn start_with_config_on_state_and_limits(
@@ -168,6 +191,30 @@ impl TestServer {
         lab_mode: bool,
         state_path: Option<std::path::PathBuf>,
         limits: LimitsConfig,
+    ) -> Self {
+        Self::start_with_config_on_state_and_limits_and_direct_commit(
+            spec,
+            routes,
+            waivers,
+            lab_mode,
+            state_path,
+            limits,
+            mecmcp_audit::DirectCommitPolicy::new(false),
+        )
+        .await
+    }
+
+    /// As [`Self::start_with_config_on_state_and_limits`], with
+    /// `--allow-direct-commit` also caller-supplied instead of hardcoded off.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_config_on_state_and_limits_and_direct_commit(
+        spec: TokenSpec,
+        routes: Vec<Route>,
+        waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
+        lab_mode: bool,
+        state_path: Option<std::path::PathBuf>,
+        limits: LimitsConfig,
+        direct_commit: mecmcp_audit::DirectCommitPolicy,
     ) -> Self {
         // Install crypto provider once for the test binary.
         ensure_crypto_provider();
@@ -343,6 +390,7 @@ impl TestServer {
             waivers,
             lab_mode,
             None,
+            direct_commit,
             state_path.as_deref(),
         )
         .expect("build server");
