@@ -34,6 +34,15 @@ pub struct ReadTool {
     ///
     /// Task 11's executor appends these as `?key=value` pairs to the request.
     pub query: &'static [(&'static str, &'static str)],
+    /// Whether this entry lists guests (reads `/cluster/resources` or an
+    /// equivalent multi-guest endpoint) and therefore must be filtered by
+    /// the caller's guest scope in `serve_read`.
+    ///
+    /// Kept separate from `type_filter` so a future catalog entry that lists
+    /// guests without a type filter cannot silently skip the scope filter --
+    /// see the catalog test that checks every `/cluster/resources` entry
+    /// sets this to `true`.
+    pub guest_listing: bool,
 }
 
 /// The complete 0.1 read surface.
@@ -45,6 +54,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: false,
         description: "Cluster quorum and node membership.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -54,6 +64,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: false,
         description: "All nodes in the cluster with status and resource totals.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -63,6 +74,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: false,
         description: "Detailed status for one node.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -72,6 +84,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: false,
         description: "All QEMU guests across the cluster, with node, status and tags.",
         type_filter: Some(GuestType::Qemu),
+        guest_listing: true,
         query: &[],
     },
     ReadTool {
@@ -81,6 +94,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: false,
         description: "All LXC guests across the cluster, with node, status and tags.",
         type_filter: Some(GuestType::Lxc),
+        guest_listing: true,
         query: &[],
     },
     ReadTool {
@@ -93,6 +107,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
                       basis (do not store secrets there); sshkeys and network \
                       config preserved.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -105,6 +120,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
                       basis (do not store secrets there); sshkeys and network \
                       config preserved.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     // LXC-only: the path hardcodes 'lxc'. Task 11's executor must refuse a QEMU
@@ -116,6 +132,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: true,
         description: "Network interfaces and addresses of one LXC guest.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -125,6 +142,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: true,
         description: "Current runtime status of one guest.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -134,6 +152,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: true,
         description: "Snapshots of one guest.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -143,6 +162,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: false,
         description: "Storage backends visible to one node, with usage.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -152,6 +172,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: false,
         description: "Backup archives on one storage backend.",
         type_filter: None,
+        guest_listing: false,
         query: &[("content", "backup")],
     },
     ReadTool {
@@ -161,6 +182,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: false,
         description: "ISO images on one storage backend.",
         type_filter: None,
+        guest_listing: false,
         query: &[("content", "iso")],
     },
     ReadTool {
@@ -170,6 +192,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: false,
         description: "Container templates on one storage backend.",
         type_filter: None,
+        guest_listing: false,
         query: &[("content", "vztmpl")],
     },
     ReadTool {
@@ -179,6 +202,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: false,
         description: "Recent tasks on one node.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -188,6 +212,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: false,
         description: "Status of one task by UPID.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -197,6 +222,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: false,
         description: "Cluster-wide firewall rules.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -206,6 +232,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: false,
         description: "Cluster-wide firewall options (enable flag, default in/out policy).",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -215,6 +242,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: false,
         description: "Firewall security groups defined on the cluster.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -224,6 +252,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: false,
         description: "Rules contained in one firewall security group.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -233,6 +262,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: false,
         description: "Cluster-wide IPSets.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -242,6 +272,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: false,
         description: "CIDR entries in one cluster-wide IPSet.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -251,6 +282,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: false,
         description: "Cluster-wide firewall address aliases.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -260,6 +292,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: false,
         description: "Firewall rules on one node.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -269,6 +302,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: false,
         description: "Firewall options on one node.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -278,6 +312,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: true,
         description: "Firewall rules of one guest.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -287,6 +322,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: true,
         description: "Firewall options of one guest.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -296,6 +332,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: true,
         description: "Firewall address aliases of one guest.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -305,6 +342,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: true,
         description: "IPSets defined on one guest.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -314,6 +352,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: true,
         description: "CIDR entries in one IPSet of one guest.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -324,6 +363,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         description: "All HA rules (node-affinity and resource-affinity) in the cluster. \
                        Not the deprecated HA groups mechanism.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
     ReadTool {
@@ -333,6 +373,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         needs_guest: false,
         description: "One HA rule by id.",
         type_filter: None,
+        guest_listing: false,
         query: &[],
     },
 ];
@@ -400,6 +441,24 @@ mod tests {
             Some(GuestType::Lxc),
             "get_containers should filter to LXC"
         );
+    }
+
+    #[test]
+    fn every_cluster_resources_entry_is_marked_a_guest_listing() {
+        // `serve_read` filters a listing by the caller's guest scope only when
+        // `guest_listing` is set. Any tool reading `/cluster/resources` that
+        // is not marked would silently skip that filter and hand a narrowed
+        // token every guest in the cluster.
+        for tool in READ_TOOLS
+            .iter()
+            .filter(|tool| tool.path == "/api2/json/cluster/resources")
+        {
+            assert!(
+                tool.guest_listing,
+                "{} reads /cluster/resources and must set guest_listing: true",
+                tool.name
+            );
+        }
     }
 
     #[test]

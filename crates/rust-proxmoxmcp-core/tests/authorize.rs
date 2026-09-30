@@ -96,8 +96,38 @@ async fn refuses_a_guest_outside_the_grant_selector() {
         .authorize(&client, "pve3", 905, &band_grant(), Intent::read())
         .await
         .expect_err("905 is outside 600-699");
-    assert!(error.to_string().contains("905"));
     assert!(error.to_string().contains("scope"));
+}
+
+/// A narrowed token must not be able to tell an out-of-scope guest apart
+/// from one that does not exist at all: looping a vmid-addressed read over
+/// the id space would otherwise let it enumerate the cluster's real
+/// inventory without ever being granted a single guest. This must fail on
+/// the pre-fix code, which returned `NotFound` for the absent vmid and
+/// `Denied` for the out-of-scope one.
+#[tokio::test]
+async fn an_absent_guest_and_an_out_of_scope_guest_get_the_same_error_text() {
+    let (index, client, _server) = fixture().await;
+
+    // 905 exists in the fixture but is outside band_grant's vmid:600-699.
+    let out_of_scope = index
+        .authorize(&client, "pve3", 905, &band_grant(), Intent::read())
+        .await
+        .expect_err("905 is outside 600-699");
+
+    // 999 does not appear in the fixture at all.
+    let absent = index
+        .authorize(&client, "pve3", 999, &band_grant(), Intent::read())
+        .await
+        .expect_err("999 does not exist");
+
+    assert_eq!(
+        out_of_scope.to_string(),
+        absent.to_string(),
+        "an out-of-scope guest and an absent one must be indistinguishable to the caller"
+    );
+    assert!(matches!(out_of_scope, ProxmoxError::Denied(_)));
+    assert!(matches!(absent, ProxmoxError::Denied(_)));
 }
 
 #[tokio::test]
@@ -136,7 +166,9 @@ async fn a_protected_guest_still_authorizes_for_read_and_reports_protection() {
 }
 
 #[tokio::test]
-async fn an_unknown_guest_is_not_found_and_never_yields_an_authorized_guest() {
+async fn an_unknown_guest_is_denied_and_never_yields_an_authorized_guest() {
+    // Not `NotFound`: see `an_absent_guest_and_an_out_of_scope_guest_get_the_same_error_text`
+    // for why an absent guest must read the same as an out-of-scope one.
     let (index, client, _server) = fixture().await;
     let error = index
         .authorize(
@@ -148,7 +180,7 @@ async fn an_unknown_guest_is_not_found_and_never_yields_an_authorized_guest() {
         )
         .await
         .expect_err("absent");
-    assert!(matches!(error, ProxmoxError::NotFound { .. }));
+    assert!(matches!(error, ProxmoxError::Denied(_)));
 }
 
 /// A grant that reaches every guest and carries the low action tier.

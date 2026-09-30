@@ -423,6 +423,104 @@ async fn a_rule_outside_the_token_guest_scope_is_refused() {
     assert!(error.contains("scope"), "{error}");
 }
 
+/// A narrowed token must not be able to tell an out-of-scope guest from an
+/// absent one by planning a rule over each and comparing the refusal
+/// wording -- the same existence-oracle guard `resolve.rs::authorize`
+/// enforces for every other guest-addressed call, now also for
+/// `plan_ha_rule_change`. Both plans name only the vmid in `resources`, not
+/// an existing rule, so this exercises `authorize_ha_rule_guests`'s own
+/// resolve match rather than the unrestricted-guest-scope gate on
+/// `update`/`delete`.
+///
+/// The two errors necessarily differ in the vmid they echo back (the caller
+/// already supplied it), so this asserts they share the unified suffix text
+/// rather than asserting full equality.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_existing_out_of_scope_guest_and_an_absent_guest_read_identically_for_ha_rules() {
+    let h = TestServer::start_with_routes(ha_rule_spec(), no_such_rule_routes()).await;
+
+    let out_of_scope = call_with_token(
+        &h,
+        &h.narrow_token,
+        "plan_ha_rule_change",
+        json!({
+            "cluster": "pve3",
+            "rule": "keep-together",
+            "op": "create",
+            "rule_type": "resource-affinity",
+            "resources": ["vm:100"],
+            "affinity": "positive"
+        }),
+    )
+    .await
+    .expect_err("vm:100 exists but is outside the narrow token's guest scope");
+
+    let absent = call_with_token(
+        &h,
+        &h.narrow_token,
+        "plan_ha_rule_change",
+        json!({
+            "cluster": "pve3",
+            "rule": "keep-together-2",
+            "op": "create",
+            "rule_type": "resource-affinity",
+            "resources": ["vm:999"],
+            "affinity": "positive"
+        }),
+    )
+    .await
+    .expect_err("vm:999 does not exist in the fixture");
+
+    let unified_suffix =
+        "denied: guest does not exist or is outside this token's scope in cluster pve3";
+    assert!(out_of_scope.contains(unified_suffix), "{out_of_scope}");
+    assert!(absent.contains(unified_suffix), "{absent}");
+    assert!(
+        !absent.contains("which is outside this token's guest scope"),
+        "the absent-guest arm must use the same wording as the out-of-scope arm, not the \
+         old, distinct phrasing that let a narrowed token tell the two cases apart: {absent}"
+    );
+}
+
+/// Planning an `update` or `delete` also authorizes the rule's *existing*
+/// guests, which are not filtered by guest scope -- same reasoning as
+/// `list_ha_rules`/`get_ha_rule`/`get_ha_rule_change_set`. Without this gate,
+/// a narrowed token could learn a rule's membership from the refusal text
+/// even though it can read none of those tools' output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn updating_or_deleting_a_rule_requires_unrestricted_guest_scope() {
+    let h = TestServer::start_with_routes(ha_rule_spec(), existing_rule_routes(false)).await;
+
+    let delete_error = call_with_token(
+        &h,
+        &h.narrow_token,
+        "plan_ha_rule_change",
+        json!({"cluster": "pve3", "rule": "keep-together", "op": "delete"}),
+    )
+    .await
+    .expect_err("a narrowed token must not plan a delete over a rule's existing membership");
+    assert!(delete_error.contains("scope"), "{delete_error}");
+    assert!(
+        !delete_error.contains("100") && !delete_error.contains("101"),
+        "the refusal must not name the rule's existing guests: {delete_error}"
+    );
+
+    let update_error = call_with_token(
+        &h,
+        &h.narrow_token,
+        "plan_ha_rule_change",
+        json!({
+            "cluster": "pve3",
+            "rule": "keep-together",
+            "op": "update",
+            "resources": ["vm:100"]
+        }),
+    )
+    .await
+    .expect_err("a narrowed token must not plan an update over a rule's existing membership");
+    assert!(update_error.contains("scope"), "{update_error}");
+}
+
 /// The guest gate runs again at apply: a guest tagged `protected` after the
 /// approval refuses the apply, and nothing is written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -702,4 +800,41 @@ async fn a_waiver_lets_the_plan_pass_but_apply_still_needs_second_principal_appr
     .await
     .expect("apply should succeed once a second principal has approved");
     assert_eq!(applied["outcome"], "ok");
+}
+
+/// `get_ha_rule_change_set` must not hand its preview -- which names the
+/// rule's guests -- to a token narrowed to a guest scope that does not cover
+/// them, even though it did not create the change set and only knows its id.
+/// Same reasoning as `list_ha_rules`/`get_ha_rule`, which already require an
+/// unrestricted guest scope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_ha_rule_change_set_requires_unrestricted_guest_scope() {
+    let h = TestServer::start_with_routes(ha_rule_spec(), no_such_rule_routes()).await;
+
+    let planned = call_with_token(
+        &h,
+        &h.token,
+        "plan_ha_rule_change",
+        json!({
+            "cluster": "pve3",
+            "rule": "keep-together",
+            "op": "create",
+            "rule_type": "resource-affinity",
+            "resources": ["vm:100", "vm:101"],
+            "affinity": "positive"
+        }),
+    )
+    .await
+    .expect("plan");
+    let id = planned["change_set_id"].as_str().expect("id").to_owned();
+
+    let error = call_with_token(
+        &h,
+        &h.narrow_token,
+        "get_ha_rule_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "rule": "keep-together"}),
+    )
+    .await
+    .expect_err("a token narrowed away from '*' guest scope must not read the preview");
+    assert!(error.contains("scope"), "{error}");
 }
