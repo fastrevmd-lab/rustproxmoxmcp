@@ -1696,21 +1696,48 @@ impl ProxmoxServer {
     /// yielding an `AuthorizedGuest` whose node fills the `{node}` parameter.
     /// Cluster- and node-scoped tools take their parameters from the request.
     ///
+    /// `requires_unrestricted_guest_scope` is for a tool that names no guest
+    /// and returns a listing shared across every guest on a storage or a node
+    /// (backups, ISOs, templates, tasks) rather than one guest's own data. A
+    /// grant narrowed to specific guests has no selector that can narrow such
+    /// a listing, so -- exactly as `download_iso` and node-level `stop_task`
+    /// already require for the same reason -- it is refused outright rather
+    /// than silently handed the run of everyone's data. Set `false` for a
+    /// tool that either names a guest via `vmid` or returns nothing
+    /// guest-attributable at all (`get_cluster_status`, `get_nodes`).
+    ///
     /// `page`, when `Some`, slices the filtered upstream array into one page
     /// (see [`paginate`]) rather than returning it whole. `None` preserves the
     /// original behavior for tools too small to ever need it.
+    #[allow(clippy::too_many_arguments)]
     async fn serve_read(
         &self,
         tool: &'static str,
         cluster: &str,
         extra_params: &[(&str, &str)],
         vmid: Option<u32>,
+        requires_unrestricted_guest_scope: bool,
         page: Option<(u32, u32)>,
         context: &RequestContext<RoleServer>,
     ) -> CallToolResult {
         let caller = Self::caller(context);
         if let Err(error) = authorize_call(caller.as_ref(), tool, Some(cluster), WRITE_TOOLS) {
             return tool_error(error);
+        }
+
+        if requires_unrestricted_guest_scope {
+            let grant = match resolve_grant(caller.as_ref()) {
+                Ok(grant) => grant,
+                Err(error) => return *error,
+            };
+            if !grant.is_unrestricted_guest_scope() {
+                return tool_error(format!(
+                    "{tool} is not scoped to any single guest -- it lists data shared across \
+                     every guest on a storage or a node -- so it requires a token whose guest \
+                     scope is '*'. This token is narrowed to specific guests and cannot be \
+                     checked against it."
+                ));
+            }
         }
 
         let Some(entry) = read_tool(tool) else {
@@ -1796,6 +1823,29 @@ impl ProxmoxServer {
                             .is_some_and(|t| t == filter_type.path_segment())
                     });
                 }
+                // `type_filter` is set exactly for tools that list guests off
+                // `/cluster/resources` (get_vms, get_containers). Those return
+                // every guest in the cluster regardless of `vmid`, which is
+                // always `None` for them, so the `Some(vmid)` branch above
+                // never runs its grant check. A narrowed token must not see
+                // guests outside its scope just because the tool it called
+                // never named one.
+                if entry.type_filter.is_some() {
+                    use rust_proxmoxmcp_core::resolve::parse_resource_guest;
+
+                    let grant = match resolve_grant(caller.as_ref()) {
+                        Ok(grant) => grant,
+                        Err(error) => return *error,
+                    };
+                    if !grant.is_unrestricted_guest_scope()
+                        && let Some(array) = value.as_array_mut()
+                    {
+                        array.retain(|item| {
+                            parse_resource_guest(item)
+                                .is_some_and(|guest| grant.allows_guest(guest.facts()))
+                        });
+                    }
+                }
                 redact_free_text_fields(&mut value);
                 Ok(value)
             }
@@ -1842,6 +1892,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             None,
+            false,
             None,
             &context,
         )
@@ -1857,7 +1908,7 @@ impl ProxmoxServer {
         Parameters(args): Parameters<ClusterArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        self.serve_read("get_nodes", &args.cluster, &[], None, None, &context)
+        self.serve_read("get_nodes", &args.cluster, &[], None, false, None, &context)
             .await
     }
 
@@ -1875,6 +1926,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("node", args.node.as_str())],
             None,
+            false,
             None,
             &context,
         )
@@ -1891,8 +1943,19 @@ impl ProxmoxServer {
         Parameters(args): Parameters<ClusterArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        self.serve_read("list_ha_rules", &args.cluster, &[], None, None, &context)
-            .await
+        // HA rules name arbitrary guests (`vm:100`, ...) and the listing is
+        // not filtered by the caller's guest scope, so a narrowed token would
+        // see guests outside its grant.
+        self.serve_read(
+            "list_ha_rules",
+            &args.cluster,
+            &[],
+            None,
+            true,
+            None,
+            &context,
+        )
+        .await
     }
 
     #[tool(name = "get_ha_rule", description = "One HA rule by id.")]
@@ -1906,6 +1969,9 @@ impl ProxmoxServer {
             &args.cluster,
             &[("rule", args.rule.as_str())],
             None,
+            // Same as list_ha_rules: a rule names guests the caller's
+            // scope may not cover, and the read is not filtered by it.
+            true,
             None,
             &context,
         )
@@ -1927,8 +1993,16 @@ impl ProxmoxServer {
             Ok(page) => page,
             Err(error) => return *error,
         };
-        self.serve_read("get_vms", &args.cluster, &[], None, Some(page), &context)
-            .await
+        self.serve_read(
+            "get_vms",
+            &args.cluster,
+            &[],
+            None,
+            false,
+            Some(page),
+            &context,
+        )
+        .await
     }
 
     #[tool(
@@ -1951,6 +2025,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             None,
+            false,
             Some(page),
             &context,
         )
@@ -1975,6 +2050,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             Some(args.vmid),
+            false,
             None,
             &context,
         )
@@ -1999,6 +2075,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             Some(args.vmid),
+            false,
             None,
             &context,
         )
@@ -2729,6 +2806,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             Some(args.vmid),
+            false,
             None,
             &context,
         )
@@ -2749,6 +2827,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             Some(args.vmid),
+            false,
             None,
             &context,
         )
@@ -2769,6 +2848,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("node", args.node.as_str())],
             None,
+            false,
             None,
             &context,
         )
@@ -2799,6 +2879,7 @@ impl ProxmoxServer {
                 ("storage", args.storage.as_str()),
             ],
             None,
+            true,
             Some(page),
             &context,
         )
@@ -2819,6 +2900,7 @@ impl ProxmoxServer {
                 ("storage", args.storage.as_str()),
             ],
             None,
+            true,
             None,
             &context,
         )
@@ -2842,6 +2924,7 @@ impl ProxmoxServer {
                 ("storage", args.storage.as_str()),
             ],
             None,
+            true,
             None,
             &context,
         )
@@ -2866,6 +2949,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("node", args.node.as_str())],
             None,
+            true,
             None,
             &context,
         )
@@ -2883,6 +2967,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("node", args.node.as_str()), ("upid", args.upid.as_str())],
             None,
+            false,
             None,
             &context,
         )
@@ -2903,6 +2988,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             None,
+            false,
             None,
             &context,
         )
@@ -2923,6 +3009,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             None,
+            false,
             None,
             &context,
         )
@@ -2943,6 +3030,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             None,
+            false,
             None,
             &context,
         )
@@ -2963,6 +3051,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("group", args.group.as_str())],
             None,
+            false,
             None,
             &context,
         )
@@ -2983,6 +3072,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             None,
+            false,
             None,
             &context,
         )
@@ -3003,6 +3093,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("name", args.name.as_str())],
             None,
+            false,
             None,
             &context,
         )
@@ -3023,6 +3114,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             None,
+            false,
             None,
             &context,
         )
@@ -3043,6 +3135,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("node", args.node.as_str())],
             None,
+            false,
             None,
             &context,
         )
@@ -3063,6 +3156,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("node", args.node.as_str())],
             None,
+            false,
             None,
             &context,
         )
@@ -3083,6 +3177,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             Some(args.vmid),
+            false,
             None,
             &context,
         )
@@ -3103,6 +3198,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             Some(args.vmid),
+            false,
             None,
             &context,
         )
@@ -3123,6 +3219,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             Some(args.vmid),
+            false,
             None,
             &context,
         )
@@ -3143,6 +3240,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             Some(args.vmid),
+            false,
             None,
             &context,
         )
@@ -3163,6 +3261,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("name", args.name.as_str())],
             Some(args.vmid),
+            false,
             None,
             &context,
         )
