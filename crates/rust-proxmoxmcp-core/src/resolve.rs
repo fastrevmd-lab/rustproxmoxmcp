@@ -330,6 +330,67 @@ fn parse_tags(raw: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+/// One `/cluster/resources` entry's guest-selector-relevant fields, owned.
+///
+/// A standalone type rather than a full [`ResolvedGuest`] because callers
+/// that only need to filter a listing by grant -- not resolve a specific
+/// vmid -- have no node status or name to carry.
+#[derive(Debug, Clone)]
+pub struct ResourceGuestFacts {
+    vmid: u32,
+    r#type: GuestType,
+    node: String,
+    pool: Option<String>,
+    tags: Vec<String>,
+}
+
+impl ResourceGuestFacts {
+    /// Borrow the facts a selector needs.
+    #[must_use]
+    pub fn facts(&self) -> GuestFacts<'_> {
+        GuestFacts {
+            vmid: self.vmid,
+            r#type: self.r#type,
+            node: &self.node,
+            pool: self.pool.as_deref(),
+            tags: &self.tags,
+        }
+    }
+}
+
+/// Parse one `/cluster/resources` entry into [`ResourceGuestFacts`].
+///
+/// Shares [`parse_tags`] with [`fetch_guests`] so a listing filter and the
+/// guest index can never disagree about what a tag string means -- two
+/// parsers reading the same field differently is an exploit, not a quirk.
+///
+/// Returns `None` for a non-guest entry, or a guest whose `vmid` or `node`
+/// is missing or unparsable. Fails closed: an entry this cannot make sense
+/// of is dropped, never guessed at or passed through.
+#[must_use]
+pub fn parse_resource_guest(entry: &serde_json::Value) -> Option<ResourceGuestFacts> {
+    let kind = entry.get("type").and_then(serde_json::Value::as_str)?;
+    let r#type = match kind {
+        "qemu" => GuestType::Qemu,
+        "lxc" => GuestType::Lxc,
+        _ => return None,
+    };
+    let vmid = entry.get("vmid").and_then(serde_json::Value::as_u64)?;
+    let vmid = u32::try_from(vmid).ok()?;
+    let node = entry.get("node").and_then(serde_json::Value::as_str)?;
+    Some(ResourceGuestFacts {
+        vmid,
+        r#type,
+        node: node.to_owned(),
+        tags: parse_tags(entry.get("tags").and_then(serde_json::Value::as_str)),
+        pool: entry
+            .get("pool")
+            .and_then(serde_json::Value::as_str)
+            .filter(|pool| !pool.is_empty())
+            .map(str::to_owned),
+    })
+}
+
 /// What a caller intends to do to a guest.
 ///
 /// Bundled rather than passed as three parameters because they are one

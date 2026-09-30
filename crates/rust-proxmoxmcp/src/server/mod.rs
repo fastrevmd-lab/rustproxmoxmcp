@@ -1802,6 +1802,29 @@ impl ProxmoxServer {
                             .is_some_and(|t| t == filter_type.path_segment())
                     });
                 }
+                // `type_filter` is set exactly for tools that list guests off
+                // `/cluster/resources` (get_vms, get_containers). Those return
+                // every guest in the cluster regardless of `vmid`, which is
+                // always `None` for them, so the `Some(vmid)` branch above
+                // never runs its grant check. A narrowed token must not see
+                // guests outside its scope just because the tool it called
+                // never named one.
+                if entry.type_filter.is_some() {
+                    use rust_proxmoxmcp_core::resolve::parse_resource_guest;
+
+                    let grant = match resolve_grant(caller.as_ref()) {
+                        Ok(grant) => grant,
+                        Err(error) => return *error,
+                    };
+                    if !grant.is_unrestricted_guest_scope()
+                        && let Some(array) = value.as_array_mut()
+                    {
+                        array.retain(|item| {
+                            parse_resource_guest(item)
+                                .is_some_and(|guest| grant.allows_guest(guest.facts()))
+                        });
+                    }
+                }
                 redact_free_text_fields(&mut value);
                 Ok(value)
             }
