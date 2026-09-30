@@ -176,6 +176,13 @@ impl GuestIndex {
     /// before the protection check so an out-of-scope caller learns nothing
     /// about whether the guest is protected.
     ///
+    /// An absent guest and an out-of-scope guest return the *same* error.
+    /// Otherwise a narrowed token could loop a vmid-addressed read over the
+    /// whole id space and use the distinct "not found" vs. "denied" text as
+    /// an oracle for which vmids exist in the cluster -- learning the
+    /// inventory shape without ever being granted a single guest. The real
+    /// reason still reaches `tracing` so an operator can tell them apart.
+    ///
     /// Protection does not gate [`Tier::Read`]: observing a protected guest is
     /// how an operator confirms it is protected. It is carried on the returned
     /// value so the audit event and, from 0.3, the change-set preview can
@@ -188,10 +195,9 @@ impl GuestIndex {
     ///   no override (fail-closed).
     ///
     /// # Errors
-    /// Returns [`ProxmoxError::NotFound`] for an absent guest,
-    /// [`ProxmoxError::Denied`] when the grant does not admit the guest, does
-    /// not carry the tier, or when the tier is gated by protection and no
-    /// override applies.
+    /// Returns [`ProxmoxError::Denied`] when the guest does not exist, when
+    /// the grant does not admit it, when it does not carry the tier, or when
+    /// the tier is gated by protection and no override applies.
     pub async fn authorize(
         &self,
         client: &ProxmoxClient,
@@ -205,12 +211,27 @@ impl GuestIndex {
             interrupts,
             override_applies,
         } = intent;
-        let guest = self.resolve(client, cluster, vmid).await?;
+        let scope_error = || {
+            ProxmoxError::Denied(format!(
+                "guest does not exist or is outside this token's scope in cluster {cluster}"
+            ))
+        };
+        let guest = match self.resolve(client, cluster, vmid).await {
+            Ok(guest) => guest,
+            Err(ProxmoxError::NotFound { what }) => {
+                tracing::debug!(cluster, vmid, %what, "guest scope check: guest absent");
+                return Err(scope_error());
+            }
+            Err(error) => return Err(error),
+        };
 
         if !grant.allows_guest(guest.facts()) {
-            return Err(ProxmoxError::Denied(format!(
-                "token scope does not admit guest {vmid} in cluster {cluster}"
-            )));
+            tracing::debug!(
+                cluster,
+                vmid,
+                "guest scope check: grant does not admit guest"
+            );
+            return Err(scope_error());
         }
 
         if !mecmcp_auth::Grant::allows_action(grant, tier.action()) {
@@ -284,12 +305,18 @@ async fn fetch_guests(
         let Some(vmid) = entry.get("vmid").and_then(serde_json::Value::as_u64) else {
             continue;
         };
-        let vmid = u32::try_from(vmid)
-            .map_err(|_| ProxmoxError::Malformed(format!("vmid {vmid} out of range")))?;
-        let node = entry
-            .get("node")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| ProxmoxError::Malformed(format!("guest {vmid} has no node")))?;
+        let Ok(vmid) = u32::try_from(vmid) else {
+            tracing::warn!(
+                cluster,
+                vmid,
+                "dropping cluster/resources entry: vmid out of range"
+            );
+            continue;
+        };
+        let Some(node) = entry.get("node").and_then(serde_json::Value::as_str) else {
+            tracing::warn!(cluster, vmid, "dropping cluster/resources entry: no node");
+            continue;
+        };
 
         guests.insert(
             vmid,
