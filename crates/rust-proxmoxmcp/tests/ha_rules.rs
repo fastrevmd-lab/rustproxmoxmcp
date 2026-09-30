@@ -424,12 +424,17 @@ async fn a_rule_outside_the_token_guest_scope_is_refused() {
 }
 
 /// A narrowed token must not be able to tell an out-of-scope guest from an
-/// absent one by planning a rule over each and comparing the refusal text --
-/// the same existence-oracle guard `resolve.rs::authorize` enforces for every
-/// other guest-addressed call, now also for `plan_ha_rule_change`. Both plans
-/// name only the vmid in `resources`, not an existing rule, so this exercises
-/// `authorize_ha_rule_guests`'s own resolve match rather than the
-/// unrestricted-guest-scope gate on `update`/`delete`.
+/// absent one by planning a rule over each and comparing the refusal
+/// wording -- the same existence-oracle guard `resolve.rs::authorize`
+/// enforces for every other guest-addressed call, now also for
+/// `plan_ha_rule_change`. Both plans name only the vmid in `resources`, not
+/// an existing rule, so this exercises `authorize_ha_rule_guests`'s own
+/// resolve match rather than the unrestricted-guest-scope gate on
+/// `update`/`delete`.
+///
+/// The two errors necessarily differ in the vmid they echo back (the caller
+/// already supplied it), so this asserts they share the unified suffix text
+/// rather than asserting full equality.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_existing_out_of_scope_guest_and_an_absent_guest_read_identically_for_ha_rules() {
     let h = TestServer::start_with_routes(ha_rule_spec(), no_such_rule_routes()).await;
@@ -466,9 +471,13 @@ async fn an_existing_out_of_scope_guest_and_an_absent_guest_read_identically_for
     .await
     .expect_err("vm:999 does not exist in the fixture");
 
-    assert_eq!(
-        out_of_scope, absent,
-        "an out-of-scope guest and an absent guest must read identically"
+    let unified_suffix = "denied: guest does not exist or is outside this token's scope in cluster pve3";
+    assert!(out_of_scope.contains(unified_suffix), "{out_of_scope}");
+    assert!(absent.contains(unified_suffix), "{absent}");
+    assert!(
+        !absent.contains("which is outside this token's guest scope"),
+        "the absent-guest arm must use the same wording as the out-of-scope arm, not the \
+         old, distinct phrasing that let a narrowed token tell the two cases apart: {absent}"
     );
 }
 
