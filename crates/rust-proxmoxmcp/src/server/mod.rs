@@ -1899,8 +1899,19 @@ impl ProxmoxServer {
         Parameters(args): Parameters<ClusterArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        self.serve_read("list_ha_rules", &args.cluster, &[], None, None, &context)
-            .await
+        // HA rules name arbitrary guests (`vm:100`, ...) and the listing is
+        // not filtered by the caller's guest scope, so a narrowed token would
+        // see guests outside its grant.
+        self.serve_read(
+            "list_ha_rules",
+            &args.cluster,
+            &[],
+            None,
+            true,
+            None,
+            &context,
+        )
+        .await
     }
 
     #[tool(name = "get_ha_rule", description = "One HA rule by id.")]
@@ -1914,6 +1925,9 @@ impl ProxmoxServer {
             &args.cluster,
             &[("rule", args.rule.as_str())],
             None,
+            // Same as list_ha_rules: a rule names guests the caller's
+            // scope may not cover, and the read is not filtered by it.
+            true,
             None,
             &context,
         )

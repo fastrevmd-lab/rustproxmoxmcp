@@ -1,5 +1,7 @@
-//! `list_backups`, `list_isos`, `list_templates`, and `list_tasks` name no
-//! guest -- they list data shared across every guest on a storage or a node --
+//! `list_backups`, `list_isos`, `list_templates`, `list_tasks`, and the HA
+//! rule reads (`list_ha_rules`, `get_ha_rule`) name no single
+//! guest -- they list data shared across every guest on a storage, a node, or
+//! the cluster --
 //! so a grant narrowed to specific guests has no selector that can narrow
 //! them, exactly the situation `download_iso` and node-level `stop_task`
 //! already refuse for the same reason (see provisioning_tools.rs and
@@ -117,4 +119,66 @@ async fn an_unrestricted_token_lists_tasks() {
     common::call(&h, "list_tasks", json!({"cluster":"pve3","node":"pve2"}))
         .await
         .expect("an unrestricted token must be admitted");
+}
+
+/// HA rules name arbitrary guests in their `resources`/`services`
+/// (`vm:100`, ...), and neither read filters its output by the caller's guest
+/// scope, so a narrowed token would learn about guests outside its grant.
+fn ha_routes() -> Vec<common::Route> {
+    vec![
+        common::Route {
+            path: "/api2/json/cluster/ha/rules",
+            status: 200,
+            body: br#"{"data":[{"rule":"keep-together","type":"colocation","resources":"vm:100,vm:101","affinity":"positive"}]}"#,
+        },
+        common::Route {
+            path: "/api2/json/cluster/ha/rules/keep-together",
+            status: 200,
+            body: br#"{"data":{"rule":"keep-together","type":"colocation","resources":"vm:100,vm:101","affinity":"positive","digest":"aabbcc"}}"#,
+        },
+    ]
+}
+
+fn ha_args(tool: &str) -> serde_json::Value {
+    if tool == "get_ha_rule" {
+        json!({"cluster":"pve3","rule":"keep-together"})
+    } else {
+        json!({"cluster":"pve3"})
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_narrowed_token_may_not_read_ha_rules() {
+    for tool in ["list_ha_rules", "get_ha_rule"] {
+        let h =
+            common::TestServer::start_with_routes(spec(&[tool], &["vmid:600-699"]), ha_routes())
+                .await;
+
+        let err = common::call(&h, tool, ha_args(tool))
+            .await
+            .expect_err(&format!(
+                "{tool}: a guest-scoped token must not read HA rules"
+            ));
+        assert!(
+            err.contains('*'),
+            "{tool}: the refusal must name the required scope: {err}"
+        );
+
+        let reached_ha = h
+            .requests()
+            .into_iter()
+            .any(|r| r.path.contains("/cluster/ha/rules"));
+        assert!(!reached_ha, "{tool}: the request must not reach Proxmox");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unrestricted_token_reads_ha_rules() {
+    for tool in ["list_ha_rules", "get_ha_rule"] {
+        let h = common::TestServer::start_with_routes(spec(&[tool], &["*"]), ha_routes()).await;
+
+        common::call(&h, tool, ha_args(tool))
+            .await
+            .unwrap_or_else(|e| panic!("{tool}: an unrestricted token must be admitted: {e}"));
+    }
 }
