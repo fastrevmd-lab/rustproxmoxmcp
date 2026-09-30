@@ -60,6 +60,22 @@ pub enum ProxmoxError {
 }
 
 impl ProxmoxError {
+    /// The unified [`ProxmoxError::Denied`] text for an absent guest and an
+    /// out-of-scope guest.
+    ///
+    /// Every call site that resolves a guest before authorizing it must use
+    /// this one text for both cases, or a narrowed token can loop a vmid over
+    /// the id space and use the distinct wording as an existence oracle for
+    /// the whole cluster's inventory -- learning the shape of guests it was
+    /// never granted. The real reason still reaches `tracing::debug` so an
+    /// operator can tell the two apart.
+    #[must_use]
+    pub fn guest_out_of_scope(cluster: &str) -> Self {
+        Self::Denied(format!(
+            "guest does not exist or is outside this token's scope in cluster {cluster}"
+        ))
+    }
+
     /// Classify a non-success response.
     ///
     /// Both 401 and 403 mean the cluster rejected the credentials this server

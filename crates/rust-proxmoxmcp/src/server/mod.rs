@@ -1516,6 +1516,24 @@ impl ProxmoxServer {
         require_ha_rule_destructive_tier(caller)?;
         let grant = resolve_grant(caller)?;
 
+        // An `update` or `delete` also authorizes the rule's *existing*
+        // guests (`guests_touched` merges them in below), and the per-guest
+        // error names the vmid. A narrowed token could plan a delete of a
+        // rule it may not read (`list_ha_rules`/`get_ha_rule` already refuse
+        // it that membership) and learn the same thing from the refusal.
+        // Gate the same way those reads do: only a token with the
+        // unrestricted guest scope may touch a rule's existing membership.
+        if matches!(action.op.as_str(), "update" | "delete") && !grant.is_unrestricted_guest_scope()
+        {
+            return Err(Box::new(tool_error(format!(
+                "changing an HA rule with op '{}' requires a token whose guest scope is '*' -- \
+                 its existing membership is not filtered by guest scope, same as \
+                 list_ha_rules and get_ha_rule. This token is narrowed to specific guests and \
+                 cannot be checked against it.",
+                action.op
+            ))));
+        }
+
         let vmids = ha_change_set::guests_touched(action, existing)
             .map_err(|error| Box::new(tool_error(error)))?;
 
@@ -1556,8 +1574,16 @@ impl ProxmoxServer {
                 }
                 Err(rust_proxmoxmcp_core::ProxmoxError::NotFound { .. }) => {
                     if !grant.allows_new_vmid(vmid) {
+                        // Same text the `Ok` arm's `authorize` call produces
+                        // for a guest that exists but is out of scope: an
+                        // absent vmid and an out-of-scope one must be
+                        // indistinguishable to the caller, or a narrowed
+                        // token could loop this over the id space and use
+                        // the wording as an existence oracle -- exactly what
+                        // this PR closes for every other guest-addressed call.
                         return Err(Box::new(tool_error(format!(
-                            "HA rule names vmid {vmid}, which is outside this token's guest scope"
+                            "HA rule names guest {vmid}: {}",
+                            rust_proxmoxmcp_core::ProxmoxError::guest_out_of_scope(cluster)
                         ))));
                     }
                     if !creation_allowed(client.cluster(), vmid) {

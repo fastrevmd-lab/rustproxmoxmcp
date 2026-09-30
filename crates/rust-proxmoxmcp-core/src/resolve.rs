@@ -211,16 +211,11 @@ impl GuestIndex {
             interrupts,
             override_applies,
         } = intent;
-        let scope_error = || {
-            ProxmoxError::Denied(format!(
-                "guest does not exist or is outside this token's scope in cluster {cluster}"
-            ))
-        };
         let guest = match self.resolve(client, cluster, vmid).await {
             Ok(guest) => guest,
             Err(ProxmoxError::NotFound { what }) => {
                 tracing::debug!(cluster, vmid, %what, "guest scope check: guest absent");
-                return Err(scope_error());
+                return Err(ProxmoxError::guest_out_of_scope(cluster));
             }
             Err(error) => return Err(error),
         };
@@ -231,7 +226,7 @@ impl GuestIndex {
                 vmid,
                 "guest scope check: grant does not admit guest"
             );
-            return Err(scope_error());
+            return Err(ProxmoxError::guest_out_of_scope(cluster));
         }
 
         if !mecmcp_auth::Grant::allows_action(grant, tier.action()) {
