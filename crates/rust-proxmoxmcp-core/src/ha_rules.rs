@@ -54,20 +54,25 @@ pub async fn fetch_rule(
         Err(ProxmoxError::Api {
             status: 500,
             message,
-        }) if is_no_such_rule(&message) => Ok(None),
+        }) if is_no_such_rule(&message, rule) => Ok(None),
         Err(error) => Err(error),
     }
 }
 
-/// Whether a PVE error message names a missing HA rule.
+/// Whether a PVE error message names `rule` as a missing HA rule.
 ///
 /// Proxmox's ha-manager reports a missing rule id as `"no such HA rule
-/// '<id>'"` (or, on older code paths, `"no such rule"`) inside an HTTP 500,
-/// not as a 404. Matched narrowly on that wording so a 500 for an unrelated
-/// cluster fault is not mistaken for "the rule does not exist".
-fn is_no_such_rule(message: &str) -> bool {
+/// '<id>'"` inside an HTTP 500, not as a 404. Matched on that exact wording
+/// with `<id>` bound to the rule this call actually asked for -- not merely
+/// on "no such" and "rule" appearing anywhere in the body -- so a 500 for an
+/// unrelated cluster fault (a path or a caller-chosen id that happens to
+/// contain those words) is not mistaken for "the requested rule does not
+/// exist", and a 500 naming a *different* rule id is propagated rather than
+/// silently read as this rule's absence.
+fn is_no_such_rule(message: &str, rule: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    lower.contains("no such") && (lower.contains("rule") || lower.contains("ha-rules"))
+    let needle = format!("no such ha rule '{}'", rule.to_ascii_lowercase());
+    lower.contains(&needle)
 }
 
 /// List every HA rule in the cluster.
@@ -270,5 +275,29 @@ mod tests {
         for service in ["vm:", "vm:abc", "vm:100;rm -rf", "ct:1.5"] {
             assert!(validate_service_id(service).is_err(), "{service}");
         }
+    }
+
+    #[test]
+    fn matches_the_exact_missing_rule_wording() {
+        assert!(is_no_such_rule(
+            "no such HA rule 'keep-together'",
+            "keep-together"
+        ));
+    }
+
+    #[test]
+    fn does_not_match_an_unrelated_fault_mentioning_rule() {
+        assert!(!is_no_such_rule(
+            "no such file or directory: /etc/pve/ha/rules.cfg",
+            "keep-together"
+        ));
+    }
+
+    #[test]
+    fn does_not_match_a_different_rules_missing_message() {
+        assert!(!is_no_such_rule(
+            "no such HA rule 'other-rule'",
+            "keep-together"
+        ));
     }
 }
