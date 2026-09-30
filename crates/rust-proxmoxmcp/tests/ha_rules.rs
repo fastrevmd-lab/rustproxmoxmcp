@@ -471,7 +471,8 @@ async fn an_existing_out_of_scope_guest_and_an_absent_guest_read_identically_for
     .await
     .expect_err("vm:999 does not exist in the fixture");
 
-    let unified_suffix = "denied: guest does not exist or is outside this token's scope in cluster pve3";
+    let unified_suffix =
+        "denied: guest does not exist or is outside this token's scope in cluster pve3";
     assert!(out_of_scope.contains(unified_suffix), "{out_of_scope}");
     assert!(absent.contains(unified_suffix), "{absent}");
     assert!(
