@@ -1,9 +1,18 @@
 //! HA rule operations against PVE 9's unified `ha-rules` model.
 //!
 //! PVE 9 replaced the older HA groups mechanism (`/cluster/ha/groups`) with a
-//! single `ha-rules` resource covering both node placement (`location` rules)
-//! and guest-to-guest affinity (`colocation` rules). This module speaks only
-//! the current model; `ha-groups` is deliberately not implemented here.
+//! single `ha-rules` resource covering both node placement (`node-affinity`
+//! rules) and guest-to-guest affinity (`resource-affinity` rules). This
+//! module speaks only the current model; `ha-groups` is deliberately not
+//! implemented here.
+//!
+//! PVE 9.0 GA renamed both the rule types and the guest-list field from a
+//! pre-GA patch series this crate originally targeted: `location` and
+//! `colocation` became `node-affinity` and `resource-affinity`, and
+//! `services` became `resources`. Confirmed against the upstream ha-manager
+//! docs (`ha-manager rules add node-affinity <id> --resources vm:100 --nodes
+//! node1`); not verified against a live PVE 9 cluster, since none was
+//! available in this environment -- see the PR discussion for that gap.
 //!
 //! HA rules are cluster-scoped configuration, not a single guest's state, so
 //! nothing here goes through [`crate::resolve::authorize`] or produces an
@@ -23,7 +32,15 @@ use crate::error::ProxmoxError;
 ///
 /// # Errors
 ///
-/// Propagates any client error other than a 404, which becomes `Ok(None)`.
+/// Propagates any client error other than "no such rule", which becomes
+/// `Ok(None)`. PVE 9 answers a missing rule id with HTTP 500 and a message
+/// body naming the missing rule, not 404 -- so a 404 is still accepted (a
+/// future PVE release, or a proxy in front of it, may answer that way), but
+/// a 500 only counts as "missing" when its message says so. A 500 for any
+/// other reason (a cluster fault, for example) is propagated rather than
+/// silently read as "does not exist": treating an ambiguous failure as
+/// absence would let a `create` plan proceed against a rule that in fact
+/// still exists.
 pub async fn fetch_rule(
     client: &ProxmoxClient,
     rule: &str,
@@ -34,8 +51,23 @@ pub async fn fetch_rule(
     match client.get_json(path_template, params, &[]).await {
         Ok(value) => Ok(Some(value)),
         Err(ProxmoxError::Api { status: 404, .. }) => Ok(None),
+        Err(ProxmoxError::Api {
+            status: 500,
+            message,
+        }) if is_no_such_rule(&message) => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// Whether a PVE error message names a missing HA rule.
+///
+/// Proxmox's ha-manager reports a missing rule id as `"no such HA rule
+/// '<id>'"` (or, on older code paths, `"no such rule"`) inside an HTTP 500,
+/// not as a 404. Matched narrowly on that wording so a 500 for an unrelated
+/// cluster fault is not mistaken for "the rule does not exist".
+fn is_no_such_rule(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("no such") && (lower.contains("rule") || lower.contains("ha-rules"))
 }
 
 /// List every HA rule in the cluster.
@@ -56,19 +88,20 @@ pub async fn list_rules(client: &ProxmoxClient) -> Result<Vec<serde_json::Value>
 /// Fields shared by an HA rule create or update.
 ///
 /// Not every field applies to every rule type: `nodes` is meaningful only for
-/// `location`, `affinity` only for `colocation`. Validated against the rule
-/// type before either function below sends anything -- see
+/// `node-affinity`, `affinity` only for `resource-affinity`. Validated against
+/// the rule type before either function below sends anything -- see
 /// `rust_proxmoxmcp::server::ha_change_set::build_ha_rule_action`, which is
 /// the one place that validation happens, so the two cannot drift.
 pub struct HaRuleFields<'a> {
-    /// `"location"` or `"colocation"`.
+    /// `"node-affinity"` or `"resource-affinity"`.
     pub rule_type: &'a str,
-    /// Service ids the rule applies to, e.g. `["vm:100", "ct:200"]`.
-    pub services: &'a [String],
-    /// `location` only: `"node[:priority]"` entries, comma-joined by the
+    /// Resource ids the rule applies to, e.g. `["vm:100", "ct:200"]`. Sent as
+    /// the PVE 9 `resources` form field.
+    pub resources: &'a [String],
+    /// `node-affinity` only: `"node[:priority]"` entries, comma-joined by the
     /// caller into Proxmox's list form.
     pub nodes: Option<&'a str>,
-    /// `colocation` only: `"positive"` or `"negative"`.
+    /// `resource-affinity` only: `"positive"` or `"negative"`.
     pub affinity: Option<&'a str>,
     /// Whether the rule is strict (a location rule that cannot be satisfied
     /// refuses the operation) or advisory.
@@ -93,11 +126,11 @@ pub async fn create_rule(
     rule: &str,
     fields: &HaRuleFields<'_>,
 ) -> Result<(), ProxmoxError> {
-    let services_value = services_form(fields.services);
+    let resources_value = resources_form(fields.resources);
     let mut form: Vec<(&str, &str)> = vec![
         ("rule", rule),
         ("type", fields.rule_type),
-        ("services", &services_value),
+        ("resources", &resources_value),
     ];
     push_optional_fields(&mut form, fields);
 
@@ -128,10 +161,10 @@ pub async fn update_rule(
     let path_template = "/api2/json/cluster/ha/rules/{rule}";
     let params = &[("rule", rule)];
 
-    let services_value = services_form(fields.services);
+    let resources_value = resources_form(fields.resources);
     let mut form: Vec<(&str, &str)> = Vec::new();
-    if !fields.services.is_empty() {
-        form.push(("services", &services_value));
+    if !fields.resources.is_empty() {
+        form.push(("resources", &resources_value));
     }
     push_optional_fields(&mut form, fields);
     if let Some(digest) = digest {
@@ -161,8 +194,8 @@ pub async fn delete_rule(client: &ProxmoxClient, rule: &str) -> Result<(), Proxm
     Ok(())
 }
 
-fn services_form(services: &[String]) -> String {
-    services.join(",")
+fn resources_form(resources: &[String]) -> String {
+    resources.join(",")
 }
 
 fn push_optional_fields<'a>(form: &mut Vec<(&'a str, &'a str)>, fields: &HaRuleFields<'a>) {
