@@ -321,7 +321,7 @@ pub const READ_TOOLS: &[ReadTool] = &[
         method: Method::Get,
         path: "/api2/json/cluster/ha/rules",
         needs_guest: false,
-        description: "All HA rules (location and colocation) in the cluster. \
+        description: "All HA rules (node-affinity and resource-affinity) in the cluster. \
                        Not the deprecated HA groups mechanism.",
         type_filter: None,
         query: &[],

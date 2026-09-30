@@ -28,21 +28,27 @@ pub struct PlanHaRuleArgs {
     /// `create`, `update` or `delete`. Defaults to `create`.
     #[serde(default = "default_ha_rule_op")]
     pub op: String,
-    /// `location` or `colocation`. Required for `create`; must be omitted for
-    /// `update` and `delete` -- Proxmox does not let a rule change type.
+    /// `node-affinity` or `resource-affinity`. Required for `create`; must be
+    /// omitted for `update` and `delete` -- Proxmox does not let a rule
+    /// change type. `location` and `colocation` (the pre-PVE-9-GA names) are
+    /// accepted as deprecated aliases for the two, respectively.
     #[serde(default)]
     pub rule_type: Option<String>,
-    /// Service ids the rule applies to, e.g. `["vm:100", "ct:200"]`. Required
-    /// for `create`; optional for `update` (replaces the list); must be
-    /// omitted for `delete`.
+    /// Resource ids the rule applies to, e.g. `["vm:100", "ct:200"]`.
+    /// Required for `create`; optional for `update` (replaces the list);
+    /// must be omitted for `delete`. Sent to Proxmox as `resources`.
+    #[serde(default)]
+    pub resources: Option<Vec<String>>,
+    /// Deprecated alias for `resources`, kept for callers written against
+    /// the pre-PVE-9-GA field name. Give one of the two, not both.
     #[serde(default)]
     pub services: Option<Vec<String>>,
-    /// `location` only: comma-separated `node[:priority]` entries. Required
-    /// when creating a `location` rule.
+    /// `node-affinity` only: comma-separated `node[:priority]` entries.
+    /// Required when creating a `node-affinity` rule.
     #[serde(default)]
     pub nodes: Option<String>,
-    /// `colocation` only: `positive` (keep together) or `negative` (keep
-    /// apart). Required when creating a `colocation` rule.
+    /// `resource-affinity` only: `positive` (keep together) or `negative`
+    /// (keep apart). Required when creating a `resource-affinity` rule.
     #[serde(default)]
     pub affinity: Option<String>,
     /// Whether the rule is strict rather than advisory.
@@ -85,7 +91,7 @@ pub(crate) struct HaRuleAction {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub services: Option<Vec<String>>,
+    pub resources: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodes: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -145,15 +151,15 @@ pub(crate) fn build_ha_rule_action(args: &PlanHaRuleArgs) -> Result<HaRuleAction
                     return Err(format!("delete does not take {name}"));
                 }
             }
-            if args.services.is_some() {
-                return Err("delete does not take services".to_owned());
+            if args.resources.is_some() || args.services.is_some() {
+                return Err("delete does not take resources".to_owned());
             }
             Ok(HaRuleAction {
                 op: "delete".to_owned(),
                 cluster: args.cluster.clone(),
                 rule: args.rule.clone(),
                 rule_type: None,
-                services: None,
+                resources: None,
                 nodes: None,
                 affinity: None,
                 strict: None,
@@ -167,18 +173,46 @@ pub(crate) fn build_ha_rule_action(args: &PlanHaRuleArgs) -> Result<HaRuleAction
     }
 }
 
+/// Merge `resources` and its deprecated `services` alias.
+///
+/// Only one may be given: accepting both silently would leave it unclear
+/// which one wins, and Proxmox's API takes a single `resources` field.
+fn merge_resources_alias(args: &PlanHaRuleArgs) -> Result<Option<Vec<String>>, String> {
+    match (&args.resources, &args.services) {
+        (Some(_), Some(_)) => Err(
+            "give only one of 'resources' or the deprecated 'services' alias, not both".to_owned(),
+        ),
+        (Some(resources), None) => Ok(Some(resources.clone())),
+        (None, Some(services)) => Ok(Some(services.clone())),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Normalise a caller-supplied rule type, accepting the pre-PVE-9-GA names
+/// (`location`, `colocation`) as deprecated aliases for the current ones
+/// (`node-affinity`, `resource-affinity`). Any other value passes through
+/// unchanged for the caller below to reject.
+fn normalise_rule_type(rule_type: &str) -> &str {
+    match rule_type {
+        "location" => "node-affinity",
+        "colocation" => "resource-affinity",
+        other => other,
+    }
+}
+
 fn build_create_or_update(args: &PlanHaRuleArgs, is_create: bool) -> Result<HaRuleAction, String> {
     let rule_type = if is_create {
         let rule_type = args
             .rule_type
             .clone()
             .ok_or_else(|| "create requires rule_type".to_owned())?;
-        if rule_type != "location" && rule_type != "colocation" {
+        let normalised = normalise_rule_type(&rule_type).to_owned();
+        if normalised != "node-affinity" && normalised != "resource-affinity" {
             return Err(format!(
-                "rule_type must be 'location' or 'colocation', got '{rule_type}'"
+                "rule_type must be 'node-affinity' or 'resource-affinity', got '{rule_type}'"
             ));
         }
-        Some(rule_type)
+        Some(normalised)
     } else {
         if args.rule_type.is_some() {
             return Err(
@@ -190,18 +224,18 @@ fn build_create_or_update(args: &PlanHaRuleArgs, is_create: bool) -> Result<HaRu
         None
     };
 
-    let services = match &args.services {
-        Some(services) => {
-            if services.is_empty() {
-                return Err("services, if given, must name at least one guest".to_owned());
+    let resources = match merge_resources_alias(args)? {
+        Some(resources) => {
+            if resources.is_empty() {
+                return Err("resources, if given, must name at least one guest".to_owned());
             }
-            for service in services {
-                rust_proxmoxmcp_core::ha_rules::validate_service_id(service)
+            for resource in &resources {
+                rust_proxmoxmcp_core::ha_rules::validate_service_id(resource)
                     .map_err(|error| error.to_string())?;
             }
-            Some(services.clone())
+            Some(resources)
         }
-        None if is_create => return Err("create requires services".to_owned()),
+        None if is_create => return Err("create requires resources".to_owned()),
         None => None,
     };
 
@@ -213,21 +247,21 @@ fn build_create_or_update(args: &PlanHaRuleArgs, is_create: bool) -> Result<HaRu
     if is_create {
         let declared = rule_type.as_deref().expect("set above for create");
         match declared {
-            "location" => {
+            "node-affinity" => {
                 if args.affinity.is_some() {
-                    return Err("a location rule does not take affinity".to_owned());
+                    return Err("a node-affinity rule does not take affinity".to_owned());
                 }
                 let Some(nodes) = &args.nodes else {
-                    return Err("a location rule requires nodes".to_owned());
+                    return Err("a node-affinity rule requires nodes".to_owned());
                 };
                 validate_nodes_list(nodes)?;
             }
-            "colocation" => {
+            "resource-affinity" => {
                 if args.nodes.is_some() {
-                    return Err("a colocation rule does not take nodes".to_owned());
+                    return Err("a resource-affinity rule does not take nodes".to_owned());
                 }
                 let Some(affinity) = &args.affinity else {
-                    return Err("a colocation rule requires affinity".to_owned());
+                    return Err("a resource-affinity rule requires affinity".to_owned());
                 };
                 if affinity != "positive" && affinity != "negative" {
                     return Err(format!(
@@ -250,7 +284,7 @@ fn build_create_or_update(args: &PlanHaRuleArgs, is_create: bool) -> Result<HaRu
             ));
         }
         if !is_create
-            && services.is_none()
+            && resources.is_none()
             && args.nodes.is_none()
             && args.affinity.is_none()
             && args.strict.is_none()
@@ -258,7 +292,7 @@ fn build_create_or_update(args: &PlanHaRuleArgs, is_create: bool) -> Result<HaRu
             && args.disable.is_none()
         {
             return Err(
-                "update names no field to change; give at least one of services, nodes, \
+                "update names no field to change; give at least one of resources, nodes, \
                  affinity, strict, comment or disable"
                     .to_owned(),
             );
@@ -270,7 +304,7 @@ fn build_create_or_update(args: &PlanHaRuleArgs, is_create: bool) -> Result<HaRu
         cluster: args.cluster.clone(),
         rule: args.rule.clone(),
         rule_type,
-        services,
+        resources,
         nodes: args.nodes.clone(),
         affinity: args.affinity.clone(),
         strict: args.strict,
@@ -294,7 +328,7 @@ pub(crate) fn guests_touched(
     action: &HaRuleAction,
     existing: Option<&serde_json::Value>,
 ) -> Result<std::collections::BTreeSet<u32>, String> {
-    let mut ids: Vec<String> = action.services.clone().unwrap_or_default();
+    let mut ids: Vec<String> = action.resources.clone().unwrap_or_default();
 
     if let Some(rule) = existing {
         let field = rule.get("resources").or_else(|| rule.get("services"));
@@ -340,7 +374,7 @@ pub(crate) fn guests_touched(
 }
 
 /// Validate a `node[:priority]` comma list, the form Proxmox's `nodes` field
-/// for a location rule takes.
+/// for a node-affinity rule takes.
 fn validate_nodes_list(nodes: &str) -> Result<(), String> {
     if nodes.is_empty() {
         return Err("nodes must name at least one node".to_owned());
@@ -376,12 +410,12 @@ pub(crate) fn missing_required_ha_fields(action: &HaRuleAction) -> Vec<&'static 
             if action.rule_type.is_none() {
                 missing.push("rule_type");
             }
-            if action.services.as_ref().is_none_or(Vec::is_empty) {
-                missing.push("services");
+            if action.resources.as_ref().is_none_or(Vec::is_empty) {
+                missing.push("resources");
             }
             match action.rule_type.as_deref() {
-                Some("location") if action.nodes.is_none() => missing.push("nodes"),
-                Some("colocation") if action.affinity.is_none() => missing.push("affinity"),
+                Some("node-affinity") if action.nodes.is_none() => missing.push("nodes"),
+                Some("resource-affinity") if action.affinity.is_none() => missing.push("affinity"),
                 _ => {}
             }
             missing
@@ -391,6 +425,40 @@ pub(crate) fn missing_required_ha_fields(action: &HaRuleAction) -> Vec<&'static 
     }
 }
 
+/// Render every field an action sets, one `  name: value` line per field the
+/// caller gave -- so `strict`/`disable` show their explicit value rather than
+/// silently defaulting, and a set `comment` is redacted rather than printed
+/// raw (it is free text, the same class of field `redact_free_text_fields`
+/// strips before a preview or a stored rule reaches the model).
+fn render_proposed_fields(action: &HaRuleAction) -> String {
+    let mut lines = Vec::new();
+    if let Some(rule_type) = &action.rule_type {
+        lines.push(format!("  type: {rule_type}"));
+    }
+    if let Some(resources) = &action.resources {
+        lines.push(format!("  resources: {}", resources.join(", ")));
+    }
+    if let Some(nodes) = &action.nodes {
+        lines.push(format!("  nodes: {nodes}"));
+    }
+    if let Some(affinity) = &action.affinity {
+        lines.push(format!("  affinity: {affinity}"));
+    }
+    if let Some(strict) = action.strict {
+        lines.push(format!("  strict: {strict}"));
+    }
+    if let Some(disable) = action.disable {
+        lines.push(format!("  disable: {disable}"));
+    }
+    if let Some(comment) = &action.comment {
+        lines.push(format!(
+            "  comment: {}",
+            mecmcp_redact::redact_text(comment)
+        ));
+    }
+    lines.join("\n")
+}
+
 /// Render the preview an approver reviews for one HA rule action.
 pub(crate) fn render_ha_rule_preview(
     action: &HaRuleAction,
@@ -398,25 +466,11 @@ pub(crate) fn render_ha_rule_preview(
 ) -> String {
     let target = format!("HA rule '{}' on cluster '{}'", action.rule, action.cluster);
     match action.op.as_str() {
-        "create" => format!(
-            "CREATE {target}\n  type: {}\n  services: {}\n  {}",
-            action.rule_type.as_deref().unwrap_or("?"),
-            action
-                .services
-                .as_ref()
-                .map(|s| s.join(", "))
-                .unwrap_or_default(),
-            match action.rule_type.as_deref() {
-                Some("location") => format!("nodes: {}", action.nodes.as_deref().unwrap_or("?")),
-                Some("colocation") => {
-                    format!("affinity: {}", action.affinity.as_deref().unwrap_or("?"))
-                }
-                _ => String::new(),
-            }
-        ),
+        "create" => format!("CREATE {target}\n{}", render_proposed_fields(action)),
         "update" => format!(
-            "UPDATE {target}\n  This changes cluster-wide guest placement policy. \
-             Current definition: {}",
+            "UPDATE {target}\n  This changes cluster-wide guest placement policy.\n\
+             Proposed change:\n{}\n  Current definition: {}",
+            render_proposed_fields(action),
             existing
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "(unknown)".to_owned())
@@ -429,5 +483,72 @@ pub(crate) fn render_ha_rule_preview(
                 .unwrap_or_else(|| "(unknown)".to_owned())
         ),
         other => format!("UNKNOWN OPERATION '{other}' on {target}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F2: an update preview must show every proposed field, not just the
+    /// rule's current definition -- otherwise the second-principal approver
+    /// approves a change they cannot see, including `strict`/`disable`
+    /// toggles and a comment that could carry cluster-shape detail.
+    #[test]
+    fn update_preview_shows_every_proposed_field() {
+        let action = HaRuleAction {
+            op: "update".to_owned(),
+            cluster: "pve3".to_owned(),
+            rule: "keep-together".to_owned(),
+            rule_type: None,
+            resources: Some(vec!["vm:100".to_owned(), "vm:200".to_owned()]),
+            nodes: None,
+            affinity: Some("negative".to_owned()),
+            strict: Some(true),
+            comment: Some("evacuate before maintenance; password: hunter2fake".to_owned()),
+            disable: Some(false),
+        };
+        let existing = serde_json::json!({"rule": "keep-together", "resources": "vm:100"});
+
+        let preview = render_ha_rule_preview(&action, Some(&existing));
+
+        assert!(preview.contains("resources: vm:100, vm:200"), "{preview}");
+        assert!(preview.contains("affinity: negative"), "{preview}");
+        assert!(preview.contains("strict: true"), "{preview}");
+        assert!(preview.contains("disable: false"), "{preview}");
+        assert!(
+            preview.contains("evacuate before maintenance"),
+            "an operator note with no secret shape must still show, so the \
+             approver sees what they are approving: {preview}"
+        );
+        assert!(
+            !preview.contains("hunter2fake"),
+            "a credential-shaped substring in the comment must be redacted, \
+             not shown verbatim: {preview}"
+        );
+    }
+
+    /// The create preview gets the same treatment.
+    #[test]
+    fn create_preview_shows_strict_and_disable() {
+        let action = HaRuleAction {
+            op: "create".to_owned(),
+            cluster: "pve3".to_owned(),
+            rule: "keep-together".to_owned(),
+            rule_type: Some("node-affinity".to_owned()),
+            resources: Some(vec!["vm:100".to_owned()]),
+            nodes: Some("pve2".to_owned()),
+            affinity: None,
+            strict: Some(true),
+            comment: None,
+            disable: Some(true),
+        };
+
+        let preview = render_ha_rule_preview(&action, None);
+
+        assert!(preview.contains("type: node-affinity"), "{preview}");
+        assert!(preview.contains("resources: vm:100"), "{preview}");
+        assert!(preview.contains("strict: true"), "{preview}");
+        assert!(preview.contains("disable: true"), "{preview}");
     }
 }

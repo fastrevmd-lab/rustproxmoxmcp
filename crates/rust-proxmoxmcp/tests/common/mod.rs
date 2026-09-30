@@ -101,6 +101,27 @@ impl TestServer {
         .await
     }
 
+    /// As [`Self::start_with_routes`], with the primary/second/agent
+    /// tokens' action tier caller-supplied instead of every tier. See
+    /// [`Self::start_with_full_config`].
+    pub async fn start_with_routes_and_actions(
+        spec: TokenSpec,
+        routes: Vec<Route>,
+        actions: Vec<ProxmoxAction>,
+    ) -> Self {
+        Self::start_with_full_config(
+            spec,
+            routes,
+            Arc::new(rust_proxmoxmcp_core::waiver::WaiverFile::empty()),
+            false,
+            None,
+            LimitsConfig::default(),
+            mecmcp_audit::DirectCommitPolicy::new(false),
+            actions,
+        )
+        .await
+    }
+
     /// Start the test server with custom waivers and lab-mode setting.
     ///
     /// This is used for testing the two-person control override system.
@@ -216,6 +237,40 @@ impl TestServer {
         limits: LimitsConfig,
         direct_commit: mecmcp_audit::DirectCommitPolicy,
     ) -> Self {
+        Self::start_with_full_config(
+            spec,
+            routes,
+            waivers,
+            lab_mode,
+            state_path,
+            limits,
+            direct_commit,
+            vec![
+                ProxmoxAction::Read,
+                ProxmoxAction::Low,
+                ProxmoxAction::Destructive,
+            ],
+        )
+        .await
+    }
+
+    /// A token carrying every scope `spec` names, minted with `actions` as
+    /// its action tier instead of every tier. For a test that must prove a
+    /// gate refuses a token missing a specific tier (`destructive`, say)
+    /// even though every other scope it could check is wide open -- there
+    /// is no other way to mint such a token through this harness, since
+    /// every other constructor hardcodes the full tier set.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_full_config(
+        spec: TokenSpec,
+        routes: Vec<Route>,
+        waivers: Arc<rust_proxmoxmcp_core::waiver::WaiverFile>,
+        lab_mode: bool,
+        state_path: Option<std::path::PathBuf>,
+        limits: LimitsConfig,
+        direct_commit: mecmcp_audit::DirectCommitPolicy,
+        actions: Vec<ProxmoxAction>,
+    ) -> Self {
         // Install crypto provider once for the test binary.
         ensure_crypto_provider();
 
@@ -269,11 +324,7 @@ impl TestServer {
         // Mint a token and write tokens.json.
         let grant = ProxmoxGrant {
             guests: spec.guests.clone(),
-            actions: vec![
-                ProxmoxAction::Read,
-                ProxmoxAction::Low,
-                ProxmoxAction::Destructive,
-            ],
+            actions: actions.clone(),
         };
 
         let tool_refs: Vec<&str> = spec.tools.iter().map(|s| s.as_str()).collect();

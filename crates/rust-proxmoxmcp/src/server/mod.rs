@@ -1480,8 +1480,8 @@ impl ProxmoxServer {
 
     /// Authorize every guest an HA rule change touches, as a destructive call.
     ///
-    /// An HA `location`/`colocation` rule directs the HA manager to move the
-    /// guests it names, so writing one is gated like `plan_proxmox_destroy`
+    /// An HA `node-affinity`/`resource-affinity` rule directs the HA manager
+    /// to move the guests it names, so writing one is gated like `plan_proxmox_destroy`
     /// is for each of those guests: the token must carry the `destructive`
     /// action tier, each guest must be inside its guest scope, and a guest
     /// that is protected (live `protected` tag or inventory pin) is refused
@@ -1509,18 +1509,12 @@ impl ProxmoxServer {
         action: &ha_change_set::HaRuleAction,
         existing: Option<&serde_json::Value>,
     ) -> Result<(), Box<CallToolResult>> {
-        use rust_proxmoxmcp_core::grant::ProxmoxAction;
         use rust_proxmoxmcp_core::protect::{
             Override, creation_allowed, destructive_allowed, protection_of,
         };
 
+        require_ha_rule_destructive_tier(caller)?;
         let grant = resolve_grant(caller)?;
-        if !grant.allows_action(ProxmoxAction::Destructive) {
-            return Err(Box::new(tool_error(
-                "changing an HA rule requires the 'destructive' action tier, which this token \
-                 does not carry",
-            )));
-        }
 
         let vmids = ha_change_set::guests_touched(action, existing)
             .map_err(|error| Box::new(tool_error(error)))?;
@@ -1604,6 +1598,33 @@ fn resolve_grant(
             )))
         }),
     }
+}
+
+/// Cheap, no-network refusal of an HA rule change from a token lacking the
+/// `destructive` action tier.
+///
+/// Split out of `ProxmoxServer::authorize_ha_rule_guests` so `plan_ha_rule_change`
+/// and `apply_ha_rule_change` can call it before `fetch_rule` -- a token this
+/// clearly disqualified must be refused before any request reaches the
+/// cluster, not merely after a GET already went out. `authorize_ha_rule_guests`
+/// still runs the same check itself once guests are known; the repeat costs
+/// nothing (no network call) and keeps that function safe to call on its own.
+///
+/// # Errors
+/// Returns the boxed `CallToolResult` to `return *result` from a handler.
+fn require_ha_rule_destructive_tier(
+    caller: Option<&CallerCtx<ProxmoxGrant>>,
+) -> Result<(), Box<CallToolResult>> {
+    use rust_proxmoxmcp_core::grant::ProxmoxAction;
+
+    let grant = resolve_grant(caller)?;
+    if !grant.allows_action(ProxmoxAction::Destructive) {
+        return Err(Box::new(tool_error(
+            "changing an HA rule requires the 'destructive' action tier, which this token \
+             does not carry",
+        )));
+    }
+    Ok(())
 }
 
 /// Derive a scope description from the caller's tool and device scopes.
@@ -1862,8 +1883,8 @@ impl ProxmoxServer {
 
     #[tool(
         name = "list_ha_rules",
-        description = "All HA rules (location and colocation) in the cluster. Not the \
-                        deprecated HA groups mechanism."
+        description = "All HA rules (node-affinity and resource-affinity) in the cluster. \
+                        Not the deprecated HA groups mechanism."
     )]
     async fn list_ha_rules(
         &self,
@@ -5277,6 +5298,13 @@ impl ProxmoxServer {
             return tool_error(error);
         }
 
+        // Refused here, before `fetch_rule`: a token missing the
+        // `destructive` tier is refused outright, so no request should reach
+        // the cluster on its behalf at all.
+        if let Err(result) = require_ha_rule_destructive_tier(caller.as_ref()) {
+            return *result;
+        }
+
         let existing = match rust_proxmoxmcp_core::ha_rules::fetch_rule(client, &args.rule).await {
             Ok(existing) => existing,
             Err(error) => return tool_error(format!("reading current rule: {error}")),
@@ -5304,7 +5332,7 @@ impl ProxmoxServer {
         // Every guest the rule names -- in the requested change and in the
         // rule as it stands -- must be one this token may act on
         // destructively, and must not be protected without an override. A
-        // location or colocation rule makes the HA manager move those guests,
+        // node-affinity or resource-affinity rule makes the HA manager move those guests,
         // so it gets the same guest-scope and protection gate a
         // `plan_proxmox_destroy` of each of them would.
         if let Err(result) = self
@@ -5585,6 +5613,13 @@ impl ProxmoxServer {
             );
         }
 
+        // Refused here, before `fetch_rule`: same reasoning as the plan
+        // handler's early check -- a token missing the `destructive` tier
+        // must not cause a request to reach the cluster at all.
+        if let Err(result) = require_ha_rule_destructive_tier(caller.as_ref()) {
+            return *result;
+        }
+
         // Re-fetch the rule's current state and verify the fingerprint, the
         // same drift check `apply_change_set` runs against a guest.
         let existing = match rust_proxmoxmcp_core::ha_rules::fetch_rule(client, &args.rule).await {
@@ -5721,7 +5756,7 @@ impl ProxmoxServer {
             "create" => {
                 let fields = rust_proxmoxmcp_core::ha_rules::HaRuleFields {
                     rule_type: action.rule_type.as_deref().unwrap_or_default(),
-                    services: action.services.as_deref().unwrap_or_default(),
+                    resources: action.resources.as_deref().unwrap_or_default(),
                     nodes: action.nodes.as_deref(),
                     affinity: action.affinity.as_deref(),
                     strict: action.strict,
@@ -5735,10 +5770,10 @@ impl ProxmoxServer {
                     .as_ref()
                     .and_then(|value| value.get("digest"))
                     .and_then(|value| value.as_str());
-                let empty_services: Vec<String> = Vec::new();
+                let empty_resources: Vec<String> = Vec::new();
                 let fields = rust_proxmoxmcp_core::ha_rules::HaRuleFields {
                     rule_type: "",
-                    services: action.services.as_deref().unwrap_or(&empty_services),
+                    resources: action.resources.as_deref().unwrap_or(&empty_resources),
                     nodes: action.nodes.as_deref(),
                     affinity: action.affinity.as_deref(),
                     strict: action.strict,
