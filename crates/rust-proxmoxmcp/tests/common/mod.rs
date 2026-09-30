@@ -70,6 +70,12 @@ pub struct TestServer {
     /// this one, and the apply must refuse it even though it carries every
     /// tool scope `token` does.
     pub narrow_token: String,
+    /// A fifth token with the same clusters/tools/guests as `token`, but
+    /// minted with only the `Read` and `Low` action tiers -- no
+    /// `Destructive`. For proving a destructive-tier gate refuses a token
+    /// that would otherwise pass every scope check, distinct from
+    /// `narrow_token`, which instead narrows the guest scope.
+    pub low_tier_token: String,
     /// The mock Proxmox server.
     mock: TlsMockServer,
     /// Guest index for cache invalidation in tests.
@@ -409,6 +415,27 @@ impl TestServer {
         )
         .expect("mint narrow-scoped token");
 
+        // A fifth token, same clusters/tools/guests as `token` but missing
+        // the `destructive` action tier. See the `low_tier_token` field doc.
+        let low_tier_grant = ProxmoxGrant {
+            guests: spec.guests.clone(),
+            actions: vec![ProxmoxAction::Read, ProxmoxAction::Low],
+        };
+        let low_tier_plaintext = TokenStoreFile::<ProxmoxGrant>::add_with_options(
+            &tokens_path,
+            "test-token-low-tier",
+            parse_scope(&spec.clusters),
+            parse_scope(&spec.tools),
+            None,
+            Some(low_tier_grant),
+            None,
+            None,
+            None,
+            None,
+            &known,
+        )
+        .expect("mint low-tier token");
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -471,6 +498,7 @@ impl TestServer {
             second_token: second_plaintext.expose_secret().to_owned(),
             agent_token: agent_plaintext.expose_secret().to_owned(),
             narrow_token: narrow_plaintext.expose_secret().to_owned(),
+            low_tier_token: low_tier_plaintext.expose_secret().to_owned(),
             mock,
             index,
             _temp_dir: temp_dir,

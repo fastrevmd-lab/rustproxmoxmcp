@@ -503,6 +503,140 @@ async fn a_token_without_the_destructive_tier_is_refused_before_any_request() {
     );
 }
 
+/// G1: a 500 whose body is an unrelated cluster fault that happens to
+/// mention "rule" (a config file path, here) must not be read as "the
+/// requested rule is absent" -- it must propagate as an error, and no POST
+/// may go out on the strength of a false "does not exist".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unrelated_500_mentioning_rule_propagates_instead_of_meaning_absent() {
+    let h = TestServer::start_with_routes(
+        ha_rule_spec(),
+        vec![
+            guests_route(false),
+            Route {
+                path: "/api2/json/cluster/ha/rules/keep-together",
+                status: 500,
+                body: br#"{"data":null,"errors":{"x":"no such file or directory: /etc/pve/ha/rules.cfg"}}"#,
+            },
+        ],
+    )
+    .await;
+
+    let error = call_with_token(
+        &h,
+        &h.token,
+        "plan_ha_rule_change",
+        json!({
+            "cluster": "pve3",
+            "rule": "keep-together",
+            "op": "create",
+            "rule_type": "resource-affinity",
+            "resources": ["vm:100", "vm:101"],
+            "affinity": "positive"
+        }),
+    )
+    .await
+    .expect_err("an unrelated 500 must propagate rather than be read as absence");
+    assert!(error.contains("reading current rule"), "{error}");
+
+    let reqs = h.requests();
+    assert!(
+        !reqs.iter().any(|r| r.method == "POST"),
+        "nothing should have been written on a false 'absent' read: {reqs:?}"
+    );
+}
+
+/// G1: a 500 naming a *different* rule as missing must not be read as "the
+/// requested rule is absent" either -- only a 500 naming the requested rule
+/// itself counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_500_naming_a_different_rule_propagates() {
+    let h = TestServer::start_with_routes(
+        ha_rule_spec(),
+        vec![
+            guests_route(false),
+            Route {
+                path: "/api2/json/cluster/ha/rules/keep-together",
+                status: 500,
+                body: br#"{"data":null,"errors":{"rule":"no such HA rule 'other-rule'"}}"#,
+            },
+        ],
+    )
+    .await;
+
+    let error = call_with_token(
+        &h,
+        &h.token,
+        "plan_ha_rule_change",
+        json!({
+            "cluster": "pve3",
+            "rule": "keep-together",
+            "op": "create",
+            "rule_type": "resource-affinity",
+            "resources": ["vm:100", "vm:101"],
+            "affinity": "positive"
+        }),
+    )
+    .await
+    .expect_err("a 500 naming a different rule must propagate");
+    assert!(error.contains("reading current rule"), "{error}");
+
+    let reqs = h.requests();
+    assert!(
+        !reqs.iter().any(|r| r.method == "POST"),
+        "nothing should have been written on a false 'absent' read: {reqs:?}"
+    );
+}
+
+/// G2: `apply_ha_rule_change`'s own early destructive-tier check, ahead of
+/// `fetch_rule`, must refuse a token that lacks the `destructive` tier even
+/// though it carries the same tool and guest scopes the plan/approve phase
+/// used -- and must do so before any request past that phase reaches the
+/// cluster. Regression check for the gap Percy found in #147's review: only
+/// the plan-side check had a test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_without_the_destructive_tier_is_refused_before_any_request() {
+    let h = TestServer::start_with_routes(ha_rule_spec(), no_such_rule_routes()).await;
+
+    let planned = call_with_token(
+        &h,
+        &h.token,
+        "plan_ha_rule_change",
+        json!({
+            "cluster": "pve3",
+            "rule": "keep-together",
+            "op": "create",
+            "rule_type": "resource-affinity",
+            "resources": ["vm:100", "vm:101"],
+            "affinity": "positive"
+        }),
+    )
+    .await
+    .expect("plan");
+    let id = planned["change_set_id"].as_str().expect("id").to_owned();
+
+    approve_ha_rule_as_second_principal(&h, &id, "keep-together").await;
+
+    let before = h.requests().len();
+
+    let error = call_with_token(
+        &h,
+        &h.low_tier_token,
+        "apply_ha_rule_change",
+        json!({"change_set_id": id, "cluster": "pve3", "rule": "keep-together"}),
+    )
+    .await
+    .expect_err("apply without the destructive tier must be refused");
+    assert!(error.contains("destructive"), "{error}");
+
+    let reqs = h.requests();
+    assert_eq!(
+        reqs.len(),
+        before,
+        "no request should reach the cluster once the plan/approve phase is done: {reqs:?}"
+    );
+}
+
 /// F3: an override (a waiver, here) on a protected guest lets the plan pass,
 /// but the change set still needs a second principal's approval before
 /// apply -- an override only waives the guest check, never the
