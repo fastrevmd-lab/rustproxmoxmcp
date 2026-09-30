@@ -569,3 +569,40 @@ async fn a_waiver_lets_the_plan_pass_but_apply_still_needs_second_principal_appr
     .expect("apply should succeed once a second principal has approved");
     assert_eq!(applied["outcome"], "ok");
 }
+
+/// `get_ha_rule_change_set` must not hand its preview -- which names the
+/// rule's guests -- to a token narrowed to a guest scope that does not cover
+/// them, even though it did not create the change set and only knows its id.
+/// Same reasoning as `list_ha_rules`/`get_ha_rule`, which already require an
+/// unrestricted guest scope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_ha_rule_change_set_requires_unrestricted_guest_scope() {
+    let h = TestServer::start_with_routes(ha_rule_spec(), no_such_rule_routes()).await;
+
+    let planned = call_with_token(
+        &h,
+        &h.token,
+        "plan_ha_rule_change",
+        json!({
+            "cluster": "pve3",
+            "rule": "keep-together",
+            "op": "create",
+            "rule_type": "resource-affinity",
+            "resources": ["vm:100", "vm:101"],
+            "affinity": "positive"
+        }),
+    )
+    .await
+    .expect("plan");
+    let id = planned["change_set_id"].as_str().expect("id").to_owned();
+
+    let error = call_with_token(
+        &h,
+        &h.narrow_token,
+        "get_ha_rule_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "rule": "keep-together"}),
+    )
+    .await
+    .expect_err("a token narrowed away from '*' guest scope must not read the preview");
+    assert!(error.contains("scope"), "{error}");
+}
