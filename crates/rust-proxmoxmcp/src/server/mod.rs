@@ -1,6 +1,7 @@
 //! The MCP tool surface for release 0.1: reads only.
 
 mod change_set;
+mod ha_change_set;
 mod restore_change_set;
 
 use mecmcp_auth::{CallerCtx, ScopeSet};
@@ -40,14 +41,19 @@ use std::sync::Arc;
 /// meaningful for everything else.
 #[cfg_attr(not(test), allow(dead_code))]
 const AUTHORIZATION_ONLY_TOOLS: &[&str] = &[
+    "create_ha_rule",
     "delete_backup",
     "delete_container",
+    "delete_ha_rule",
     "delete_iso",
     "delete_snapshot",
     "delete_vm",
+    "migrate_container",
+    "migrate_vm",
     "restore_backup",
     "restore_backup_new_vmid",
     "rollback_snapshot",
+    "update_ha_rule",
     "update_vm_config",
 ];
 
@@ -79,6 +85,10 @@ const fn tool_for_op(op: &str, kind: GuestType) -> Option<&'static str> {
         b"delete_backup" => Some("delete_backup"),
         b"delete_iso" => Some("delete_iso"),
         b"restore_backup" => Some("restore_backup"),
+        b"migrate" => Some(match kind {
+            GuestType::Lxc => "migrate_container",
+            GuestType::Qemu => "migrate_vm",
+        }),
         // QEMU-only, but named as one tool regardless of `kind`: the plan
         // handler refuses a non-QEMU guest before this is reached, so there
         // is no second guest type for this to distinguish the way
@@ -140,6 +150,22 @@ fn render_destructive_preview(
              there is no snapshot of the pre-restore state unless one was taken.",
             action.volid.as_deref().unwrap_or("?")
         ),
+        "migrate" => {
+            let mode = if action.online {
+                "LIVE (guest stays running throughout)"
+            } else {
+                "OFFLINE (guest must be stopped)"
+            };
+            let disks = if action.with_local_disks {
+                " Node-local disks are copied along with the guest."
+            } else {
+                ""
+            };
+            format!(
+                "MIGRATE {target} to node '{}'\n  {mode} migration.{disks}",
+                action.target_node.as_deref().unwrap_or("?")
+            )
+        }
         "update_vm_config" => {
             let rendered = action.config.as_ref().map_or_else(String::new, |config| {
                 config
@@ -204,10 +230,15 @@ fn build_destroy_action(
     };
 
     let mut storage_node = None;
+    let mut target_node = None;
     let mut config = None;
     let (snapname, storage, volid) = match args.op.as_str() {
         // What 0.3 planned, and still the default.
         "destroy_guest" => (None, None, None),
+        "migrate" => {
+            target_node = Some(require_segment(&args.target_node, "target_node")?);
+            (None, None, None)
+        }
         "update_vm_config" => {
             if args.config.is_empty() {
                 return Err("update_vm_config requires config".to_owned());
@@ -265,7 +296,7 @@ fn build_destroy_action(
             return Err(format!(
                 "unknown destructive operation '{other}'; expected one of \
                  destroy_guest, delete_snapshot, rollback_snapshot, delete_backup, \
-                 delete_iso, restore_backup, update_vm_config"
+                 delete_iso, restore_backup, migrate, update_vm_config"
             ));
         }
     };
@@ -278,6 +309,9 @@ fn build_destroy_action(
         storage,
         volid,
         storage_node,
+        target_node,
+        online: args.online,
+        with_local_disks: args.with_local_disks,
         config,
     })
 }
@@ -318,6 +352,7 @@ fn missing_required_fields(action: &change_set::DestroyAction) -> Vec<&'static s
             ("storage_node", present(&action.storage_node)),
         ],
         "restore_backup" => vec![("volid", present(&action.volid))],
+        "migrate" => vec![("target_node", present(&action.target_node))],
         "update_vm_config" => vec![(
             "config",
             action.config.as_ref().is_some_and(|c| !c.is_empty()),
@@ -360,6 +395,33 @@ fn kind_named_in(path: &str) -> Option<&'static str> {
 /// stops it as part of the operation, so neither is listed.
 fn destroy_requires_a_stopped_guest(op: &str) -> bool {
     matches!(op, "destroy_guest" | "destroy")
+}
+
+/// Refuse a migration plan Proxmox would refuse anyway, before an approval is
+/// spent on it.
+///
+/// A live migration (`online`) needs a running guest to migrate live; an
+/// offline one needs the guest already stopped, since neither this server nor
+/// (for LXC) stock Proxmox negotiates a stop/restart on the caller's behalf
+/// for an *offline* request -- only `online` on a container asks Proxmox for
+/// its own stop/migrate/restart cycle. Checked here for the same reason
+/// [`destroy_requires_a_stopped_guest`] is checked before planning: discovering
+/// this at apply spends a second principal's approval on an operation that
+/// cannot succeed.
+fn migrate_precondition(online: bool, status: &str) -> Result<(), String> {
+    if online && status != "running" {
+        return Err(format!(
+            "guest reports status '{status}'; a live migration (online) requires a running \
+             guest. Start it first, or plan an offline migration instead."
+        ));
+    }
+    if !online && status != "stopped" {
+        return Err(format!(
+            "guest reports status '{status}'; an offline migration requires a stopped guest. \
+             Stop it first, or plan with online: true for a live migration."
+        ));
+    }
+    Ok(())
 }
 
 /// Principal recorded on a receipt written by startup recovery.
@@ -598,16 +660,20 @@ fn paginate(
 /// Every tool registered by this release. Kept sorted; asserted against the
 /// catalog by a test so the two cannot drift.
 pub const KNOWN_TOOLS: &[&str] = &[
+    "apply_ha_rule_change",
     "apply_proxmox_change_set",
     "apply_restore_new_vmid",
+    "approve_ha_rule_change",
     "approve_proxmox_change_set",
     "clone_vm",
     "create_backup",
     "create_container",
+    "create_ha_rule",
     "create_snapshot",
     "create_vm",
     "delete_backup",
     "delete_container",
+    "delete_ha_rule",
     "delete_iso",
     "delete_snapshot",
     "delete_vm",
@@ -624,6 +690,8 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "get_guest_firewall_options",
     "get_guest_firewall_rules",
     "get_guest_status",
+    "get_ha_rule",
+    "get_ha_rule_change_set",
     "get_node_firewall_options",
     "get_node_firewall_rules",
     "get_node_status",
@@ -639,10 +707,14 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "list_firewall_security_groups",
     "list_guest_firewall_aliases",
     "list_guest_firewall_ipsets",
+    "list_ha_rules",
     "list_isos",
     "list_snapshots",
     "list_tasks",
     "list_templates",
+    "migrate_container",
+    "migrate_vm",
+    "plan_ha_rule_change",
     "plan_proxmox_destroy",
     "plan_restore_new_vmid",
     "reset_vm",
@@ -658,6 +730,7 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "stop_task",
     "stop_vm",
     "update_container_resources",
+    "update_ha_rule",
     "update_vm_config",
 ];
 
@@ -675,6 +748,15 @@ pub struct NodeArgs {
     pub cluster: String,
     /// Node name as reported by `get_nodes`.
     pub node: String,
+}
+
+/// Arguments for a read scoped to one HA rule.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct HaRuleArgs {
+    /// Inventory name of the cluster.
+    pub cluster: String,
+    /// HA rule id, as reported by `list_ha_rules`.
+    pub rule: String,
 }
 
 /// Arguments for a cluster-scoped, paginated read.
@@ -1395,6 +1477,110 @@ impl ProxmoxServer {
             Err(error) => Err(Box::new(tool_error(error))),
         }
     }
+
+    /// Authorize every guest an HA rule change touches, as a destructive call.
+    ///
+    /// An HA `location`/`colocation` rule directs the HA manager to move the
+    /// guests it names, so writing one is gated like `plan_proxmox_destroy`
+    /// is for each of those guests: the token must carry the `destructive`
+    /// action tier, each guest must be inside its guest scope, and a guest
+    /// that is protected (live `protected` tag or inventory pin) is refused
+    /// unless a waiver or lab mode overrides it -- the same
+    /// [`destructive_allowed`] rule, through the same `GuestIndex::authorize`.
+    /// Unlike a destroy plan, an override here never waives the change set's
+    /// second-principal approval; it only lets the guest check pass.
+    ///
+    /// The guests checked are the union of the ones the action names and the
+    /// ones the rule currently names (`resources`, or `services` on older
+    /// payloads), so an update or delete cannot reach a guest the token could
+    /// not have named itself. A named vmid with no guest behind it is held to
+    /// the creation rule instead: inside the token's scope by number and not
+    /// an inventory pin.
+    ///
+    /// [`destructive_allowed`]: rust_proxmoxmcp_core::protect::destructive_allowed
+    ///
+    /// # Errors
+    /// Returns the boxed `CallToolResult` to `return *result` from a handler.
+    async fn authorize_ha_rule_guests(
+        &self,
+        client: &ProxmoxClient,
+        cluster: &str,
+        caller: Option<&CallerCtx<ProxmoxGrant>>,
+        action: &ha_change_set::HaRuleAction,
+        existing: Option<&serde_json::Value>,
+    ) -> Result<(), Box<CallToolResult>> {
+        use rust_proxmoxmcp_core::grant::ProxmoxAction;
+        use rust_proxmoxmcp_core::protect::{
+            Override, creation_allowed, destructive_allowed, protection_of,
+        };
+
+        let grant = resolve_grant(caller)?;
+        if !grant.allows_action(ProxmoxAction::Destructive) {
+            return Err(Box::new(tool_error(
+                "changing an HA rule requires the 'destructive' action tier, which this token \
+                 does not carry",
+            )));
+        }
+
+        let vmids = ha_change_set::guests_touched(action, existing)
+            .map_err(|error| Box::new(tool_error(error)))?;
+
+        // Fresh state, for the same reason `plan_destroy` drops the cache: a
+        // `protected` tag added seconds ago must be seen.
+        self.index.invalidate_cluster(cluster);
+
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_secs();
+
+        for vmid in vmids {
+            match self.index.resolve(client, cluster, vmid).await {
+                Ok(guest) => {
+                    let protection = protection_of(client.cluster(), Some(&guest), false);
+                    let override_ = destructive_allowed(
+                        &protection,
+                        &self.waivers,
+                        cluster,
+                        vmid,
+                        now_unix,
+                        self.lab_mode,
+                    );
+                    let override_applies = !matches!(override_, Override::None);
+                    self.index
+                        .authorize(
+                            client,
+                            cluster,
+                            vmid,
+                            &grant,
+                            Intent::destructive(override_applies),
+                        )
+                        .await
+                        .map_err(|error| {
+                            Box::new(tool_error(format!("HA rule names guest {vmid}: {error}")))
+                        })?;
+                }
+                Err(rust_proxmoxmcp_core::ProxmoxError::NotFound { .. }) => {
+                    if !grant.allows_new_vmid(vmid) {
+                        return Err(Box::new(tool_error(format!(
+                            "HA rule names vmid {vmid}, which is outside this token's guest scope"
+                        ))));
+                    }
+                    if !creation_allowed(client.cluster(), vmid) {
+                        return Err(Box::new(tool_error(format!(
+                            "HA rule names vmid {vmid}, a protected pin on cluster {cluster}"
+                        ))));
+                    }
+                }
+                Err(error) => {
+                    return Err(Box::new(tool_error(format!(
+                        "could not resolve guest {vmid} named by the HA rule: {error}"
+                    ))));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Resolve the grant for a guest-addressed call.
@@ -1697,6 +1883,37 @@ impl ProxmoxServer {
             &[("node", args.node.as_str())],
             None,
             false,
+            None,
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "list_ha_rules",
+        description = "All HA rules (location and colocation) in the cluster. Not the \
+                        deprecated HA groups mechanism."
+    )]
+    async fn list_ha_rules(
+        &self,
+        Parameters(args): Parameters<ClusterArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read("list_ha_rules", &args.cluster, &[], None, None, &context)
+            .await
+    }
+
+    #[tool(name = "get_ha_rule", description = "One HA rule by id.")]
+    async fn get_ha_rule(
+        &self,
+        Parameters(args): Parameters<HaRuleArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.serve_read(
+            "get_ha_rule",
+            &args.cluster,
+            &[("rule", args.rule.as_str())],
+            None,
             None,
             &context,
         )
@@ -2068,6 +2285,22 @@ impl ProxmoxServer {
             "restore_backup" => {
                 let volid = action.volid.as_deref().ok_or_else(|| missing("volid"))?;
                 guests::restore_backup(client, node, kind, vmid, volid, true).await
+            }
+            "migrate" => {
+                let target_node = action
+                    .target_node
+                    .as_deref()
+                    .ok_or_else(|| missing("target_node"))?;
+                guests::migrate_guest(
+                    client,
+                    node,
+                    kind,
+                    vmid,
+                    target_node,
+                    action.online,
+                    action.with_local_disks,
+                )
+                .await
             }
             "update_vm_config" => {
                 let config = action.config.as_ref().ok_or_else(|| missing("config"))?;
@@ -4059,6 +4292,42 @@ impl ProxmoxServer {
             ));
         }
 
+        // Same reasoning, for `migrate`: refuse a plan Proxmox cannot satisfy
+        // before an approval is spent on it, rather than after.
+        if action.op == "migrate" {
+            // `build_destroy_action` requires `target_node` for this op, so
+            // the field is always present on an action reaching this point.
+            let target_node = action
+                .target_node
+                .as_deref()
+                .expect("migrate action always carries target_node");
+
+            if target_node == guest.node {
+                return tool_error(format!(
+                    "guest {} is already on node '{}'; nothing to migrate",
+                    guest.vmid, guest.node
+                ));
+            }
+
+            if let Err(error) = migrate_precondition(action.online, &guest.status) {
+                return tool_error(error);
+            }
+
+            match rust_proxmoxmcp_core::guests::list_node_names(client).await {
+                Ok(nodes) => {
+                    if !nodes.iter().any(|node| node == target_node) {
+                        return tool_error(format!(
+                            "target node '{target_node}' is not a member of cluster '{}'; \
+                             known nodes: {}",
+                            args.cluster,
+                            nodes.join(", ")
+                        ));
+                    }
+                }
+                Err(error) => return tool_error(format!("listing cluster nodes: {error}")),
+            }
+        }
+
         // `update_vm_config` writes to `/qemu/{vmid}/config` specifically --
         // there is no LXC equivalent this tool reaches. Refused here, before
         // any approval is spent, rather than discovered as a 501 from
@@ -5025,6 +5294,598 @@ impl ProxmoxServer {
     }
 
     #[tool(
+        name = "plan_ha_rule_change",
+        description = "Plan an HA rule create, update or delete for two-principal approval."
+    )]
+    async fn plan_ha_rule_change(
+        &self,
+        Parameters(args): Parameters<ha_change_set::PlanHaRuleArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        use change_set::ChangeSetResponse;
+        use ha_change_set::{
+            build_ha_rule_action, ha_rule_device, render_ha_rule_preview, tool_for_ha_op,
+        };
+
+        let caller = Self::caller(&context);
+        if let Err(error) = authorize_call(
+            caller.as_ref(),
+            "plan_ha_rule_change",
+            Some(&args.cluster),
+            WRITE_TOOLS,
+        ) {
+            return tool_error(error);
+        }
+
+        let client = match self.client_for(&args.cluster) {
+            Ok(client) => client,
+            Err(result) => return *result,
+        };
+
+        let action = match build_ha_rule_action(&args) {
+            Ok(action) => action,
+            Err(error) => return tool_error(error),
+        };
+
+        // The operation's own tool scope, on top of `plan_ha_rule_change`. Same
+        // reasoning as `tool_for_op`: without this, a token allowlisted only
+        // for the generic plan/apply handlers could select any operation.
+        let Some(op_tool) = tool_for_ha_op(&action.op) else {
+            return tool_error(format!("unknown HA rule operation '{}'", action.op));
+        };
+        if let Err(error) =
+            authorize_call(caller.as_ref(), op_tool, Some(&args.cluster), WRITE_TOOLS)
+        {
+            return tool_error(error);
+        }
+
+        let existing = match rust_proxmoxmcp_core::ha_rules::fetch_rule(client, &args.rule).await {
+            Ok(existing) => existing,
+            Err(error) => return tool_error(format!("reading current rule: {error}")),
+        };
+
+        // Refuse a plan Proxmox would refuse anyway, before an approval is
+        // spent on it -- the same reasoning as the stopped-guest check on a
+        // destroy plan.
+        match (action.op.as_str(), existing.is_some()) {
+            ("create", true) => {
+                return tool_error(format!(
+                    "rule '{}' already exists; plan an update instead",
+                    args.rule
+                ));
+            }
+            ("update" | "delete", false) => {
+                return tool_error(format!(
+                    "rule '{}' does not exist; nothing to {}",
+                    args.rule, action.op
+                ));
+            }
+            _ => {}
+        }
+
+        // Every guest the rule names -- in the requested change and in the
+        // rule as it stands -- must be one this token may act on
+        // destructively, and must not be protected without an override. A
+        // location or colocation rule makes the HA manager move those guests,
+        // so it gets the same guest-scope and protection gate a
+        // `plan_proxmox_destroy` of each of them would.
+        if let Err(result) = self
+            .authorize_ha_rule_guests(
+                client,
+                &args.cluster,
+                caller.as_ref(),
+                &action,
+                existing.as_ref(),
+            )
+            .await
+        {
+            return *result;
+        }
+
+        let expected_fingerprint = rust_proxmoxmcp_core::fingerprint::ha_rule_fingerprint(
+            &args.cluster,
+            &args.rule,
+            existing.as_ref(),
+        );
+        // The preview reaches the model and the change-set store, so the
+        // rule's free-text fields get the same redaction a `get_ha_rule` read
+        // does. The fingerprint above stays over the raw rule.
+        let redacted_existing = existing.clone().map(|mut value| {
+            redact_free_text_fields(&mut value);
+            value
+        });
+        let preview_text = render_ha_rule_preview(&action, redacted_existing.as_ref());
+
+        let coordinator = self.coordinator.clone();
+        let owner = caller
+            .as_ref()
+            .map(|ctx| ctx.token_name.clone())
+            .unwrap_or_else(|| "stdio".to_owned());
+        let device = ha_rule_device(&args.cluster, &args.rule);
+        let policy_signature = "proxmox-no-policy-engine";
+
+        let output = match coordinator
+            .create_change_set(
+                device,
+                vec![action],
+                owner,
+                expected_fingerprint.clone(),
+                policy_signature.to_owned(),
+            )
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => return tool_error(format!("create: {error}")),
+        };
+
+        // Persist the preview, as `plan_destroy` does -- see its comment for
+        // why this is a second write rather than part of `create_change_set`.
+        let Some(mut with_preview) = coordinator
+            .change_sets()
+            .await
+            .into_iter()
+            .find(|record| record.id == output.change_set_id)
+        else {
+            tracing::error!(
+                change_set = %output.change_set_id,
+                "the change set could not be read back; the plan is refused"
+            );
+            return tool_error(
+                "plan refused: the change set could not be read back to store its \
+                 preview. It has no preview, so approve and apply will refuse it. \
+                 Plan the operation again.",
+            );
+        };
+
+        with_preview.preview = Some(mecmcp_changeset::PreviewRecord {
+            digest: mecmcp_changeset::preview_digest(&preview_text),
+            artifact: preview_text.clone(),
+            job_id: None,
+        });
+        if let Err(error) = coordinator.update_change_set(with_preview).await {
+            tracing::error!(
+                %error,
+                change_set = %output.change_set_id,
+                "the preview could not be persisted; the plan is refused"
+            );
+            return tool_error(format!(
+                "plan refused: the preview could not be persisted ({error}). The \
+                 change set has no stored preview, so approve and apply will refuse \
+                 it. Plan the operation again."
+            ));
+        }
+
+        let response = ChangeSetResponse {
+            change_set_id: output.change_set_id,
+            state: format!("{:?}", output.state),
+            expected_fingerprint,
+            preview: preview_text,
+            expected_digest: Some(output.digest),
+        };
+
+        tool_result(
+            Ok::<_, String>(response),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
+    }
+
+    #[tool(
+        name = "get_ha_rule_change_set",
+        description = "Retrieve the current state of an HA rule change set."
+    )]
+    async fn get_ha_rule_change_set(
+        &self,
+        Parameters(args): Parameters<ha_change_set::HaChangeSetArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        use change_set::ChangeSetResponse;
+
+        let caller = Self::caller(&context);
+        if let Err(error) = authorize_call(
+            caller.as_ref(),
+            "get_ha_rule_change_set",
+            Some(&args.cluster),
+            WRITE_TOOLS,
+        ) {
+            return tool_error(error);
+        }
+
+        let coordinator = self.coordinator.clone();
+        let device = ha_change_set::ha_rule_device(&args.cluster, &args.rule);
+        let record = match coordinator.change_set(&args.change_set_id, &device).await {
+            Ok(record) => record,
+            Err(error) => return tool_error(format!("get: {error}")),
+        };
+
+        let preview_text = record
+            .preview
+            .as_ref()
+            .map(|p| p.artifact.clone())
+            .unwrap_or_else(|| "(no preview)".to_owned());
+
+        let response = ChangeSetResponse {
+            change_set_id: record.id,
+            state: format!("{:?}", record.state),
+            expected_fingerprint: record.expected_candidate_fingerprint,
+            preview: preview_text,
+            expected_digest: Some(record.digest),
+        };
+
+        tool_result(
+            Ok::<_, String>(response),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
+    }
+
+    #[tool(
+        name = "approve_ha_rule_change",
+        description = "Approve a planned HA rule change set as a second principal."
+    )]
+    async fn approve_ha_rule_change(
+        &self,
+        Parameters(args): Parameters<ha_change_set::HaChangeSetArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        use change_set::ChangeSetResponse;
+
+        let caller = Self::caller(&context);
+        if let Err(error) = authorize_call(
+            caller.as_ref(),
+            "approve_ha_rule_change",
+            Some(&args.cluster),
+            WRITE_TOOLS,
+        ) {
+            return tool_error(error);
+        }
+
+        let approver = caller
+            .as_ref()
+            .map(|ctx| ctx.token_name.clone())
+            .unwrap_or_else(|| "stdio".to_owned());
+        // Same as `approve_change_set`: the actor type comes from the caller's
+        // verified token entry, and anything but `Human` is refused by mecmcp.
+        let approver_actor_type = change_set::actor_type(caller.as_ref());
+
+        let coordinator = self.coordinator.clone();
+        let device = ha_change_set::ha_rule_device(&args.cluster, &args.rule);
+        let record = match coordinator.change_set(&args.change_set_id, &device).await {
+            Ok(record) => record,
+            Err(error) => return tool_error(format!("get: {error}")),
+        };
+
+        let Some(preview) = record.preview.as_ref() else {
+            return tool_error(
+                "approval refused: this change set has no stored preview, so there is \
+                 nothing to review. Plan the operation again.",
+            );
+        };
+
+        let output = match coordinator
+            .approve_change_set(
+                args.change_set_id.clone(),
+                device,
+                approver,
+                record.digest.clone(),
+                approver_actor_type,
+            )
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                let msg = error.to_string();
+                if msg.contains("owner cannot approve their own") {
+                    return tool_error(
+                        "self-approval refused: the planner cannot approve their own change set",
+                    );
+                }
+                return tool_error(format!("approve: {error}"));
+            }
+        };
+
+        let preview_text = preview.artifact.clone();
+
+        let response = ChangeSetResponse {
+            change_set_id: output.change_set_id,
+            state: format!("{:?}", output.state),
+            expected_fingerprint: record.expected_candidate_fingerprint,
+            preview: preview_text,
+            expected_digest: Some(output.digest),
+        };
+
+        tool_result(
+            Ok::<_, String>(response),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+        )
+    }
+
+    #[tool(
+        name = "apply_ha_rule_change",
+        description = "Apply an approved HA rule change set."
+    )]
+    async fn apply_ha_rule_change(
+        &self,
+        Parameters(args): Parameters<ha_change_set::HaChangeSetArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        use ha_change_set::{HaRuleAction, missing_required_ha_fields, tool_for_ha_op};
+
+        let caller = Self::caller(&context);
+        let apply_request_id = caller
+            .as_ref()
+            .map_or_else(|| "stdio".to_owned(), |ctx| ctx.request_id.to_string());
+        let apply_principal = caller
+            .as_ref()
+            .map_or_else(|| "stdio".to_owned(), |ctx| ctx.token_name.clone());
+        if let Err(error) = authorize_call(
+            caller.as_ref(),
+            "apply_ha_rule_change",
+            Some(&args.cluster),
+            WRITE_TOOLS,
+        ) {
+            return tool_error(error);
+        }
+
+        let client = match self.client_for(&args.cluster) {
+            Ok(client) => client,
+            Err(result) => return *result,
+        };
+
+        let coordinator = self.coordinator.clone();
+        let device = ha_change_set::ha_rule_device(&args.cluster, &args.rule);
+        let mut record = match coordinator.change_set(&args.change_set_id, &device).await {
+            Ok(record) => record,
+            Err(error) => return tool_error(format!("get: {error}")),
+        };
+
+        if record.preview.is_none() {
+            return tool_error(
+                "apply refused: this change set has no stored preview, so the action it \
+                 would take was never recorded for review. Plan the operation again.",
+            );
+        }
+
+        // Re-fetch the rule's current state and verify the fingerprint, the
+        // same drift check `apply_change_set` runs against a guest.
+        let existing = match rust_proxmoxmcp_core::ha_rules::fetch_rule(client, &args.rule).await {
+            Ok(existing) => existing,
+            Err(error) => return tool_error(format!("reading current rule: {error}")),
+        };
+        let current_fingerprint = rust_proxmoxmcp_core::fingerprint::ha_rule_fingerprint(
+            &args.cluster,
+            &args.rule,
+            existing.as_ref(),
+        );
+        if current_fingerprint != record.expected_candidate_fingerprint {
+            return tool_error(format!(
+                "fingerprint changed (expected {}, got {})",
+                record.expected_candidate_fingerprint, current_fingerprint
+            ));
+        }
+
+        if record.state != mecmcp_changeset::ChangeSetState::Approved {
+            return tool_error(format!(
+                "change set not approved (state: {:?})",
+                record.state
+            ));
+        }
+
+        let action: HaRuleAction = match record.actions.first() {
+            Some(value) => match serde_json::from_value(value.clone()) {
+                Ok(action) => action,
+                Err(error) => {
+                    return tool_error(format!(
+                        "the change set's action could not be read ({error}); \
+                         it cannot be applied"
+                    ));
+                }
+            },
+            None => return tool_error("the change set records no action".to_owned()),
+        };
+
+        let Some(op_tool) = tool_for_ha_op(&action.op) else {
+            return tool_error(format!(
+                "the change set names an unknown operation '{}'",
+                action.op
+            ));
+        };
+        if let Err(error) =
+            authorize_call(caller.as_ref(), op_tool, Some(&args.cluster), WRITE_TOOLS)
+        {
+            return tool_error(error);
+        }
+
+        let absent = missing_required_ha_fields(&action);
+        if !absent.is_empty() {
+            return tool_error(format!(
+                "the change set records a '{}' action without {}; it cannot be applied. \
+                 Plan the operation again with plan_ha_rule_change and have the new \
+                 change set approved -- nothing was sent to the cluster.",
+                action.op,
+                absent.join(", ")
+            ));
+        }
+
+        // Again at apply, against the rule as it stands now: a grant can be
+        // narrowed, or a guest tagged `protected`, between plan and apply,
+        // and the apply is the call that acts.
+        if let Err(result) = self
+            .authorize_ha_rule_guests(
+                client,
+                &args.cluster,
+                caller.as_ref(),
+                &action,
+                existing.as_ref(),
+            )
+            .await
+        {
+            return *result;
+        }
+
+        // Spend the approval before anything reaches the cluster, and claim
+        // with `ApplyHandle::None`: an HA rule write answers synchronously,
+        // so there is never a vendor task to attach.
+        record = match coordinator
+            .claim_change_set_for_apply(
+                &record.id,
+                &record.device,
+                mecmcp_changeset::ApplyHandle::None,
+            )
+            .await
+        {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                return tool_error(format!(
+                    "apply refused: the change set could not be claimed for apply ({error}). \
+                     Another apply may already hold it. Nothing was sent to the cluster."
+                ));
+            }
+        };
+
+        if let Some(recorder) = &self.evidence
+            && let Err(error) = recorder.apply_intent(
+                &apply_request_id,
+                &record.id,
+                &record.device,
+                &apply_principal,
+            )
+        {
+            let mut abandoned = record.clone();
+            abandoned.state = mecmcp_changeset::ChangeSetState::Failed;
+            let settled = coordinator.update_change_set(abandoned).await;
+            if let Err(settle_error) = &settled {
+                tracing::error!(
+                    target: "audit",
+                    %settle_error,
+                    change_set = %record.id,
+                    "claimed change set left in Applying after the intent record failed"
+                );
+            }
+            return tool_error(match settled {
+                Ok(()) => format!(
+                    "apply refused: the apply-intent evidence record could not be persisted \
+                     ({error}); nothing was sent to the cluster and the change set is now \
+                     failed -- plan the operation again"
+                ),
+                Err(settle_error) => format!(
+                    "apply refused: the apply-intent evidence record could not be persisted \
+                     ({error}), and the change set could not then be settled \
+                     ({settle_error}). Nothing was sent to the cluster, but the record is \
+                     still claimed and reads as applying -- it needs an operator before \
+                     this rule can be planned again"
+                ),
+            });
+        }
+
+        let result = match action.op.as_str() {
+            "create" => {
+                let fields = rust_proxmoxmcp_core::ha_rules::HaRuleFields {
+                    rule_type: action.rule_type.as_deref().unwrap_or_default(),
+                    services: action.services.as_deref().unwrap_or_default(),
+                    nodes: action.nodes.as_deref(),
+                    affinity: action.affinity.as_deref(),
+                    strict: action.strict,
+                    comment: action.comment.as_deref(),
+                    disable: action.disable,
+                };
+                rust_proxmoxmcp_core::ha_rules::create_rule(client, &action.rule, &fields).await
+            }
+            "update" => {
+                let digest = existing
+                    .as_ref()
+                    .and_then(|value| value.get("digest"))
+                    .and_then(|value| value.as_str());
+                let empty_services: Vec<String> = Vec::new();
+                let fields = rust_proxmoxmcp_core::ha_rules::HaRuleFields {
+                    rule_type: "",
+                    services: action.services.as_deref().unwrap_or(&empty_services),
+                    nodes: action.nodes.as_deref(),
+                    affinity: action.affinity.as_deref(),
+                    strict: action.strict,
+                    comment: action.comment.as_deref(),
+                    disable: action.disable,
+                };
+                rust_proxmoxmcp_core::ha_rules::update_rule(client, &action.rule, &fields, digest)
+                    .await
+            }
+            "delete" => rust_proxmoxmcp_core::ha_rules::delete_rule(client, &action.rule).await,
+            other => Err(rust_proxmoxmcp_core::ProxmoxError::Malformed(format!(
+                "unknown HA rule operation '{other}'"
+            ))),
+        };
+
+        match result {
+            Ok(()) => {
+                if let Some(recorder) = &self.evidence
+                    && let Err(receipt_error) = recorder.result_receipt(
+                        &apply_request_id,
+                        &record.id,
+                        &record.device,
+                        &apply_principal,
+                        true,
+                        "",
+                    )
+                {
+                    tracing::error!(
+                        %receipt_error,
+                        change_set_id = %record.id,
+                        "the operation completed but its result receipt could not be persisted"
+                    );
+                }
+
+                record.state = mecmcp_changeset::ChangeSetState::Applied;
+                record.task_id = None;
+                if let Err(error) = coordinator.update_change_set(record).await {
+                    tracing::error!(%error, "could not mark the change set applied");
+                }
+
+                tool_result::<_, String>(
+                    Ok(serde_json::json!({ "outcome": "ok" })),
+                    ResultFormat::PrettyJson,
+                    RESULT_LIMITS,
+                )
+            }
+            Err(error) => {
+                // Same distinction `apply_change_set` draws: the cluster
+                // answering "no" and the request vanishing are different
+                // facts, and only the first is safe to record as a failure.
+                let definitive = matches!(
+                    error,
+                    rust_proxmoxmcp_core::ProxmoxError::Api { .. }
+                        | rust_proxmoxmcp_core::ProxmoxError::Unauthorized
+                        | rust_proxmoxmcp_core::ProxmoxError::Denied(_)
+                        | rust_proxmoxmcp_core::ProxmoxError::NotFound { .. }
+                );
+                if definitive {
+                    if let Some(recorder) = &self.evidence
+                        && let Err(receipt_error) = recorder.result_receipt(
+                            &apply_request_id,
+                            &record.id,
+                            &record.device,
+                            &apply_principal,
+                            false,
+                            &error.to_string(),
+                        )
+                    {
+                        tracing::error!(%receipt_error, "failure receipt not persisted");
+                    }
+                    record.state = mecmcp_changeset::ChangeSetState::Failed;
+                    let _ = coordinator.update_change_set(record).await;
+                } else {
+                    tracing::error!(
+                        %error,
+                        "the HA rule write failed without a definitive answer; the outcome \
+                         is indeterminate and no result receipt is emitted"
+                    );
+                }
+                tool_error(error)
+            }
+        }
+    }
+
+    #[tool(
         name = "plan_restore_new_vmid",
         description = "Plan restoring a backup archive into a new VMID, for two-principal approval."
     )]
@@ -5681,6 +6542,10 @@ mod tests {
             "get_proxmox_change_set",
             "approve_proxmox_change_set",
             "apply_proxmox_change_set",
+            "plan_ha_rule_change",
+            "get_ha_rule_change_set",
+            "approve_ha_rule_change",
+            "apply_ha_rule_change",
             "plan_restore_new_vmid",
             "apply_restore_new_vmid",
         ];
@@ -5998,6 +6863,9 @@ mod destructive_action_tests {
             storage: None,
             volid: None,
             storage_node: None,
+            target_node: None,
+            online: false,
+            with_local_disks: false,
             config: std::collections::BTreeMap::new(),
         }
     }
@@ -6178,6 +7046,9 @@ mod destructive_scope_tests {
             storage: Some("local".to_owned()),
             volid: volid.map(ToOwned::to_owned),
             storage_node: Some("pve2".to_owned()),
+            target_node: None,
+            online: false,
+            with_local_disks: false,
             config: None,
         }
     }
@@ -6236,6 +7107,9 @@ mod destructive_scope_tests {
             storage: Some("local".to_owned()),
             volid: Some("local:backup/x".to_owned()),
             storage_node: None,
+            target_node: None,
+            online: false,
+            with_local_disks: false,
             config: std::collections::BTreeMap::new(),
         };
         let error = build_destroy_action(&args).expect_err("storage_node is required");
@@ -6340,6 +7214,7 @@ mod destructive_scope_tests {
             ("delete_backup", &["storage", "volid", "storage_node"][..]),
             ("delete_iso", &["storage", "volid", "storage_node"][..]),
             ("restore_backup", &["volid"][..]),
+            ("migrate", &["target_node"][..]),
             ("update_vm_config", &["config"][..]),
         ] {
             let stripped = super::change_set::DestroyAction {
@@ -6350,6 +7225,9 @@ mod destructive_scope_tests {
                 storage: None,
                 volid: None,
                 storage_node: None,
+                target_node: None,
+                online: false,
+                with_local_disks: false,
                 config: None,
             };
             assert_eq!(

@@ -316,6 +316,25 @@ pub const READ_TOOLS: &[ReadTool] = &[
         type_filter: None,
         query: &[],
     },
+    ReadTool {
+        name: "list_ha_rules",
+        method: Method::Get,
+        path: "/api2/json/cluster/ha/rules",
+        needs_guest: false,
+        description: "All HA rules (location and colocation) in the cluster. \
+                       Not the deprecated HA groups mechanism.",
+        type_filter: None,
+        query: &[],
+    },
+    ReadTool {
+        name: "get_ha_rule",
+        method: Method::Get,
+        path: "/api2/json/cluster/ha/rules/{rule}",
+        needs_guest: false,
+        description: "One HA rule by id.",
+        type_filter: None,
+        query: &[],
+    },
 ];
 
 /// Look up a read tool by MCP name.
