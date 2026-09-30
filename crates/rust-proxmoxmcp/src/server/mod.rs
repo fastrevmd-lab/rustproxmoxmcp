@@ -1823,14 +1823,16 @@ impl ProxmoxServer {
                             .is_some_and(|t| t == filter_type.path_segment())
                     });
                 }
-                // `type_filter` is set exactly for tools that list guests off
+                // `guest_listing` is set exactly for tools that list guests off
                 // `/cluster/resources` (get_vms, get_containers). Those return
                 // every guest in the cluster regardless of `vmid`, which is
                 // always `None` for them, so the `Some(vmid)` branch above
                 // never runs its grant check. A narrowed token must not see
                 // guests outside its scope just because the tool it called
-                // never named one.
-                if entry.type_filter.is_some() {
+                // never named one. Keyed on the explicit flag, not on
+                // `type_filter.is_some()`, so a future guest-listing tool with
+                // no type filter cannot silently skip this.
+                if entry.guest_listing {
                     use rust_proxmoxmcp_core::resolve::parse_resource_guest;
 
                     let grant = match resolve_grant(caller.as_ref()) {
@@ -2538,12 +2540,18 @@ impl ProxmoxServer {
         let client = self.client_for(&args.cluster)?;
         let grant = resolve_grant(caller.as_ref())?;
 
-        let resolved = self
-            .index
-            .resolve(client, &args.cluster, args.vmid)
-            .await
-            .map_err(|error| Box::new(tool_error(error)))?;
-        let protection = protection_of(client.cluster(), Some(&resolved), false);
+        // A resolve failure here is not surfaced directly: doing so would
+        // tell an out-of-scope caller "not found" before the scope check
+        // below ever ran, distinguishing an absent guest from a merely
+        // denied one. `authorize` below re-resolves (from cache) and returns
+        // the same error either way; this lookup exists only to compute
+        // protection for `override_applies` when the guest does exist.
+        let (resolved, resolution_failed) =
+            match self.index.resolve(client, &args.cluster, args.vmid).await {
+                Ok(guest) => (Some(guest), false),
+                Err(_) => (None, true),
+            };
+        let protection = protection_of(client.cluster(), resolved.as_ref(), resolution_failed);
 
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2620,12 +2628,17 @@ impl ProxmoxServer {
 
         // Resolve first so protection can be computed before authorization,
         // exactly as the destroy path does: a waiver or lab mode has to be
-        // known before the gate runs, not after it has already refused.
-        let resolved = match self.index.resolve(client, &args.cluster, args.vmid).await {
-            Ok(guest) => guest,
-            Err(error) => return tool_error(error),
-        };
-        let protection = protection_of(client.cluster(), Some(&resolved), false);
+        // known before the gate runs, not after it has already refused. A
+        // resolve failure is not surfaced here -- see the comment in
+        // `authorize_low_with_interrupts` -- so `authorize` below is what
+        // decides whether an absent or an out-of-scope guest gets refused,
+        // and both get the same error text.
+        let (resolved, resolution_failed) =
+            match self.index.resolve(client, &args.cluster, args.vmid).await {
+                Ok(guest) => (Some(guest), false),
+                Err(_) => (None, true),
+            };
+        let protection = protection_of(client.cluster(), resolved.as_ref(), resolution_failed);
 
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4280,12 +4293,16 @@ impl ProxmoxServer {
         // refuse; the plan should not have been built from stale state.
         self.index.invalidate_cluster(&args.cluster);
 
-        // Resolve guest and compute protection to determine override.
-        let guest = match self.index.resolve(client, &args.cluster, args.vmid).await {
-            Ok(guest) => guest,
-            Err(error) => return tool_error(error),
-        };
-        let protection = protection_of(client.cluster(), Some(&guest), false);
+        // Resolve guest and compute protection to determine override. A
+        // resolve failure is not surfaced directly -- `authorize` below
+        // re-resolves and is what decides whether an absent guest and an
+        // out-of-scope one get refused, with identical error text either way.
+        let (resolved, resolution_failed) =
+            match self.index.resolve(client, &args.cluster, args.vmid).await {
+                Ok(guest) => (Some(guest), false),
+                Err(_) => (None, true),
+            };
+        let protection = protection_of(client.cluster(), resolved.as_ref(), resolution_failed);
 
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4840,12 +4857,16 @@ impl ProxmoxServer {
         // started before this point from re-publishing pre-change state.
         self.index.invalidate_cluster(&args.cluster);
 
-        // Resolve guest and compute protection to determine override.
-        let guest = match self.index.resolve(client, &args.cluster, args.vmid).await {
-            Ok(guest) => guest,
-            Err(error) => return tool_error(error),
-        };
-        let protection = protection_of(client.cluster(), Some(&guest), false);
+        // Resolve guest and compute protection to determine override. A
+        // resolve failure is not surfaced directly -- `authorize` below
+        // re-resolves and is what decides whether an absent guest and an
+        // out-of-scope one get refused, with identical error text either way.
+        let (resolved, resolution_failed) =
+            match self.index.resolve(client, &args.cluster, args.vmid).await {
+                Ok(guest) => (Some(guest), false),
+                Err(_) => (None, true),
+            };
+        let protection = protection_of(client.cluster(), resolved.as_ref(), resolution_failed);
 
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -5554,6 +5575,23 @@ impl ProxmoxServer {
             WRITE_TOOLS,
         ) {
             return tool_error(error);
+        }
+
+        // The preview below names the rule's guests, which are not filtered
+        // by the caller's guest scope -- same reasoning as `list_ha_rules`
+        // and `get_ha_rule`. A narrowed token must not read a change set it
+        // did not create just because it knows the id.
+        let grant = match resolve_grant(caller.as_ref()) {
+            Ok(grant) => grant,
+            Err(error) => return *error,
+        };
+        if !grant.is_unrestricted_guest_scope() {
+            return tool_error(
+                "get_ha_rule_change_set is not scoped to any single guest -- its preview names \
+                 the rule's guests -- so it requires a token whose guest scope is '*'. This \
+                 token is narrowed to specific guests and cannot be checked against it."
+                    .to_owned(),
+            );
         }
 
         let coordinator = self.coordinator.clone();
