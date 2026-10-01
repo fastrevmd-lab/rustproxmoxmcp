@@ -217,6 +217,36 @@ async fn a_narrowed_token_may_not_stop_a_node_level_task() {
     assert!(err.contains('*'), "{err}");
 }
 
+/// L2 regression: `get_task_status` names no guest selector at all -- the
+/// vmid embedded in a UPID is never checked against the caller's grant, only
+/// used cosmetically -- so before this fix a narrowed token could read the
+/// status of any task on any node, in or out of its own scope. It now
+/// requires an unrestricted ('*') scope, the same as the other node- and
+/// cluster-wide listings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_narrowed_token_cannot_reach_get_task_status() {
+    let h = common::TestServer::start_with_routes(
+        spec(&["get_task_status"], &["vmid:600-699"]),
+        routes(),
+    )
+    .await;
+
+    // Even a task that names an in-scope guest (617) is refused: the tool
+    // reads node-wide task state, not anything scoped to that guest.
+    let err = common::call(
+        &h,
+        "get_task_status",
+        json!({
+            "cluster":"pve3",
+            "node":"pve2",
+            "upid":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdump:617:root@pam:"
+        }),
+    )
+    .await
+    .expect_err("a narrowed guest scope must not reach get_task_status");
+    assert!(err.contains('*'), "{err}");
+}
+
 /// `get_container_ip` reads an LXC interface list, so a QEMU guest has to be
 /// refused by name rather than sent to a path that does not exist for it.
 ///

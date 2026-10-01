@@ -558,3 +558,66 @@ async fn a_wildcard_read_token_reaches_every_firewall_read_tool() {
     .await
     .expect("wildcard token reaches get_guest_firewall_options");
 }
+
+/// L2 regression: the cluster-, group-, IPSet-, alias- and node-level firewall
+/// reads name no guest, so a guest-scoped selector has nothing to narrow --
+/// before this fix they were served to a narrowed token anyway, and IPSets
+/// and aliases name addresses belonging to guests outside that token's scope.
+/// Each needs an unrestricted ('*') scope, the same way `list_backups` and
+/// `download_iso` already do for the equivalent reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_narrowed_token_cannot_reach_cluster_or_node_firewall_reads() {
+    let narrowed = common::TokenSpec {
+        clusters: vec!["pve3".to_owned()],
+        tools: vec![
+            "get_cluster_firewall_rules".to_owned(),
+            "get_cluster_firewall_options".to_owned(),
+            "list_firewall_security_groups".to_owned(),
+            "get_firewall_security_group_rules".to_owned(),
+            "list_firewall_ipsets".to_owned(),
+            "get_firewall_ipset_entries".to_owned(),
+            "list_firewall_aliases".to_owned(),
+            "get_node_firewall_rules".to_owned(),
+            "get_node_firewall_options".to_owned(),
+        ],
+        guests: vec!["vmid:600-699".to_owned()],
+    };
+    let h = common::TestServer::start_with_routes(
+        narrowed,
+        cluster_routes(POPULATED_RULES, POPULATED_OPTIONS),
+    )
+    .await;
+
+    for (tool, args) in [
+        ("get_cluster_firewall_rules", json!({"cluster": "pve3"})),
+        ("get_cluster_firewall_options", json!({"cluster": "pve3"})),
+        ("list_firewall_security_groups", json!({"cluster": "pve3"})),
+        (
+            "get_firewall_security_group_rules",
+            json!({"cluster": "pve3", "group": "webservers"}),
+        ),
+        ("list_firewall_ipsets", json!({"cluster": "pve3"})),
+        (
+            "get_firewall_ipset_entries",
+            json!({"cluster": "pve3", "name": "blocklist"}),
+        ),
+        ("list_firewall_aliases", json!({"cluster": "pve3"})),
+        (
+            "get_node_firewall_rules",
+            json!({"cluster": "pve3", "node": "pve2"}),
+        ),
+        (
+            "get_node_firewall_options",
+            json!({"cluster": "pve3", "node": "pve2"}),
+        ),
+    ] {
+        let err = match common::call(&h, tool, args).await {
+            Ok(value) => panic!("{tool} must refuse a narrowed guest scope, got {value:?}"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains('*'),
+            "{tool} refusal must name the unrestricted-scope requirement: {err}"
+        );
+    }
+}

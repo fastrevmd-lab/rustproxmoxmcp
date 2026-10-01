@@ -2067,7 +2067,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("node", args.node.as_str())],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -3167,7 +3167,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("node", args.node.as_str())],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -3286,7 +3286,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("node", args.node.as_str()), ("upid", args.upid.as_str())],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -3307,7 +3307,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -3328,7 +3328,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -3349,7 +3349,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -3370,7 +3370,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("group", args.group.as_str())],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -3391,7 +3391,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -3412,7 +3412,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("name", args.name.as_str())],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -3433,7 +3433,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -3454,7 +3454,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("node", args.node.as_str())],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -3475,7 +3475,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("node", args.node.as_str())],
             None,
-            false,
+            true,
             None,
             &context,
         )
