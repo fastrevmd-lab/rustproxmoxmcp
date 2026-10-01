@@ -397,6 +397,31 @@ fn destroy_requires_a_stopped_guest(op: &str) -> bool {
     matches!(op, "destroy_guest" | "destroy")
 }
 
+/// Refuse `delete_iso` for a token whose guest scope is narrowed.
+///
+/// `delete_iso` names a vmid only so the usual guest-scope and protection
+/// machinery has something to check, but the ISO it deletes lives on
+/// node/cluster storage that every guest shares -- it is not actually scoped
+/// to that vmid. A token narrowed to `vmid:600-699` naming any in-scope guest
+/// could otherwise delete an ISO relied on by guests outside its scope,
+/// including ones it could never touch directly. `download_iso` already
+/// requires an unrestricted scope for the same reason (see its handler); this
+/// closes the equivalent hole on the delete side.
+fn require_unrestricted_scope_for_delete_iso(
+    op: &str,
+    grant: &rust_proxmoxmcp_core::grant::ProxmoxGrant,
+) -> Result<(), String> {
+    if op == "delete_iso" && !grant.is_unrestricted_guest_scope() {
+        return Err(
+            "delete_iso deletes from storage that is not scoped to any guest, so it requires a \
+             token whose guest scope is '*'. This token is narrowed to specific guests and \
+             cannot be checked against a storage."
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 /// Refuse a migration plan Proxmox would refuse anyway, before an approval is
 /// spent on it.
 ///
@@ -4739,6 +4764,10 @@ impl ProxmoxServer {
             return tool_error(error);
         }
 
+        if let Err(error) = require_unrestricted_scope_for_delete_iso(&action.op, &grant) {
+            return tool_error(error);
+        }
+
         // The digest and disk sizes come from the guest's own config, not
         // `/cluster/resources` -- that snapshot is cluster-wide and reports
         // neither. Fetched fresh rather than cached: this is what apply
@@ -5174,6 +5203,10 @@ impl ProxmoxServer {
             {
                 return tool_error(error);
             }
+
+            if let Err(error) = require_unrestricted_scope_for_delete_iso(&action.op, &grant) {
+                return tool_error(error);
+            }
         } else {
             use restore_change_set::RestoreNewVmidAction;
             use rust_proxmoxmcp_core::grant::ProxmoxAction;
@@ -5473,6 +5506,10 @@ impl ProxmoxServer {
         if let Err(error) =
             authorize_call(caller.as_ref(), op_tool, Some(&args.cluster), WRITE_TOOLS)
         {
+            return tool_error(error);
+        }
+
+        if let Err(error) = require_unrestricted_scope_for_delete_iso(&action.op, &grant) {
             return tool_error(error);
         }
 

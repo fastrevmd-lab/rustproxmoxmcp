@@ -832,6 +832,56 @@ async fn plan_delete_iso_refuses_backup_volid() {
     );
 }
 
+/// L1 regression: `delete_iso` names a vmid only so the usual guest-scope
+/// machinery has something to check, but the ISO itself lives on storage
+/// every guest on the node shares -- it is not actually scoped to that vmid.
+/// A token narrowed to a vmid range must not be able to delete it merely by
+/// naming an in-scope guest, the same way `download_iso` already requires an
+/// unrestricted scope for the identical reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_delete_iso_refuses_a_narrowed_guest_scope() {
+    let h = common::TestServer::start_with_routes(
+        common::TokenSpec {
+            clusters: vec!["pve3".to_owned()],
+            tools: vec!["plan_proxmox_destroy".to_owned(), "delete_iso".to_owned()],
+            guests: vec!["vmid:600-699".to_owned()],
+        },
+        vec![
+            common::Route {
+                path: "/api2/json/nodes",
+                status: 200,
+                body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+            },
+            common::Route {
+                path: "/api2/json/cluster/resources",
+                status: 200,
+                body: br#"{"data":[{"id":"lxc/617","type":"lxc","vmid":617,"name":"test","node":"pve2","status":"stopped"}]}"#,
+            },
+        ],
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({
+            "cluster": "pve3",
+            "vmid": 617,
+            "op": "delete_iso",
+            "storage": "local",
+            "storage_node": "pve2",
+            "volid": "local:iso/debian-12.iso"
+        }),
+    )
+    .await
+    .expect_err("a narrowed guest scope must not admit delete_iso");
+
+    assert!(
+        err.contains("unrestricted") || err.contains('*'),
+        "refusal must name the unrestricted-scope requirement: {err}"
+    );
+}
+
 /// delete_backup must refuse an iso/ volid at plan time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plan_delete_backup_refuses_iso_volid() {
