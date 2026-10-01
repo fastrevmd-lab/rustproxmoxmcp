@@ -565,11 +565,9 @@ fn init_audit(args: &mecmcp_runtime::cli::Cli) -> Result<Option<mecmcp_audit::Au
 
 /// Load `--approval-digest-key-file`, if set.
 ///
-/// `None` keeps the change-set coordinator on the unkeyed v5 approval digest
-/// (today's default). Propagating the error on a bad path rather than
-/// swallowing it matters here: a deployment that set this flag believes the
-/// digest is keyed, and starting up anyway with no key (silently falling
-/// back to unkeyed) would make that belief false.
+/// `None` keeps the change-set coordinator on today's default digest mode.
+/// A load failure must stop startup rather than continue without the key,
+/// since this flag controls an approval security control.
 fn load_approval_digest_key(
     path: Option<&std::path::Path>,
 ) -> Result<Option<mecmcp_changeset::ApprovalDigestKey>> {
@@ -997,8 +995,7 @@ mod shared_cli_security_option_tests {
         );
     }
 
-    /// A valid key file is loaded, not silently dropped: this flag used to be
-    /// accepted by clap and then never read anywhere.
+    /// A valid key file must be loaded and used, not silently dropped.
     #[test]
     fn a_valid_approval_digest_key_file_is_loaded() {
         let dir = tempfile::tempdir().unwrap();

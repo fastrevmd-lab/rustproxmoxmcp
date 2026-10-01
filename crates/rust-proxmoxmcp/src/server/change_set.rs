@@ -222,8 +222,7 @@ mod tests {
     use super::build_coordinator;
 
     /// A key passed through `build_coordinator` must actually produce the
-    /// keyed v6 approval digest, not the unkeyed v5 one a caller who thinks
-    /// `--approval-digest-key-file` protects them would otherwise get.
+    /// keyed v6 approval digest, not the unkeyed v5 one.
     #[tokio::test]
     async fn an_approval_digest_key_passed_to_build_coordinator_produces_a_v6_digest() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -273,7 +272,7 @@ mod tests {
         assert_eq!(
             approval.digest_version, 6,
             "a key passed through build_coordinator must produce a v6 (keyed) digest, \
-             not the unkeyed v5 one -- otherwise --approval-digest-key-file does nothing"
+             not the unkeyed v5 one"
         );
 
         drop(coordinator);
