@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+Fixes from the MEC-446/MEC-1163 authorization audit (F1-F4, L1-L3):
+
+- **F1:** `delete_backup`/`restore_backup` and restore-to-a-new-VMID now
+  bind the archive to the guest it actually belongs to, checked at both
+  plan and apply, instead of trusting the volid's filename convention.
+- **F2:** `approve_proxmox_change_set` and `get_proxmox_change_set` now
+  check the approver's guest scope and destructive tier against the
+  change set's target, not only against the caller's own grant.
+- **F3:** `create_vm`/`create_container` config now goes through an
+  allowlist of cloud-init, sizing, metadata, network and new-volume disk
+  keys, closing the gap where a disk key's `import-from` or an
+  existing-volume reference could attach another guest's volume with no
+  approval step.
+- **F4:** a waiver now lifts *protection* only. Previously a waiver that
+  matched a protected guest's `plan_proxmox_destroy` also skipped the
+  second human approver via `waive_approval_operator`; it now leaves the
+  change set `Planned`, and the normal approve/apply flow -- including
+  the human-approver requirement -- still applies. `--lab-mode` is
+  unaffected: it is still a blanket single-operator waiver by design.
+- **L1:** `delete_iso` now requires the caller's guest scope to be
+  unrestricted (`*`), since the ISO it names is not bound to any guest
+  the token's scope could be checked against.
+- **L2:** cluster- and node-wide read tools now require an unrestricted
+  guest scope, closing the gap where a guest-narrowed token could read
+  data about guests outside its scope via a cluster-wide listing.
+- **L3:** the guest-resolve cache is now dropped before any call that can
+  interrupt a guest (not only before a destructive plan), so a call that
+  changes guest state is never authorized against a stale cached read.
+
+**Breaking:** `waivers.json` entries now require a non-empty `ops` list
+naming the operation(s) the waiver covers; an entry with no `ops` field,
+or an empty list, is refused at load and the server will not start. See
+[README § `waivers.json` schema](README.md#waiversjson-schema) for the
+exact `op` strings each call path expects, and for `principal`, the new
+optional field that narrows a waiver to one token name.
+
 ### Changed
 
 - **Re-pinned the `mecmcp-*` crates from `v0.23.0` to `v0.24.1`** (MEC-449).

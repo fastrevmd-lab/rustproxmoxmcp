@@ -68,6 +68,60 @@ service-owned) carries time-boxed operator waivers. Both overrides originate
 outside the tool call: **there is deliberately no `grant_waiver` tool and no
 `force` argument**, because an override a caller can pass is not an override.
 
+- **A waiver lifts protection only, never the second approver.** A matching
+  waiver lets a plan against a protected guest proceed past the protection
+  gate; the resulting change set still goes through the normal
+  plan → approve → apply flow and still needs a distinct human approver (or
+  `--lab-mode`, which is the one path that also waives approval). The
+  waiver's reason and ticket are printed in the stored preview so the
+  approver can see why protection was lifted before deciding whether to
+  also approve.
+
+#### `waivers.json` schema
+
+```json
+{
+  "version": 1,
+  "waivers": [
+    {
+      "cluster": "pve3",
+      "vmid": 905,
+      "until": "2026-12-31T23:59:59Z",
+      "reason": "decommission per CHG-1234",
+      "ticket": "CHG-1234",
+      "ops": ["destroy_guest"],
+      "principal": "ops-token"
+    }
+  ]
+}
+```
+
+- **`ops` is required and non-empty.** A waiver file version 1 entry with no
+  `ops` field, or an empty list, is refused at load -- the server will not
+  start with a waiver that covers no operation. This is a breaking,
+  intentionally fail-closed change from pre-MEC-447 waiver files, which had
+  no `ops` field at all: re-add every entry with the exact operation(s) it
+  should cover before upgrading.
+- **`principal` is optional.** When set, the waiver only matches that one
+  token name; when absent, it matches any caller.
+- **The `op` strings `ops` must name** depend on which path the waiver
+  covers:
+  - A destructive operation planned through `plan_proxmox_destroy`: the
+    `op` argument passed to that call (`destroy_guest`, `delete_snapshot`,
+    `rollback_snapshot`, `delete_backup`, `delete_iso`, `restore_backup`,
+    `migrate`, `update_vm_config`).
+  - A service-interrupting `low`-tier tool (for example `stop_vm`,
+    `stop_container`, `reboot_vm`): the tool's own name.
+  - An HA rule change planned through `plan_ha_rule_change`: `ha_rule_`
+    followed by that call's `op` (`ha_rule_create`, `ha_rule_update`,
+    `ha_rule_delete`).
+  - A restore that targets a *new* VMID (`restore_backup_new_vmid`): the
+    fixed string `restore_new_vmid`, naming the archive owner guest the
+    waiver protects, not the new VMID.
+
+  A waiver that misspells or omits the operation it was meant for matches
+  nothing -- the call is refused the same as if no waiver existed.
+
 - **`approve_proxmox_change_set` requires a human approver token.** The
   server passes the caller's token `actor_type` through to mecmcp, which
   refuses any approval from an `agent` or unattributed (stdio) caller --
