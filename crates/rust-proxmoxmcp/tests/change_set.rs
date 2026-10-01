@@ -811,6 +811,141 @@ async fn plan_delete_backup_refuses_iso_volid() {
     );
 }
 
+/// MEC-447 / F1 regression: `delete_backup` must refuse a volid that names
+/// its own storage and content kind correctly, but whose archive actually
+/// belongs to a *different* guest than the one the token is planning
+/// against. Before this fix the only checks were storage and content kind --
+/// both of which a caller controls -- so a token scoped to vmid 617 could
+/// delete guest 905's backup by typing its volid, including a protected,
+/// out-of-scope guest's backup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_delete_backup_refuses_a_volid_belonging_to_another_guest() {
+    let h = common::TestServer::start_with_routes(
+        common::TokenSpec {
+            clusters: vec!["pve3".to_owned()],
+            tools: vec!["plan_proxmox_destroy".to_owned(), "delete_backup".to_owned()],
+            guests: vec!["*".to_owned()],
+        },
+        vec![
+            common::Route {
+                path: "/api2/json/nodes",
+                status: 200,
+                body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+            },
+            common::Route {
+                path: "/api2/json/cluster/resources",
+                status: 200,
+                body: br#"{"data":[{"id":"lxc/617","type":"lxc","vmid":617,"name":"test","node":"pve2","status":"stopped"},{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"}]}"#,
+            },
+            common::Route {
+                path: "/api2/json/nodes/pve2/storage/local/content",
+                status: 200,
+                body: br#"{"data":[{"volid":"local:backup/vzdump-qemu-905-2024_01_01-00_00_00.vma.zst","vmid":"905","content":"backup"}]}"#,
+            },
+            // Without the owner check, planning would proceed past this
+            // point and read guest 617's own config to compute the
+            // fingerprint -- present so the old, vulnerable code path
+            // actually reaches (and would have passed) the point this test
+            // guards, rather than failing on an unrelated missing route.
+            common::Route {
+                path: "/api2/json/nodes/pve2/lxc/617/config",
+                status: 200,
+                body: br#"{"data":{"hostname":"test","cores":1,"memory":512,"digest":"aabbccddeeff00112233445566778899aabbccdd","rootfs":"local-lvm:vm-617-disk-0,size=8G"}}"#,
+            },
+        ],
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({
+            "cluster": "pve3",
+            "vmid": 617,
+            "op": "delete_backup",
+            "storage": "local",
+            "storage_node": "pve2",
+            "volid": "local:backup/vzdump-qemu-905-2024_01_01-00_00_00.vma.zst"
+        }),
+    )
+    .await
+    .expect_err(
+        "a volid that Proxmox reports as belonging to guest 905 must be refused when the \
+         plan names vmid 617",
+    );
+
+    assert!(
+        err.contains("905") && err.contains("617"),
+        "refusal must name both the archive's real owner and the vmid the plan named: {err}"
+    );
+
+    let reqs = h.requests();
+    assert!(
+        !reqs.iter().any(|r| r.method == "DELETE"),
+        "nothing may be deleted when the volid does not belong to the named guest: {reqs:?}"
+    );
+}
+
+/// MEC-447 / F1 regression: `restore_backup` must refuse an archive that
+/// belongs to a different guest than the one it would overwrite, even though
+/// the archive's content kind and the vmid's own existence both check out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_restore_backup_refuses_a_volid_belonging_to_another_guest() {
+    let h = common::TestServer::start_with_routes(
+        common::TokenSpec {
+            clusters: vec!["pve3".to_owned()],
+            tools: vec!["plan_proxmox_destroy".to_owned(), "restore_backup".to_owned()],
+            guests: vec!["*".to_owned()],
+        },
+        vec![
+            common::Route {
+                path: "/api2/json/nodes",
+                status: 200,
+                body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+            },
+            common::Route {
+                path: "/api2/json/cluster/resources",
+                status: 200,
+                body: br#"{"data":[{"id":"lxc/617","type":"lxc","vmid":617,"name":"test","node":"pve2","status":"stopped"},{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"}]}"#,
+            },
+            common::Route {
+                path: "/api2/json/nodes/pve2/storage/local/content",
+                status: 200,
+                body: br#"{"data":[{"volid":"local:backup/vzdump-qemu-905-2024_01_01-00_00_00.vma.zst","vmid":"905","content":"backup"}]}"#,
+            },
+            // See the sibling `delete_backup` test above for why this route
+            // is needed to exercise the old code path meaningfully.
+            common::Route {
+                path: "/api2/json/nodes/pve2/lxc/617/config",
+                status: 200,
+                body: br#"{"data":{"hostname":"test","cores":1,"memory":512,"digest":"aabbccddeeff00112233445566778899aabbccdd","rootfs":"local-lvm:vm-617-disk-0,size=8G"}}"#,
+            },
+        ],
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({
+            "cluster": "pve3",
+            "vmid": 617,
+            "op": "restore_backup",
+            "volid": "local:backup/vzdump-qemu-905-2024_01_01-00_00_00.vma.zst"
+        }),
+    )
+    .await
+    .expect_err(
+        "restoring guest 617 from an archive Proxmox reports as belonging to guest 905 must \
+         be refused",
+    );
+
+    assert!(
+        err.contains("905") && err.contains("617"),
+        "refusal must name both the archive's real owner and the vmid the plan named: {err}"
+    );
+}
+
 /// Storage prefix in volid must match the storage parameter.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plan_refuses_volid_storage_mismatch() {

@@ -2365,11 +2365,15 @@ impl ProxmoxServer {
                     .storage_node
                     .as_deref()
                     .ok_or_else(|| missing("storage_node"))?;
+                if action.op == "delete_backup" {
+                    Self::require_backup_owner(client, storage_node, volid, vmid).await?;
+                }
                 let data = guests::delete_volume(client, storage_node, storage, volid).await?;
                 Ok(data.as_str().unwrap_or_default().to_owned())
             }
             "restore_backup" => {
                 let volid = action.volid.as_deref().ok_or_else(|| missing("volid"))?;
+                Self::require_backup_owner(client, node, volid, vmid).await?;
                 guests::restore_backup(client, node, kind, vmid, volid, true).await
             }
             "migrate" => {
@@ -2395,6 +2399,116 @@ impl ProxmoxServer {
             other => Err(rust_proxmoxmcp_core::ProxmoxError::Malformed(format!(
                 "unknown destructive operation '{other}'"
             ))),
+        }
+    }
+
+    /// Refuse `delete_backup` / `restore_backup` on an archive that does not
+    /// belong to `vmid`.
+    ///
+    /// Neither operation's volid is bound to any in-scope guest anywhere else
+    /// in the pipeline: `delete_backup` checks only storage and content kind,
+    /// and `restore_backup` checks only content kind. Without this, a token
+    /// scoped to its own vmid could name an out-of-scope guest's archive and
+    /// delete or restore from it, because the volid's filename convention
+    /// (`vzdump-qemu-<vmid>-...`) is never actually checked against the vmid
+    /// the token is authorized for. This asks Proxmox which guest really owns
+    /// the archive and fails closed if that cannot be established.
+    async fn require_backup_owner(
+        client: &ProxmoxClient,
+        node: &str,
+        volid: &str,
+        vmid: u32,
+    ) -> Result<(), rust_proxmoxmcp_core::ProxmoxError> {
+        let owner = rust_proxmoxmcp_core::guests::resolve_backup_owner(client, node, volid)
+            .await
+            .map_err(|error| {
+                rust_proxmoxmcp_core::ProxmoxError::Denied(format!(
+                    "could not establish which guest owns backup archive '{volid}': {error}. \
+                     Refusing rather than trusting the archive's filename."
+                ))
+            })?;
+        if owner != vmid {
+            return Err(rust_proxmoxmcp_core::ProxmoxError::Denied(format!(
+                "backup archive '{volid}' belongs to guest {owner}, not {vmid}; refusing an \
+                 operation on an archive that does not belong to the named guest"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Authorize a restore-into-new-vmid against the archive's real owner,
+    /// not just the (necessarily free) destination vmid.
+    ///
+    /// `restore_new_vmid` has no source guest to resolve scope from the way
+    /// every other destructive tool does -- the destination is required to be
+    /// free, so the only guest whose scope can matter is whoever the archive
+    /// belongs to. Without this, a token scoped to `vmid:600-699` could name
+    /// any other guest's backup and read its disks into a vmid it controls.
+    ///
+    /// The owner is commonly gone by the time an old backup is restored, which
+    /// is the entire point of restoring one -- so an owner that no longer
+    /// resolves is not itself refused. It falls back to the same bare-number
+    /// scope check [`ProxmoxGrant::allows_new_vmid`] uses for a creation
+    /// destination: only `*` and `vmid:`/`vmid:range` terms can speak for a
+    /// guest with no live tags or pool to match against. An owner that *does*
+    /// still resolve gets the full scope and protection check a live guest
+    /// gets anywhere else in this server.
+    async fn authorize_backup_owner(
+        &self,
+        client: &ProxmoxClient,
+        cluster: &str,
+        owner_vmid: u32,
+        grant: &ProxmoxGrant,
+        volid: &str,
+    ) -> Result<(), String> {
+        use rust_proxmoxmcp_core::protect::{Override, destructive_allowed, protection_of};
+
+        match self.index.resolve(client, cluster, owner_vmid).await {
+            Ok(owner_guest) => {
+                if !grant.allows_guest(owner_guest.facts()) {
+                    return Err(format!(
+                        "backup archive '{volid}' belongs to guest {owner_vmid}, which is \
+                         outside this token's guest scope; a restore may not read from it"
+                    ));
+                }
+
+                let now_unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("time")
+                    .as_secs();
+                let protection = protection_of(client.cluster(), Some(&owner_guest), false);
+                let override_ = destructive_allowed(
+                    &protection,
+                    &self.waivers,
+                    cluster,
+                    owner_vmid,
+                    now_unix,
+                    self.lab_mode,
+                );
+                if protection.is_protected() && matches!(override_, Override::None) {
+                    return Err(format!(
+                        "backup archive '{volid}' belongs to guest {owner_vmid}, which is \
+                         protected ({}); restoring from it needs a waiver",
+                        protection.summary()
+                    ));
+                }
+                Ok(())
+            }
+            Err(rust_proxmoxmcp_core::ProxmoxError::NotFound { .. }) => {
+                if grant.allows_new_vmid(owner_vmid) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "backup archive '{volid}' belongs to guest {owner_vmid}, which no \
+                         longer exists and is outside this token's guest scope; a restore may \
+                         not read from it"
+                    ))
+                }
+            }
+            Err(error) => Err(format!(
+                "could not establish whether guest {owner_vmid} (owner of backup archive \
+                 '{volid}') is in scope: {error}"
+            )),
         }
     }
 
@@ -4370,6 +4484,31 @@ impl ProxmoxServer {
             Err(error) => return tool_error(error),
         };
 
+        // Refuse at plan time rather than relying solely on the apply-time
+        // re-check in `execute_destructive`: a `delete_backup`/`restore_backup`
+        // volid's filename convention names a vmid, but nothing before this
+        // bound it to the vmid the caller is authorized for. Spending a
+        // two-person approval on a plan that was never going to touch the
+        // named guest's own archive is worse than refusing it here.
+        if action.op == "delete_backup" || action.op == "restore_backup" {
+            let owner_node = match action.op.as_str() {
+                "delete_backup" => action
+                    .storage_node
+                    .as_deref()
+                    .expect("delete_backup always carries storage_node"),
+                _ => guest.node.as_str(),
+            };
+            let volid = action
+                .volid
+                .as_deref()
+                .expect("delete_backup/restore_backup always carry volid");
+            if let Err(error) =
+                Self::require_backup_owner(client, owner_node, volid, args.vmid).await
+            {
+                return tool_error(error);
+            }
+        }
+
         // Refuse here rather than at apply. Proxmox will not destroy a running
         // guest -- `destroy_vm`/`destroy_container` send `purge` and never
         // `force` -- so planning one produces a change set that cannot succeed.
@@ -6074,7 +6213,49 @@ impl ProxmoxServer {
             );
         }
 
-        let action = match build_restore_new_vmid_action(&args) {
+        // Checked before any network call: an iso or template volid is not a
+        // backup archive and resolving its "owner" against a backup content
+        // listing would produce a confusing not-found rather than this clear
+        // refusal. `build_restore_new_vmid_action` re-validates this, but
+        // that happens after owner resolution below, which needs to know
+        // this is a backup volid first.
+        if let Err(error) = rust_proxmoxmcp_core::guests::validate_volid_kind(&args.volid, "backup")
+        {
+            return tool_error(error.to_string());
+        }
+
+        // Resolve the archive's real owner from Proxmox's own storage content
+        // listing, before this plan's identity even exists. The volid's
+        // filename conventionally names a vmid, but that is a convention a
+        // caller can type, not a binding the server checked -- without this,
+        // a token scoped to its own vmid range could copy another guest's
+        // disks into a vmid it controls merely by naming that guest's
+        // archive.
+        let owner_vmid = match rust_proxmoxmcp_core::guests::resolve_backup_owner(
+            client,
+            &args.node,
+            &args.volid,
+        )
+        .await
+        {
+            Ok(owner_vmid) => owner_vmid,
+            Err(error) => {
+                return tool_error(format!(
+                    "could not establish which guest owns backup archive '{}': {error}. \
+                     Refusing rather than trusting the archive's filename.",
+                    args.volid
+                ));
+            }
+        };
+
+        if let Err(error) = self
+            .authorize_backup_owner(client, &args.cluster, owner_vmid, &grant, &args.volid)
+            .await
+        {
+            return tool_error(error);
+        }
+
+        let action = match build_restore_new_vmid_action(&args, owner_vmid) {
             Ok(action) => action,
             Err(error) => return tool_error(error),
         };
@@ -6316,6 +6497,48 @@ impl ProxmoxServer {
                 "vmid {} is a protected pin on cluster {} and must not receive a restore",
                 action.target_vmid, args.cluster
             ));
+        }
+
+        // Re-verify the archive still belongs to the owner this change set
+        // was planned and digested against, then re-run the same scope and
+        // protection check `plan_restore_new_vmid` ran -- a scope can be
+        // narrowed, or a waiver can expire, between plan and apply, and this
+        // is the call that actually copies the owner's disks.
+        match rust_proxmoxmcp_core::guests::resolve_backup_owner(
+            client,
+            &action.node,
+            &action.volid,
+        )
+        .await
+        {
+            Ok(owner_vmid) if owner_vmid == action.owner_vmid => {}
+            Ok(owner_vmid) => {
+                return tool_error(format!(
+                    "backup archive '{}' now belongs to guest {owner_vmid}, not the {} it was \
+                     planned against; the archive's ownership changed since this was planned. \
+                     Plan the operation again.",
+                    action.volid, action.owner_vmid
+                ));
+            }
+            Err(error) => {
+                return tool_error(format!(
+                    "could not re-establish which guest owns backup archive '{}': {error}. \
+                     Refusing rather than trusting the previously recorded owner.",
+                    action.volid
+                ));
+            }
+        }
+        if let Err(error) = self
+            .authorize_backup_owner(
+                client,
+                &args.cluster,
+                action.owner_vmid,
+                &grant,
+                &action.volid,
+            )
+            .await
+        {
+            return tool_error(error);
         }
 
         let kind = match action.kind.as_str() {

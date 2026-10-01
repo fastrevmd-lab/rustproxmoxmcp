@@ -58,15 +58,28 @@ pub(crate) struct RestoreNewVmidAction {
     pub target_vmid: u32,
     pub kind: String,
     pub volid: String,
+    /// The vmid Proxmox's own storage content listing reports as this
+    /// archive's source -- never the vmid the volid's filename suggests.
+    ///
+    /// Recorded in the digest-covered action, not just checked once, so apply
+    /// re-checks the caller's authority over the *same* owner it was checked
+    /// against at plan -- a filename cannot be mistaken for authority to any
+    /// guest it happens to mention.
+    pub owner_vmid: u32,
 }
 
 /// Build and validate the action a restore-new-vmid plan will record.
+///
+/// `owner_vmid` is the vmid Proxmox's content listing reports as the
+/// archive's source, resolved by the caller before this is invoked -- this
+/// function does no network I/O, so it cannot resolve it itself.
 ///
 /// # Errors
 ///
 /// Returns a human-readable message for a caller-facing tool error.
 pub(crate) fn build_restore_new_vmid_action(
     args: &PlanRestoreNewVmidArgs,
+    owner_vmid: u32,
 ) -> Result<RestoreNewVmidAction, String> {
     if args.kind != "qemu" && args.kind != "lxc" {
         return Err(format!("kind must be 'qemu' or 'lxc', got '{}'", args.kind));
@@ -84,6 +97,7 @@ pub(crate) fn build_restore_new_vmid_action(
         target_vmid: args.target_vmid,
         kind: args.kind.clone(),
         volid: args.volid.clone(),
+        owner_vmid,
     })
 }
 
@@ -114,7 +128,7 @@ mod tests {
 
     #[test]
     fn a_well_formed_plan_builds_an_action() {
-        let action = build_restore_new_vmid_action(&args()).expect("builds");
+        let action = build_restore_new_vmid_action(&args(), 100).expect("builds");
         assert_eq!(action.target_vmid, 650);
         assert_eq!(action.kind, "qemu");
     }
@@ -123,7 +137,7 @@ mod tests {
     fn an_unknown_kind_is_refused() {
         let mut a = args();
         a.kind = "docker".to_owned();
-        let error = build_restore_new_vmid_action(&a).expect_err("refused");
+        let error = build_restore_new_vmid_action(&a, 100).expect_err("refused");
         assert!(error.contains("qemu"), "{error}");
     }
 
@@ -131,7 +145,7 @@ mod tests {
     fn a_non_backup_volid_is_refused() {
         let mut a = args();
         a.volid = "local:iso/debian.iso".to_owned();
-        let error = build_restore_new_vmid_action(&a).expect_err("refused");
+        let error = build_restore_new_vmid_action(&a, 100).expect_err("refused");
         assert!(error.contains("backup"), "{error}");
     }
 
@@ -139,13 +153,13 @@ mod tests {
     fn an_unusable_node_segment_is_refused() {
         let mut a = args();
         a.node = "pve2/bad".to_owned();
-        let error = build_restore_new_vmid_action(&a).expect_err("refused");
+        let error = build_restore_new_vmid_action(&a, 100).expect_err("refused");
         assert!(error.contains("node"), "{error}");
     }
 
     #[test]
     fn the_preview_names_the_target_and_source() {
-        let action = build_restore_new_vmid_action(&args()).expect("builds");
+        let action = build_restore_new_vmid_action(&args(), 100).expect("builds");
         let preview = render_restore_new_vmid_preview(&action);
         assert!(preview.contains("650"), "{preview}");
         assert!(preview.contains("vzdump-qemu-100"), "{preview}");

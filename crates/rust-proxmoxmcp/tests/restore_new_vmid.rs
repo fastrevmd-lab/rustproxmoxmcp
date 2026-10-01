@@ -33,6 +33,17 @@ async fn restore_harness() -> TestServer {
         status: 200,
         body: br#"{"data":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:qmrestore:650:root@pam:"}"#,
     });
+    // Owner resolution for the fixture's default volid, `local:backup/vzdump-
+    // qemu-100-...`: Proxmox's content listing says it belongs to vmid 100,
+    // which does not exist in `default_guest_routes`' `/cluster/resources`
+    // fixture (905 and 617 only) -- it stands in for an old backup whose
+    // source guest is gone, the common case this restore operation exists
+    // for. The token's `guests: ["*"]` scope admits it either way.
+    routes.push(rust_proxmoxmcp_core::testing::Route {
+        path: "/api2/json/nodes/pve2/storage/local/content",
+        status: 200,
+        body: br#"{"data":[{"volid":"local:backup/vzdump-qemu-100-2024_01_01-00_00_00.vma.zst","vmid":"100","content":"backup"}]}"#,
+    });
 
     TestServer::start_with_routes(spec, routes).await
 }

@@ -717,6 +717,72 @@ pub async fn delete_volume(
     client.delete_json(&path, &[], &[]).await
 }
 
+/// Resolve the vmid that owns a backup archive, by asking Proxmox rather than
+/// trusting the volid's filename.
+///
+/// A volid such as `local:backup/vzdump-qemu-905-2024_01_01-00_00_00.vma.zst`
+/// *looks* like it names guest 905, but that is a filename convention, not a
+/// binding the server enforces -- nothing stops a caller from typing a volid
+/// string that names someone else's archive. Proxmox's own content listing
+/// for the storage carries the real `vmid` for each entry, independent of the
+/// name, so this is the only source of truth checked here.
+///
+/// # Errors
+/// Returns [`ProxmoxError::Malformed`] when `volid` has no `storage:` prefix,
+/// or when the matching entry is missing a `vmid` field.
+/// Returns [`ProxmoxError::NotFound`] when the storage's content listing does
+/// not include this volid at all -- fail closed rather than guessing who owns
+/// an archive Proxmox itself cannot confirm.
+pub async fn resolve_backup_owner(
+    client: &ProxmoxClient,
+    node: &str,
+    volid: &str,
+) -> Result<u32, ProxmoxError> {
+    let Some((storage, _)) = volid.split_once(':') else {
+        return Err(ProxmoxError::Malformed(
+            "volid is not in storage:path form".into(),
+        ));
+    };
+
+    let data = client
+        .get_json(
+            "/api2/json/nodes/{node}/storage/{storage}/content",
+            &[("node", node), ("storage", storage)],
+            &[("content", "backup")],
+        )
+        .await?;
+
+    let entries = data.as_array().ok_or_else(|| {
+        ProxmoxError::Malformed("storage content listing was not a JSON array".into())
+    })?;
+
+    let entry = entries
+        .iter()
+        .find(|entry| entry.get("volid").and_then(serde_json::Value::as_str) == Some(volid))
+        .ok_or_else(|| ProxmoxError::NotFound {
+            what: format!("backup archive '{volid}' on node {node}, storage {storage}"),
+        })?;
+
+    let vmid = entry
+        .get("vmid")
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|s| s.parse::<u64>().ok()))
+        })
+        .ok_or_else(|| {
+            ProxmoxError::Malformed(format!(
+                "backup archive '{volid}' has no readable vmid in Proxmox's content listing"
+            ))
+        })?;
+
+    u32::try_from(vmid).map_err(|_| {
+        ProxmoxError::Malformed(format!(
+            "backup archive '{volid}' reports vmid {vmid}, which does not fit a u32"
+        ))
+    })
+}
+
 /// Restore a guest from a backup archive and return the UPID.
 ///
 /// The most destructive operation in the surface. It overwrites the guest at
