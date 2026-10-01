@@ -414,7 +414,7 @@ fn require_unrestricted_scope_for_delete_iso(
     if op == "delete_iso" && !grant.is_unrestricted_guest_scope() {
         return Err(
             "delete_iso deletes from storage that is not scoped to any guest, so it requires a \
-             token whose guest scope is '*'. This token is narrowed to specific guests and \
+             caller whose guest scope is '*'. This caller is narrowed to specific guests and \
              cannot be checked against a storage."
                 .to_owned(),
         );
