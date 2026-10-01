@@ -928,6 +928,14 @@ const ALLOWED_CREATE_CONFIG_KEYS: &[&str] = &[
     "features",
     // container privilege flag; value-checked separately
     "unprivileged",
+    // container template image; value-checked separately (must be a vztmpl
+    // volid, not an arbitrary path)
+    "ostemplate",
+    // LXC default mountpoint storage, and the plural cloud-init key some
+    // callers send instead of `sshkeys` -- both are plain strings with no
+    // device, host path, or other-guest reach
+    "storage",
+    "ssh-public-keys",
 ];
 
 /// Key prefixes `create_vm`/`create_container` accept unconditionally, where
@@ -1018,6 +1026,32 @@ fn disk_value_is_new_allocation(value: &str) -> bool {
         }
     }
     !contains_volume_reference(value)
+}
+
+/// Whether a disk value is a cloud-init drive, an empty cdrom, or an ISO
+/// attached read-only -- the three disk-key shapes real Proxmox creates send
+/// that are not a size-based new allocation, and that still carry no path to
+/// another guest's data: a cloud-init drive is server-managed and empty at
+/// create time, an empty cdrom names no volume at all, and an ISO's content
+/// kind is checked the same way `restore_backup`'s volid is, via
+/// `validate_volid_kind`.
+fn disk_value_is_allowed_media(value: &str) -> bool {
+    if value == "none,media=cdrom" {
+        return true;
+    }
+    if let Some((storage, rest)) = value.split_once(':')
+        && !storage.is_empty()
+        && rest == "cloudinit"
+    {
+        return true;
+    }
+    if let Some((volid, rest)) = value.split_once(',')
+        && rest == "media=cdrom"
+        && rust_proxmoxmcp_core::guests::validate_volid_kind(volid, "iso").is_ok()
+    {
+        return true;
+    }
+    false
 }
 
 /// Config key families `update_vm_config` accepts, by exact match
@@ -2621,7 +2655,7 @@ impl ProxmoxServer {
                 if !grant.allows_guest(owner_guest.facts()) {
                     return Err(format!(
                         "backup archive '{volid}' belongs to guest {owner_vmid}, which is \
-                         outside this token's guest scope; a restore may not read from it"
+                         outside this caller's guest scope; a restore may not read from it"
                     ));
                 }
 
@@ -2657,7 +2691,7 @@ impl ProxmoxServer {
                 } else {
                     Err(format!(
                         "backup archive '{volid}' belongs to guest {owner_vmid}, which no \
-                         longer exists and is outside this token's guest scope; a restore may \
+                         longer exists and is outside this caller's guest scope; a restore may \
                          not read from it"
                     ))
                 }
@@ -2806,6 +2840,19 @@ impl ProxmoxServer {
             ));
         }
 
+        // `ostemplate` is the one other key where the *value* decides: the
+        // key names only that a template is being used, not which storage or
+        // content kind it comes from, so an arbitrary path or non-template
+        // volid would otherwise pass the key allowlist unchecked.
+        if let Some(value) = config.get("ostemplate")
+            && rust_proxmoxmcp_core::guests::validate_volid_kind(value, "vztmpl").is_err()
+        {
+            return Some(tool_error(format!(
+                "ostemplate '{value}' is not a usable template volid ('<storage>:vztmpl/<name>'). \
+                 A 'low' create_container may only reference a template image."
+            )));
+        }
+
         let host_pathed = config_host_paths(config);
         if !host_pathed.is_empty() {
             return Some(tool_error(format!(
@@ -2828,6 +2875,7 @@ impl ProxmoxServer {
             .filter(|(key, value)| {
                 is_create_disk_key(&key.to_ascii_lowercase())
                     && !disk_value_is_new_allocation(value)
+                    && !disk_value_is_allowed_media(value)
             })
             .map(|(key, _)| key.clone())
             .collect();
@@ -4628,7 +4676,6 @@ impl ProxmoxServer {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         use change_set::ChangeSetResponse;
-        use mecmcp_changeset::WaiverKind;
         use rust_proxmoxmcp_core::{
             fingerprint::{GuestState, fingerprint},
             guests::fetch_guest_config_state,
@@ -4983,27 +5030,39 @@ impl ProxmoxServer {
         }
 
         // Apply override.
+        //
+        // A matching operator waiver lifts *protection* -- the same
+        // `Override::Waiver` already let this plan past the per-guest
+        // protection gate in the `authorize` call above -- but it is not a
+        // second principal's decision, so it must not move the change set to
+        // `Approved`. The record stays `Planned`: a distinct human still has
+        // to call `approve_proxmox_change_set`. `authorize_ha_rule_guests`
+        // holds the same line for HA rule changes, and its doc comment says
+        // it plainly: an override there "never waives the change set's
+        // second-principal approval; it only lets the guest check pass".
+        //
+        // Earlier this called `coordinator.waive_approval_operator`, which
+        // sets the record `Approved` outright -- collapsing two-person
+        // control for any caller holding the destructive tier and a waiver,
+        // agent tokens included, contrary to this PR's stated intent.
         let output = match override_ {
             Override::Waiver {
                 reason,
                 ticket,
                 until_unix,
-            } => match coordinator
-                .waive_approval_operator(
-                    output.change_set_id.clone(),
-                    device.clone(),
-                    owner.clone(),
-                    output.digest.clone(),
-                    WaiverKind::OperatorFile,
-                    reason,
-                    Some(until_unix),
-                    ticket,
-                )
-                .await
-            {
-                Ok(waived) => waived,
-                Err(error) => return tool_error(format!("waiver: {error}")),
-            },
+            } => {
+                tracing::warn!(
+                    target: "audit",
+                    event = "protection_waived",
+                    change_set = %output.change_set_id,
+                    %reason,
+                    ticket = ticket.as_deref().unwrap_or(""),
+                    until_unix,
+                    "an operator waiver lifted protection for this plan; a distinct human \
+                     approval is still required before it may be applied"
+                );
+                output
+            }
             Override::LabMode => match coordinator
                 .waive_approval(
                     output.change_set_id.clone(),
@@ -5106,9 +5165,25 @@ impl ProxmoxServer {
                 };
                 if !grant.allows_new_vmid(action.target_vmid) {
                     return tool_error(format!(
-                        "vmid {} is outside this token's guest scope",
+                        "vmid {} is outside this caller's guest scope",
                         action.target_vmid
                     ));
+                }
+                // Same authority check `approve_change_set` runs: scope and
+                // protection on the owner guest whose archive this would
+                // read, not just the target vmid above.
+                if let Err(error) = self
+                    .authorize_backup_owner(
+                        client,
+                        &args.cluster,
+                        action.owner_vmid,
+                        &grant,
+                        &action.volid,
+                        caller.as_ref().map(|ctx| ctx.token_name.as_str()),
+                    )
+                    .await
+                {
+                    return tool_error(error);
                 }
             }
         }
@@ -5303,12 +5378,12 @@ impl ProxmoxServer {
             if !grant.allows_action(ProxmoxAction::Destructive) {
                 return tool_error(
                     "restoring into a new vmid requires the 'destructive' action tier, which \
-                     this token does not carry",
+                     this caller does not carry",
                 );
             }
             if !grant.allows_new_vmid(action.target_vmid) {
                 return tool_error(format!(
-                    "vmid {} is outside this token's guest scope, so a backup may not be \
+                    "vmid {} is outside this caller's guest scope, so a backup may not be \
                      restored into it",
                     action.target_vmid
                 ));
@@ -5318,6 +5393,26 @@ impl ProxmoxServer {
                     "vmid {} is a protected pin on cluster {} and must not receive a restore",
                     action.target_vmid, args.cluster
                 ));
+            }
+            // The approver's authority over *this* vmid -- scope and
+            // protection on the guest whose disks get copied, not just the
+            // target vmid checked above. Without this an approver scoped
+            // only to the target range, with no read into the owner guest at
+            // all, could approve a copy out of a guest they otherwise could
+            // never touch. Mirrors the re-check `apply_restore_new_vmid`
+            // runs, so approve and apply hold the same standard.
+            if let Err(error) = self
+                .authorize_backup_owner(
+                    client,
+                    &args.cluster,
+                    action.owner_vmid,
+                    &grant,
+                    &action.volid,
+                    caller.as_ref().map(|ctx| ctx.token_name.as_str()),
+                )
+                .await
+            {
+                return tool_error(error);
             }
         }
 
@@ -5468,13 +5563,25 @@ impl ProxmoxServer {
         // Peeked from the raw record rather than the typed `action` deserialized
         // below: the override check needs the op before dispatch decides whether
         // the action shape even deserializes, and a waiver must bind to the exact
-        // op the approver signed, not a default.
-        let op_for_override = record
+        // op the approver signed, not a default. A record with no readable `op`
+        // is refused outright rather than defaulting to any specific operation
+        // string -- defaulting to, say, `"destroy_guest"` would let a waiver
+        // scoped to `destroy_guest` admit an apply whose real operation is
+        // unknown, which is the opposite of what a waiver's `ops` binding is
+        // for. The digest binds the stored actions, so this is not reachable
+        // today; refusing it keeps that true if the record shape ever changes.
+        let Some(op_for_override) = record
             .actions
             .first()
             .and_then(|value| value.get("op"))
             .and_then(|value| value.as_str())
-            .unwrap_or("destroy_guest");
+        else {
+            return tool_error(
+                "change set refused: its first action has no readable 'op' field, so no \
+                 waiver can be bound to the operation it actually names. Plan the operation \
+                 again.",
+            );
+        };
 
         let override_ = destructive_allowed(
             &protection,

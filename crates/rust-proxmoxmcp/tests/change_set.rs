@@ -264,16 +264,37 @@ async fn a_protected_guest_with_matching_waiver_can_be_applied() {
     .await
     .expect("plan should succeed with matching waiver");
 
-    // The waiver allows planning. Check if approval is still needed.
+    // F4 regression: an operator waiver lifts *protection*, not the
+    // second-principal approval requirement. A matching waiver must leave
+    // the change set `Planned`, not jump it straight to `Approved` -- that
+    // would let any caller holding the destructive tier and a waiver (an
+    // agent token included) skip the human approval two-person control
+    // exists to require.
     let id = planned["change_set_id"].as_str().expect("id");
     let state = planned["state"].as_str().expect("state");
+    assert_eq!(
+        state, "Planned",
+        "a waiver must not move the change set past Planned; approval is a \
+         separate, still-required step"
+    );
 
-    // If not already approved, approve as second principal.
-    if state != "Approved" {
-        common::approve_as_second_principal_for(&h, id, "pve3", 618).await;
-    }
+    // Apply before approval must be refused.
+    let unapproved = common::call(
+        &h,
+        "apply_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 618}),
+    )
+    .await;
+    assert!(
+        unapproved.is_err(),
+        "apply must refuse an unapproved change set even with a matching waiver: \
+         {unapproved:?}"
+    );
 
-    // Apply should succeed.
+    // A distinct human approves as the second principal.
+    common::approve_as_second_principal_for(&h, id, "pve3", 618).await;
+
+    // Apply should succeed once approved.
     let result = common::call(
         &h,
         "apply_proxmox_change_set",
@@ -283,7 +304,7 @@ async fn a_protected_guest_with_matching_waiver_can_be_applied() {
 
     assert!(
         result.is_ok(),
-        "apply should succeed with matching waiver: {result:?}"
+        "apply should succeed once a matching waiver's plan is approved: {result:?}"
     );
 }
 
