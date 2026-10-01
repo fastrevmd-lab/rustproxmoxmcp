@@ -1594,7 +1594,7 @@ impl ProxmoxServer {
         existing: Option<&serde_json::Value>,
     ) -> Result<(), Box<CallToolResult>> {
         use rust_proxmoxmcp_core::protect::{
-            Override, creation_allowed, destructive_allowed, protection_of,
+            DestructiveAttempt, Override, creation_allowed, destructive_allowed, protection_of,
         };
 
         require_ha_rule_destructive_tier(caller)?;
@@ -1641,6 +1641,10 @@ impl ProxmoxServer {
                         vmid,
                         now_unix,
                         self.lab_mode,
+                        DestructiveAttempt {
+                            op: &format!("ha_rule_{}", action.op),
+                            principal: caller.map(|ctx| ctx.token_name.as_str()),
+                        },
                     );
                     let override_applies = !matches!(override_, Override::None);
                     self.index
@@ -2544,8 +2548,11 @@ impl ProxmoxServer {
         owner_vmid: u32,
         grant: &ProxmoxGrant,
         volid: &str,
+        principal: Option<&str>,
     ) -> Result<(), String> {
-        use rust_proxmoxmcp_core::protect::{Override, destructive_allowed, protection_of};
+        use rust_proxmoxmcp_core::protect::{
+            DestructiveAttempt, Override, destructive_allowed, protection_of,
+        };
 
         match self.index.resolve(client, cluster, owner_vmid).await {
             Ok(owner_guest) => {
@@ -2568,6 +2575,10 @@ impl ProxmoxServer {
                     owner_vmid,
                     now_unix,
                     self.lab_mode,
+                    DestructiveAttempt {
+                        op: "restore_new_vmid",
+                        principal,
+                    },
                 );
                 if protection.is_protected() && matches!(override_, Override::None) {
                     return Err(format!(
@@ -2787,7 +2798,9 @@ impl ProxmoxServer {
         context: &RequestContext<RoleServer>,
         interrupts_override: Option<bool>,
     ) -> Result<rust_proxmoxmcp_core::AuthorizedGuest, Box<CallToolResult>> {
-        use rust_proxmoxmcp_core::protect::{Override, destructive_allowed, protection_of};
+        use rust_proxmoxmcp_core::protect::{
+            DestructiveAttempt, Override, destructive_allowed, protection_of,
+        };
 
         let caller = Self::caller(context);
         if let Err(error) = authorize_call(caller.as_ref(), tool, Some(&args.cluster), WRITE_TOOLS)
@@ -2822,6 +2835,10 @@ impl ProxmoxServer {
             args.vmid,
             now_unix,
             self.lab_mode,
+            DestructiveAttempt {
+                op: tool,
+                principal: caller.as_ref().map(|ctx| ctx.token_name.as_str()),
+            },
         );
         let override_applies = !matches!(override_, Override::None);
 
@@ -2866,7 +2883,9 @@ impl ProxmoxServer {
         args: &GuestArgs,
         context: &RequestContext<RoleServer>,
     ) -> CallToolResult {
-        use rust_proxmoxmcp_core::protect::{Override, destructive_allowed, protection_of};
+        use rust_proxmoxmcp_core::protect::{
+            DestructiveAttempt, Override, destructive_allowed, protection_of,
+        };
 
         let caller = Self::caller(context);
         if let Err(error) = authorize_call(caller.as_ref(), tool, Some(&args.cluster), WRITE_TOOLS)
@@ -2913,6 +2932,10 @@ impl ProxmoxServer {
             args.vmid,
             now_unix,
             self.lab_mode,
+            DestructiveAttempt {
+                op: tool,
+                principal: caller.as_ref().map(|ctx| ctx.token_name.as_str()),
+            },
         );
         let override_applies = !matches!(override_, Override::None);
 
@@ -4517,7 +4540,7 @@ impl ProxmoxServer {
             fingerprint::{GuestState, fingerprint},
             guests::fetch_guest_config_state,
             preview::{PreviewInput, render_preview},
-            protect::{Override, destructive_allowed, protection_of},
+            protect::{DestructiveAttempt, Override, destructive_allowed, protection_of},
         };
 
         let caller = Self::caller(&context);
@@ -4574,6 +4597,10 @@ impl ProxmoxServer {
             args.vmid,
             now_unix,
             self.lab_mode,
+            DestructiveAttempt {
+                op: &args.op,
+                principal: caller.as_ref().map(|ctx| ctx.token_name.as_str()),
+            },
         );
 
         let override_applies = !matches!(override_, Override::None);
@@ -5019,7 +5046,9 @@ impl ProxmoxServer {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         use change_set::{ChangeSetResponse, DestroyAction};
-        use rust_proxmoxmcp_core::protect::{Override, destructive_allowed, protection_of};
+        use rust_proxmoxmcp_core::protect::{
+            DestructiveAttempt, Override, destructive_allowed, protection_of,
+        };
 
         let caller = Self::caller(&context);
         if let Err(error) = authorize_call(
@@ -5111,6 +5140,10 @@ impl ProxmoxServer {
                 args.vmid,
                 now_unix,
                 self.lab_mode,
+                DestructiveAttempt {
+                    op: &action.op,
+                    principal: caller.as_ref().map(|ctx| ctx.token_name.as_str()),
+                },
             );
             let override_applies = !matches!(override_, Override::None);
 
@@ -5237,7 +5270,7 @@ impl ProxmoxServer {
         use rust_proxmoxmcp_core::{
             fingerprint::{GuestState, fingerprint},
             guests::fetch_guest_config_state,
-            protect::{Override, destructive_allowed, protection_of},
+            protect::{DestructiveAttempt, Override, destructive_allowed, protection_of},
         };
 
         let caller = Self::caller(&context);
@@ -5328,6 +5361,17 @@ impl ProxmoxServer {
             .expect("time")
             .as_secs();
 
+        // Peeked from the raw record rather than the typed `action` deserialized
+        // below: the override check needs the op before dispatch decides whether
+        // the action shape even deserializes, and a waiver must bind to the exact
+        // op the approver signed, not a default.
+        let op_for_override = record
+            .actions
+            .first()
+            .and_then(|value| value.get("op"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("destroy_guest");
+
         let override_ = destructive_allowed(
             &protection,
             &self.waivers,
@@ -5335,6 +5379,10 @@ impl ProxmoxServer {
             args.vmid,
             now_unix,
             self.lab_mode,
+            DestructiveAttempt {
+                op: op_for_override,
+                principal: caller.as_ref().map(|ctx| ctx.token_name.as_str()),
+            },
         );
 
         let override_applies = !matches!(override_, Override::None);
@@ -6539,7 +6587,14 @@ impl ProxmoxServer {
         };
 
         if let Err(error) = self
-            .authorize_backup_owner(client, &args.cluster, owner_vmid, &grant, &args.volid)
+            .authorize_backup_owner(
+                client,
+                &args.cluster,
+                owner_vmid,
+                &grant,
+                &args.volid,
+                caller.as_ref().map(|ctx| ctx.token_name.as_str()),
+            )
             .await
         {
             return tool_error(error);
@@ -6825,6 +6880,7 @@ impl ProxmoxServer {
                 action.owner_vmid,
                 &grant,
                 &action.volid,
+                caller.as_ref().map(|ctx| ctx.token_name.as_str()),
             )
             .await
         {

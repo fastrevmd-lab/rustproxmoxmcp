@@ -203,6 +203,8 @@ async fn a_protected_guest_with_matching_waiver_can_be_applied() {
         4102444800, // 2100-01-01 in Unix time
         "test waiver".to_owned(),
         Some("TEST-123".to_owned()),
+        vec!["destroy_guest".to_owned()],
+        None,
     );
     let waivers = Arc::new(WaiverFile::with_entries(vec![waiver]));
 
@@ -282,6 +284,68 @@ async fn a_protected_guest_with_matching_waiver_can_be_applied() {
     assert!(
         result.is_ok(),
         "apply should succeed with matching waiver: {result:?}"
+    );
+}
+
+/// F4 regression: a waiver an operator wrote to let `delete_snapshot` through
+/// must not also admit `destroy_guest` on the same protected guest. Before
+/// the `ops` allowlist, `destructive_allowed` matched on `(cluster, vmid)`
+/// alone, so any destructive op against the waived guest sailed through --
+/// a token scoped to this guest could plan and apply a full destroy under a
+/// waiver the operator wrote for a narrower operation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_waiver_for_one_op_does_not_admit_destroy_guest() {
+    use rust_proxmoxmcp_core::waiver::{WaiverEntry, WaiverFile};
+    use std::sync::Arc;
+
+    let waiver = WaiverEntry::new(
+        "pve3".to_owned(),
+        618,
+        4102444800, // 2100-01-01 in Unix time
+        "snapshot cleanup only".to_owned(),
+        Some("TEST-124".to_owned()),
+        vec!["delete_snapshot".to_owned()],
+        None,
+    );
+    let waivers = Arc::new(WaiverFile::with_entries(vec![waiver]));
+
+    let spec = common::TokenSpec {
+        clusters: vec!["pve3".to_owned()],
+        tools: vec![
+            "plan_proxmox_destroy".to_owned(),
+            "delete_vm".to_owned(),
+            "delete_container".to_owned(),
+        ],
+        guests: vec!["*".to_owned()],
+    };
+
+    let routes = vec![
+        common::Route {
+            path: "/api2/json/nodes",
+            status: 200,
+            body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+        },
+        common::Route {
+            path: "/api2/json/cluster/resources",
+            status: 200,
+            body: br#"{"data":[{"id":"lxc/618","type":"lxc","vmid":618,"name":"test-protected","node":"pve2","status":"stopped","tags":"protected"}]}"#,
+        },
+    ];
+
+    let h = common::TestServer::start_with_config(spec, routes, waivers, false).await;
+
+    // A destroy plan -- the default op when none is given -- must be refused:
+    // the waiver on record only names `delete_snapshot`.
+    let err = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 618}),
+    )
+    .await
+    .expect_err("a delete_snapshot-scoped waiver must not admit destroy_guest");
+    assert!(
+        err.to_lowercase().contains("protected"),
+        "expected a protection refusal, got: {err}"
     );
 }
 
@@ -388,6 +452,8 @@ async fn a_protected_guest_with_expired_waiver_is_refused() {
         905,
         946684800, // 2000-01-01 in Unix time
         "expired waiver".to_owned(),
+        None,
+        vec!["destroy_guest".to_owned()],
         None,
     );
     let waivers = Arc::new(WaiverFile::with_entries(vec![waiver]));

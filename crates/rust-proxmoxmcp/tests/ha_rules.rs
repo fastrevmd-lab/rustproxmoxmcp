@@ -750,6 +750,8 @@ async fn a_waiver_lets_the_plan_pass_but_apply_still_needs_second_principal_appr
         4_102_444_800, // 2100-01-01 in Unix time
         "test waiver".to_owned(),
         Some("TEST-999".to_owned()),
+        vec!["ha_rule_create".to_owned()],
+        None,
     );
     let waivers = Arc::new(WaiverFile::with_entries(vec![waiver]));
 
