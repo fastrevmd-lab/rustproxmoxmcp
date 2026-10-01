@@ -2836,6 +2836,18 @@ impl ProxmoxServer {
         let client = self.client_for(&args.cluster)?;
         let grant = resolve_grant(caller.as_ref())?;
 
+        // A protection tag added inside the resolve cache's TTL must be seen
+        // before an interrupting call acts on it, same as `plan_destroy` and
+        // `authorize_ha_rule_guests` drop the cache ahead of their resolve.
+        // A non-interrupting low call (`create_snapshot`, `clone_vm`, ...)
+        // does not take the guest out of service, so it keeps the cached
+        // answer.
+        let interrupts = interrupts_override
+            .unwrap_or_else(|| rust_proxmoxmcp_core::tier::interrupts_service(tool));
+        if interrupts {
+            self.index.invalidate_cluster(&args.cluster);
+        }
+
         // A resolve failure here is not surfaced directly: doing so would
         // tell an out-of-scope caller "not found" before the scope check
         // below ever ran, distinguishing an absent guest from a merely
@@ -2927,6 +2939,15 @@ impl ProxmoxServer {
             Ok(grant) => grant,
             Err(error) => return *error,
         };
+
+        // A protection tag added inside the resolve cache's TTL must be seen
+        // before an interrupting verb acts on it, same as `plan_destroy` and
+        // `authorize_ha_rule_guests` drop the cache ahead of their resolve.
+        // `start_vm`/`start_container` are additive, not disruptive, and keep
+        // the cached answer.
+        if rust_proxmoxmcp_core::tier::interrupts_service(tool) {
+            self.index.invalidate_cluster(&args.cluster);
+        }
 
         // Resolve first so protection can be computed before authorization,
         // exactly as the destroy path does: a waiver or lab mode has to be
