@@ -4,6 +4,15 @@
 //! gets its own [`HttpClient`], so `max_concurrent_requests` and
 //! `max_queued_requests` bound that cluster alone. A wedged endpoint returns
 //! `QueueFull` immediately instead of consuming a pool shared with healthy ones.
+//!
+//! Requests are built with [`HttpRequest::from_absolute_url`], not
+//! [`HttpRequest::with_base_and_path`], because `get_json`/`delete_json` need
+//! a query string and `with_base_and_path` has no way to attach one -- it
+//! only sets the path. The URL handed to `from_absolute_url` is still
+//! assembled from a [`mecmcp_openapi::ExpandedPath`] (path segments are
+//! injection-checked the same as before) plus the operator-configured
+//! cluster endpoint and locally percent-encoded query pairs; nothing
+//! device- or model-supplied reaches this constructor unvalidated.
 
 use crate::error::ProxmoxError;
 use crate::inventory::Cluster;
@@ -118,7 +127,7 @@ impl ProxmoxClient {
             url.push_str(&query_string);
         }
 
-        let request = HttpRequest::new(Method::Get, &url)?
+        let request = HttpRequest::from_absolute_url(Method::Get, &url)?
             .header("Accept", "application/json")?
             .secret_header("Authorization", &self.authorization)?;
 
@@ -177,7 +186,7 @@ impl ProxmoxClient {
             url.push_str(&query_string);
         }
 
-        let request = HttpRequest::new(Method::Delete, &url)?
+        let request = HttpRequest::from_absolute_url(Method::Delete, &url)?
             .header("Accept", "application/json")?
             .secret_header("Authorization", &self.authorization)?;
 
@@ -236,7 +245,7 @@ impl ProxmoxClient {
             .collect::<Vec<_>>()
             .join("&");
 
-        let request = HttpRequest::new(Method::Post, &url)?
+        let request = HttpRequest::from_absolute_url(Method::Post, &url)?
             .header("Accept", "application/json")?
             .header("Content-Type", "application/x-www-form-urlencoded")?
             .secret_header("Authorization", &self.authorization)?
@@ -284,7 +293,7 @@ impl ProxmoxClient {
             .collect::<Vec<_>>()
             .join("&");
 
-        let request = HttpRequest::new(Method::Put, &url)?
+        let request = HttpRequest::from_absolute_url(Method::Put, &url)?
             .header("Accept", "application/json")?
             .header("Content-Type", "application/x-www-form-urlencoded")?
             .secret_header("Authorization", &self.authorization)?
