@@ -1580,8 +1580,14 @@ impl ProxmoxServer {
         evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
         direct_commit: mecmcp_audit::DirectCommitPolicy,
         state_file: Option<&std::path::Path>,
+        approval_digest_key: Option<mecmcp_changeset::ApprovalDigestKey>,
     ) -> Result<Self, mecmcp_changeset::CoordinatorError> {
-        let coordinator = change_set::build_coordinator(state_file, lab_mode, evidence.clone())?;
+        let coordinator = change_set::build_coordinator(
+            state_file,
+            lab_mode,
+            evidence.clone(),
+            approval_digest_key,
+        )?;
         Ok(Self::new(
             clusters,
             clients,
@@ -7775,6 +7781,7 @@ mod tests {
             false,
             None,
             direct_commit,
+            None,
             None,
         )
         .expect("build server")

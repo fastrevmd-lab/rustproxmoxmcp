@@ -515,6 +515,7 @@ impl TestServer {
             None,
             direct_commit,
             state_path.as_deref(),
+            None,
         )
         .expect("build server");
         let coordinator = Arc::clone(handler.coordinator());
