@@ -278,3 +278,172 @@ async fn restore_new_vmid_requires_its_own_tool_scope() {
         "{error}"
     );
 }
+
+/// F1 regression (finding 4, MEC-1180): a token whose guest scope does not
+/// cover the archive's real owner must not read from it, even when the
+/// restore target vmid is in scope. Without `authorize_backup_owner`'s
+/// guest-scope check, a token scoped to its own vmid range could copy a
+/// live, protected, out-of-scope guest's disks into a vmid it controls
+/// merely by naming that guest's archive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_narrow_scoped_token_may_not_restore_from_an_out_of_scope_owners_archive() {
+    let spec = TokenSpec {
+        clusters: vec!["pve3".to_owned()],
+        tools: vec![
+            "plan_restore_new_vmid".to_owned(),
+            "get_proxmox_change_set".to_owned(),
+            "approve_proxmox_change_set".to_owned(),
+            "apply_restore_new_vmid".to_owned(),
+            "restore_backup_new_vmid".to_owned(),
+        ],
+        guests: vec!["*".to_owned()],
+    };
+    let mut routes = default_guest_routes(617, false);
+    // The archive belongs to 905 -- the fixture's live, protected guest --
+    // not the usual 100 this file's other tests restore from.
+    routes.push(rust_proxmoxmcp_core::testing::Route {
+        path: "/api2/json/nodes/pve2/storage/local/content",
+        status: 200,
+        body: br#"{"data":[{"volid":"local:backup/vzdump-qemu-905-2024_01_01-00_00_00.vma.zst","vmid":"905","content":"backup"}]}"#,
+    });
+    let h = TestServer::start_with_routes(spec, routes).await;
+
+    // `h.narrow_token` is scoped to vmid:1-1 only -- neither 905 (the
+    // archive's real owner) nor 650 (the restore target) is in its scope.
+    // Owner is checked first, so this must refuse on 905, not 650.
+    let error = call_with_token(
+        &h,
+        &h.narrow_token,
+        "plan_restore_new_vmid",
+        json!({
+            "cluster": "pve3",
+            "node": "pve2",
+            "target_vmid": 650,
+            "kind": "qemu",
+            "volid": "local:backup/vzdump-qemu-905-2024_01_01-00_00_00.vma.zst",
+        }),
+    )
+    .await
+    .expect_err("owner guest 905 is outside this caller's guest scope");
+    assert!(
+        error.contains("outside this caller's guest scope"),
+        "{error}"
+    );
+
+    let reqs = h.requests();
+    assert!(
+        !reqs.iter().any(|r| r.method == "POST"),
+        "no restore request should have been issued: {reqs:?}"
+    );
+}
+
+/// F1 regression (finding 4, MEC-1180): a protected owner with no matching
+/// waiver must refuse the restore, the same as a protected guest refuses a
+/// destroy plan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restoring_from_a_protected_owners_archive_without_a_waiver_is_refused() {
+    let spec = TokenSpec {
+        clusters: vec!["pve3".to_owned()],
+        tools: vec![
+            "plan_restore_new_vmid".to_owned(),
+            "get_proxmox_change_set".to_owned(),
+            "approve_proxmox_change_set".to_owned(),
+            "apply_restore_new_vmid".to_owned(),
+            "restore_backup_new_vmid".to_owned(),
+        ],
+        guests: vec!["*".to_owned()],
+    };
+    let mut routes = default_guest_routes(617, false);
+    routes.push(rust_proxmoxmcp_core::testing::Route {
+        path: "/api2/json/nodes/pve2/storage/local/content",
+        status: 200,
+        body: br#"{"data":[{"volid":"local:backup/vzdump-qemu-905-2024_01_01-00_00_00.vma.zst","vmid":"905","content":"backup"}]}"#,
+    });
+    // A full guest scope admits 905 -- `start_with_routes` mints an empty
+    // waiver file, so protection alone must still refuse this.
+    let h = TestServer::start_with_routes(spec, routes).await;
+
+    let error = call_with_token(
+        &h,
+        &h.token,
+        "plan_restore_new_vmid",
+        json!({
+            "cluster": "pve3",
+            "node": "pve2",
+            "target_vmid": 650,
+            "kind": "qemu",
+            "volid": "local:backup/vzdump-qemu-905-2024_01_01-00_00_00.vma.zst",
+        }),
+    )
+    .await
+    .expect_err("owner guest 905 is protected and no waiver covers this restore");
+    assert!(
+        error.contains("protected") && error.contains("needs a waiver"),
+        "{error}"
+    );
+}
+
+/// F1 regression (finding 4, MEC-1180): the apply-time re-check must catch
+/// an archive whose real owner changed since the plan -- the same way
+/// `apply_proxmox_change_set` refuses a guest whose fingerprint moved.
+/// Proxmox's content listing is live state; nothing stops it answering
+/// differently between plan and apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archive_ownership_changing_between_plan_and_apply_is_refused() {
+    let h = restore_harness().await;
+
+    let planned = call_with_token(
+        &h,
+        &h.token,
+        "plan_restore_new_vmid",
+        json!({
+            "cluster": "pve3",
+            "node": "pve2",
+            "target_vmid": 650,
+            "kind": "qemu",
+            "volid": "local:backup/vzdump-qemu-100-2024_01_01-00_00_00.vma.zst",
+        }),
+    )
+    .await
+    .expect("plan");
+    let id = planned["change_set_id"].as_str().expect("id").to_owned();
+
+    call_with_token(
+        &h,
+        &h.second_token,
+        "approve_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 650}),
+    )
+    .await
+    .expect("second principal approval should succeed");
+
+    // Same volid, different owner: the content listing now attributes it to
+    // 905 instead of the 100 the plan recorded.
+    h.replace_route(rust_proxmoxmcp_core::testing::Route {
+        path: "/api2/json/nodes/pve2/storage/local/content",
+        status: 200,
+        body: br#"{"data":[{"volid":"local:backup/vzdump-qemu-100-2024_01_01-00_00_00.vma.zst","vmid":"905","content":"backup"}]}"#,
+    });
+
+    let error = call_with_token(
+        &h,
+        &h.token,
+        "apply_restore_new_vmid",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 650}),
+    )
+    .await
+    .expect_err("the archive's ownership changed since this was planned");
+    assert!(
+        error.contains("ownership changed since this was planned"),
+        "{error}"
+    );
+
+    let reqs = h.requests();
+    assert!(
+        !reqs
+            .iter()
+            .any(|r| r.method == "POST" && r.path == "/api2/json/nodes/pve2/qemu"),
+        "nothing may be sent to the cluster when the archive's owner changed since plan: \
+         {reqs:?}"
+    );
+}
