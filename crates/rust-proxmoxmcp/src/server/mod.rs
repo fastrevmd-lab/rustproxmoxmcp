@@ -846,41 +846,154 @@ fn redact_download_url(url: &str) -> String {
     }
 }
 
-/// Config keys `create_vm` and `create_container` refuse.
+/// Config key families `create_vm`/`create_container` accept, by exact match
+/// (case-insensitive).
 ///
 /// `create_guest` forwards arbitrary key/value pairs to Proxmox, which is what
 /// lets one function serve both QEMU and LXC without modelling either. That
-/// passthrough is only safe if the keys that leave the guest are refused, and
-/// there are more of them than they first appear:
-///
-/// - `archive`, `restore` and `force` turn a create into a **restore**.
-///   `guests::restore_backup` posts to the *same* endpoint with the same body
-///   shape; the only difference is these three fields. Without this, a token
-///   holding only `create_vm` could overwrite an existing guest, skipping the
-///   destructive tier, the protection check and change-set approval entirely.
-/// - `hookscript` names a script Proxmox runs **on the node**, and `args` is
-///   appended to the `kvm` command line on the node.
-/// - `mpN` mounts a host path into a container. With `unprivileged=0` that is
-///   host root inside a privileged container.
-/// - `hostpciN`, `usbN`, `devN`, `serialN` and `parallelN` pass host devices
-///   through.
-/// - `lxc.*` is raw LXC configuration, which can express all of the above.
-/// - `cicustom` runs cloud-init snippets from storage.
-///
-/// Refused rather than dropped, so a caller is told their config was not
-/// applied as written.
-const REFUSED_CONFIG_KEYS: &[&str] = &[
-    "archive",
-    "restore",
-    "force",
-    "hookscript",
-    "args",
-    "cicustom",
+/// passthrough was previously safe only if every dangerous key was named on a
+/// denylist -- `archive`/`restore`/`force` (turn a create into a *restore*:
+/// `guests::restore_backup` posts to the same endpoint with the same body
+/// shape, so a token holding only `create_vm` could overwrite an existing
+/// guest, skipping the destructive tier, the protection check and change-set
+/// approval entirely), `hookscript`/`args` (run on the node), `mpN`/
+/// `hostpciN`/`usbN`/`devN`/`serialN` (host mounts and device passthrough),
+/// `lxc.*` (raw LXC config expressing all of the above), and `cicustom`
+/// (cloud-init snippets from storage) -- but a denylist only refuses what it
+/// names, and it missed the one that matters most: a disk key
+/// (`scsiN`/`ideN`/`rootfs`/...) can carry `import-from=<volid>` or name an
+/// existing volume directly (`local-lvm:vm-905-disk-0`), attaching another
+/// guest's disk to a brand-new vmid with no approval step at all. An
+/// allowlist of the cloud-init, sizing, metadata and network families this
+/// tool exists for, plus disk keys restricted to a *new* allocation (checked
+/// separately in `reject_unsafe_config`), closes that and every future
+/// denylist gap by construction.
+const ALLOWED_CREATE_CONFIG_KEYS: &[&str] = &[
+    // cloud-init
+    "ciuser",
+    "sshkeys",
+    "nameserver",
+    "searchdomain",
+    "citype",
+    "ciupgrade",
+    // sizing
+    "cores",
+    "sockets",
+    "memory",
+    "balloon",
+    "cpu",
+    "numa",
+    "swap",
+    // metadata
+    "name",
+    "hostname",
+    "description",
+    "tags",
+    "onboot",
+    "startup",
+    "agent",
+    // boot/platform -- no device, host path, or other-guest reach
+    "ostype",
+    "arch",
+    "bios",
+    "scsihw",
+    "boot",
+    "machine",
+    "vga",
+    "features",
+    // container privilege flag; value-checked separately
+    "unprivileged",
 ];
 
-/// Key prefixes refused for the same reasons, where Proxmox numbers the key.
-const REFUSED_CONFIG_PREFIXES: &[&str] =
-    &["mp", "hostpci", "usb", "dev", "serial", "parallel", "lxc."];
+/// Key prefixes `create_vm`/`create_container` accept unconditionally, where
+/// Proxmox numbers the key.
+const ALLOWED_CREATE_CONFIG_PREFIXES: &[&str] = &["ipconfig", "net"];
+
+/// Disk key prefixes a create may allocate a *new* volume under, where
+/// Proxmox numbers the key.
+const CREATE_DISK_KEY_PREFIXES: &[&str] = &["scsi", "ide", "sata", "virtio"];
+
+/// Disk keys a create may allocate a new volume under by exact match.
+const CREATE_DISK_KEY_EXACT: &[&str] = &["rootfs", "efidisk0", "tpmstate0"];
+
+/// Whether `key` names a disk a create may allocate a new volume under.
+fn is_create_disk_key(lower: &str) -> bool {
+    CREATE_DISK_KEY_EXACT.contains(&lower)
+        || CREATE_DISK_KEY_PREFIXES.iter().any(|prefix| {
+            lower
+                .strip_prefix(prefix)
+                .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+        })
+}
+
+/// Whether `key` is inside `create_vm`/`create_container`'s allowlist.
+fn is_allowed_create_config_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    ALLOWED_CREATE_CONFIG_KEYS.contains(&lower.as_str())
+        || ALLOWED_CREATE_CONFIG_PREFIXES
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+        || is_create_disk_key(&lower)
+}
+
+/// Whether `value` contains a Proxmox volume name (`vm-<n>-...` or
+/// `base-<n>-...`) anywhere in it, not just as the whole field.
+///
+/// `import-from=local-lvm:vm-905-disk-0` is the spelling `disk_value_is_new_allocation`
+/// exists to catch via its option-name check; this is the same fact checked
+/// independent of which option carries it; Proxmox does not require the
+/// volume reference to be the value of a key named `import-from` or `file`.
+fn contains_volume_reference(value: &str) -> bool {
+    for prefix in ["vm-", "base-"] {
+        let mut rest = value;
+        while let Some(idx) = rest.find(prefix) {
+            let after = &rest[idx + prefix.len()..];
+            let digits = after.len() - after.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            if digits > 0 && after[digits..].starts_with('-') {
+                return true;
+            }
+            rest = &rest[idx + prefix.len()..];
+        }
+    }
+    false
+}
+
+/// Whether a disk key's value allocates a *new* volume rather than
+/// referencing an existing one.
+///
+/// Proxmox's grammar is `<storage>:<size-or-volref>[,opt=val,...]`. A fresh
+/// allocation's leading field is a bare size in GB (`32`, `32.5`); an
+/// existing volume's is a Proxmox volume name (`vm-905-disk-0`,
+/// `base-905-disk-0`), and `import-from=<volid>` names a second volume
+/// entirely outside the leading field. Refusing anything but a bare numeric
+/// leading field, with no `import-from`/`file` option and no volume name
+/// anywhere in the value, closes all three spellings by construction: an
+/// unqualified disk key otherwise lets a 'low' create attach, import, or
+/// alias another guest's disk -- going around the guest scope a 'low' tier,
+/// which was never meant to reach any guest but the new one, promises.
+fn disk_value_is_new_allocation(value: &str) -> bool {
+    let Some((_, rest)) = value.split_once(':') else {
+        return false;
+    };
+    let mut fields = rest.split(',');
+    let Some(size) = fields.next() else {
+        return false;
+    };
+    if size.is_empty() || !size.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return false;
+    }
+    for field in fields {
+        let option_key = field
+            .split_once('=')
+            .map_or(field, |(key, _)| key)
+            .trim()
+            .to_ascii_lowercase();
+        if option_key == "import-from" || option_key == "file" {
+            return false;
+        }
+    }
+    !contains_volume_reference(value)
+}
 
 /// Config key families `update_vm_config` accepts, by exact match
 /// (case-insensitive).
@@ -942,43 +1055,14 @@ fn is_allowed_vm_config_key(key: &str) -> bool {
         })
 }
 
-/// Config keys that exact-match `refused_keys` (case-insensitively) or start
-/// with one of `refused_prefixes` followed by digits (`mp0`, `usb1`, ...) or,
-/// for a prefix ending in `.`, anything at all (`lxc.cgroup...`).
-///
-/// Shared between `reject_unsafe_config` (guest creation) and
-/// `reject_unsafe_vm_config` (QEMU config update), each with its own
-/// denylist for what its tool's mandate excludes. Pure key-name logic, with
-/// no dependency on `Self`, so `build_destroy_action` -- a free function that
-/// builds a change-set action, not a `ProxmoxServer` method -- can call it
-/// too.
-fn offending_config_keys(
-    config: &std::collections::BTreeMap<String, String>,
-    refused_keys: &[&str],
-    refused_prefixes: &[&str],
-) -> Vec<String> {
-    config
-        .keys()
-        .filter(|key| {
-            let lower = key.to_ascii_lowercase();
-            let numbered = refused_prefixes.iter().any(|prefix| {
-                lower.strip_prefix(prefix).is_some_and(|rest| {
-                    prefix.ends_with('.')
-                        || (!rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
-                })
-            });
-            refused_keys.contains(&lower.as_str()) || numbered
-        })
-        .cloned()
-        .collect()
-}
-
 /// Config keys whose value carries an absolute host path in any
 /// comma-separated field, under any key.
 ///
 /// Proxmox storage references are `storage:spec`; an absolute path names the
 /// hypervisor's own filesystem rather than a guest disk or a cloud-init
-/// value. Shared for the same reason as [`offending_config_keys`].
+/// value. Shared between `reject_unsafe_config` (guest creation) and
+/// `reject_unsafe_vm_config` (QEMU config update). Pure key-name logic, with
+/// no dependency on `Self`.
 fn config_host_paths(config: &std::collections::BTreeMap<String, String>) -> Vec<String> {
     config
         .iter()
@@ -2609,19 +2693,28 @@ impl ProxmoxServer {
 
     /// Refuse config a `low` create must not be able to express.
     ///
-    /// Two checks, because a key list alone is not enough. A key can be
-    /// perfectly ordinary and still carry a host path in its value --
-    /// `scsi0=/dev/sdb` passes a host disk through under a key that must stay
-    /// allowed for `scsi0=local-lvm:32`.
+    /// An allowlist of key families, not a denylist -- see
+    /// `ALLOWED_CREATE_CONFIG_KEYS` for why -- plus three value checks a key
+    /// list alone cannot express: `unprivileged`'s value (not its presence)
+    /// decides privilege; a disk key can be perfectly ordinary and still
+    /// carry a host path (`scsi0=/dev/sdb`) or another guest's volume
+    /// (`scsi0=local-lvm:vm-905-disk-0`) under a key that must stay allowed
+    /// for `scsi0=local-lvm:32`.
     fn reject_unsafe_config(
         config: &std::collections::BTreeMap<String, String>,
     ) -> Option<CallToolResult> {
-        let offending = offending_config_keys(config, REFUSED_CONFIG_KEYS, REFUSED_CONFIG_PREFIXES);
+        let offending: Vec<String> = config
+            .keys()
+            .filter(|key| !is_allowed_create_config_key(key))
+            .cloned()
+            .collect();
         if !offending.is_empty() {
             return Some(tool_error(format!(
-                "config key(s) {} are refused: they express a restore, host code execution, a host \
-                 mount or device passthrough, none of which a 'low' create may do. Create the guest \
-                 without them and set them from the Proxmox UI if you genuinely need them.",
+                "config key(s) {} are refused: a 'low' create accepts only cloud-init, sizing, \
+                 metadata, network and new-volume disk keys. A restore, host code execution, a \
+                 host mount, device passthrough, or an existing-volume reference, none of which \
+                 a 'low' create may do. Create the guest without them and set them from the \
+                 Proxmox UI if you genuinely need them.",
                 offending.join(", ")
             )));
         }
@@ -2647,6 +2740,31 @@ impl ProxmoxServer {
                  'storage:spec'; a path names the hypervisor's own filesystem, which a 'low' \
                  create must not reach.",
                 host_pathed.join(", ")
+            )));
+        }
+
+        // F3 of the MEC-446/MEC-1163 authorization audit: a disk key's value
+        // is otherwise free-form, so `import-from=<volid>` or an existing
+        // volume named directly (`local-lvm:vm-905-disk-0`) attaches another
+        // guest's disk to this one -- including a protected, out-of-scope
+        // guest -- with no approval step, because `create_vm`/
+        // `create_container` are 'low' tier and never resolve a source guest
+        // to check scope against. See `disk_value_is_new_allocation`.
+        let foreign_volume: Vec<String> = config
+            .iter()
+            .filter(|(key, value)| {
+                is_create_disk_key(&key.to_ascii_lowercase())
+                    && !disk_value_is_new_allocation(value)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        if !foreign_volume.is_empty() {
+            return Some(tool_error(format!(
+                "config key(s) {} must allocate a new volume ('<storage>:<size-in-gb>'), not \
+                 reference an existing one: 'import-from', 'file', and a value naming another \
+                 guest's volume ('vm-<id>-...'/'base-<id>-...') are refused. A 'low' create must \
+                 not be able to attach or import a volume outside the guest it is creating.",
+                foreign_volume.join(", ")
             )));
         }
 

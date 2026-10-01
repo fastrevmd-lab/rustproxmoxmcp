@@ -457,3 +457,120 @@ async fn an_old_shaped_create_is_refused_rather_than_half_applied() {
         .count();
     assert_eq!(created, 0, "a half-understood create must not be sent");
 }
+
+/// F3 of the MEC-446/MEC-1163 authorization audit: `import-from` pulls
+/// another guest's disk into a brand-new vmid with no approval step at all --
+/// `create_vm`/`create_container` are 'low' tier and never resolve a source
+/// guest to check scope against, so this bypasses the guest scope entirely,
+/// not merely weakens it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_from_another_guests_volume_is_refused() {
+    let h = common::TestServer::start_with_direct_commit(
+        spec_with(&["create_vm"], &["*"]),
+        provisioning_routes(),
+        true,
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "create_vm",
+        json!({
+            "cluster":"pve3","node":"pve2","vmid":650,
+            "config":{"scsi0":"local-lvm:0,import-from=local-lvm:vm-905-disk-0"}
+        }),
+    )
+    .await
+    .expect_err("import-from must be refused");
+    assert!(err.contains("scsi0"), "{err}");
+
+    let created = h
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST" && r.path.ends_with("/qemu"))
+        .count();
+    assert_eq!(created, 0, "nothing may be created");
+}
+
+/// Same gap, simpler spelling: naming an existing volume directly, with no
+/// `import-from` option at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attaching_an_existing_volume_directly_is_refused() {
+    let h = common::TestServer::start_with_direct_commit(
+        spec_with(&["create_vm"], &["*"]),
+        provisioning_routes(),
+        true,
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "create_vm",
+        json!({
+            "cluster":"pve3","node":"pve2","vmid":650,
+            "config":{"scsi0":"local-lvm:vm-905-disk-0"}
+        }),
+    )
+    .await
+    .expect_err("attaching an existing volume directly must be refused");
+    assert!(err.contains("scsi0"), "{err}");
+
+    let created = h
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST" && r.path.ends_with("/qemu"))
+        .count();
+    assert_eq!(created, 0, "nothing may be created");
+}
+
+/// The LXC twin of the same gap: `rootfs` is the container's primary disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lxc_rootfs_referencing_another_guests_volume_is_refused() {
+    let h = common::TestServer::start_with_direct_commit(
+        spec_with(&["create_container"], &["*"]),
+        provisioning_routes(),
+        true,
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "create_container",
+        json!({
+            "cluster":"pve3","node":"pve2","vmid":651,
+            "config":{"rootfs":"local-lvm:vm-905-disk-0"}
+        }),
+    )
+    .await
+    .expect_err("rootfs naming another guest's volume must be refused");
+    assert!(err.contains("rootfs"), "{err}");
+
+    let created = h
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST" && r.path.ends_with("/lxc"))
+        .count();
+    assert_eq!(created, 0, "nothing may be created");
+}
+
+/// A disk key naming another guest's volume via `unusedN`-style attach (no
+/// size, no `import-from`) must also be refused -- not just the two spellings
+/// above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disk_key_with_no_size_at_all_is_refused() {
+    let h = common::TestServer::start_with_direct_commit(
+        spec_with(&["create_vm"], &["*"]),
+        provisioning_routes(),
+        true,
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "create_vm",
+        json!({"cluster":"pve3","node":"pve2","vmid":650,"config":{"scsi0":"local-lvm:"}}),
+    )
+    .await
+    .expect_err("a disk key with no size must be refused");
+    assert!(err.contains("scsi0"), "{err}");
+}
