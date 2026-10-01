@@ -2783,7 +2783,7 @@ impl ProxmoxServer {
             .collect();
         if !offending.is_empty() {
             return Some(tool_error(format!(
-                "config key(s) {} are refused: a 'low' create accepts only cloud-init, sizing, \
+                "config field(s) {} are refused: a 'low' create accepts only cloud-init, sizing, \
                  metadata, network and new-volume disk keys. A restore, host code execution, a \
                  host mount, device passthrough, or an existing-volume reference, none of which \
                  a 'low' create may do. Create the guest without them and set them from the \
@@ -2833,7 +2833,7 @@ impl ProxmoxServer {
             .collect();
         if !foreign_volume.is_empty() {
             return Some(tool_error(format!(
-                "config key(s) {} must allocate a new volume ('<storage>:<size-in-gb>'), not \
+                "config field(s) {} must allocate a new volume ('<storage>:<size-in-gb>'), not \
                  reference an existing one: 'import-from', 'file', and a value naming another \
                  guest's volume ('vm-<id>-...'/'base-<id>-...') are refused. A 'low' create must \
                  not be able to attach or import a volume outside the guest it is creating.",
