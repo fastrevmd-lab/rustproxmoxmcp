@@ -76,6 +76,11 @@ pub struct TestServer {
     /// that would otherwise pass every scope check, distinct from
     /// `narrow_token`, which instead narrows the guest scope.
     pub low_tier_token: String,
+    /// A sixth token with every action tier and the same clusters/tools as
+    /// `token`, but scoped to `vmid:600-699` only. See the field's
+    /// definition site for why this range (not `narrow_token`'s `vmid:1-1`)
+    /// is needed.
+    pub mid_range_token: String,
     /// The mock Proxmox server.
     mock: TlsMockServer,
     /// Guest index for cache invalidation in tests.
@@ -447,6 +452,35 @@ impl TestServer {
         )
         .expect("mint low-tier token");
 
+        // A sixth token, same clusters/tools as `token`, carrying every
+        // action tier, but scoped to `vmid:600-699` -- wide enough to cover
+        // a restore target in that range (e.g. 650) while excluding the
+        // fixture's other guests (617, 905, 618). For proving an
+        // owner-guest authority check (scope or protection) is re-run
+        // against the *approver's* own grant, distinct from `narrow_token`
+        // (which excludes every fixture guest, including the target) and
+        // `second_token` (which, like `token`, is scoped to every guest).
+        let mid_range_grant = ProxmoxGrant {
+            guests: vec!["vmid:600-699".to_owned()],
+            actions: actions.clone(),
+        };
+        let mid_range_plaintext = TokenStoreFile::<ProxmoxGrant>::add_with_options(
+            &tokens_path,
+            "test-token-mid-range",
+            parse_scope(&spec.clusters),
+            parse_scope(&spec.tools),
+            None,
+            Some(mid_range_grant),
+            None,
+            None,
+            None,
+            // Human: this token stands in for a second, distinct approver in
+            // the tests that use it.
+            Some(mecmcp_auth::ActorType::Human),
+            &known,
+        )
+        .expect("mint mid-range token");
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -510,6 +544,7 @@ impl TestServer {
             agent_token: agent_plaintext.expose_secret().to_owned(),
             narrow_token: narrow_plaintext.expose_secret().to_owned(),
             low_tier_token: low_tier_plaintext.expose_secret().to_owned(),
+            mid_range_token: mid_range_plaintext.expose_secret().to_owned(),
             mock,
             index,
             _temp_dir: temp_dir,

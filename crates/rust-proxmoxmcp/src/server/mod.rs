@@ -104,16 +104,30 @@ const fn tool_for_op(op: &str, kind: GuestType) -> Option<&'static str> {
 /// description, so reusing it showed `DESTROY` for a rollback, a restore and a
 /// volume deletion alike — an approver would have been asked to sign off on
 /// something other than what would run.
+///
+/// Carries its own `protected`/`waiver` lines rather than delegating to
+/// `render_preview`'s, because only `destroy_guest`/`destroy` go through
+/// that renderer -- every other operation here (`delete_snapshot`,
+/// `rollback_snapshot`, `delete_backup`, `restore_backup`, `migrate`,
+/// `update_vm_config`, `delete_iso`) used to have no protection or waiver
+/// line at all. Since a matching waiver no longer auto-approves the change
+/// set (see the F4 fix), the human approver is the real gate, and they must
+/// be told when they are signing off on a protected guest.
 fn render_destructive_preview(
     action: &change_set::DestroyAction,
     guest_name: &str,
     node: &str,
+    protected: bool,
+    protection_summary: &str,
+    override_: &rust_proxmoxmcp_core::protect::Override,
 ) -> String {
+    use rust_proxmoxmcp_core::protect::Override;
+
     let target = format!(
         "{} (vmid {}, {}, node {})",
         guest_name, action.vmid, action.cluster, node
     );
-    match action.op.as_str() {
+    let body = match action.op.as_str() {
         "destroy_guest" | "destroy" => {
             format!(
                 "DESTROY {target}\n  The guest and its disks are removed. This cannot be undone."
@@ -190,7 +204,28 @@ fn render_destructive_preview(
             )
         }
         other => format!("UNKNOWN OPERATION '{other}' on {target}"),
-    }
+    };
+
+    // protected/waiver lines, mirroring `render_preview`'s: always present,
+    // so an absent line never has to be read as "not applicable".
+    let protected_line = if protected {
+        format!("  protected  yes — {protection_summary}")
+    } else {
+        "  protected  no".to_owned()
+    };
+    let waiver_line = match override_ {
+        Override::None => "  waiver     none".to_owned(),
+        Override::Waiver { reason, ticket, .. } => {
+            if let Some(ticket) = ticket {
+                format!("  waiver     {ticket} — {reason}")
+            } else {
+                format!("  waiver     {reason}")
+            }
+        }
+        Override::LabMode => "  waiver     lab-mode".to_owned(),
+    };
+
+    format!("{body}\n{protected_line}\n{waiver_line}")
 }
 
 /// Build and validate the action a destructive plan will record.
@@ -4934,7 +4969,14 @@ impl ProxmoxServer {
         let preview_text = if matches!(action.op.as_str(), "destroy_guest" | "destroy") {
             render_preview(&preview_input)
         } else {
-            render_destructive_preview(&action, &guest.name, &guest.node)
+            render_destructive_preview(
+                &action,
+                &guest.name,
+                &guest.node,
+                protection.is_protected(),
+                &protection.summary(),
+                &override_,
+            )
         };
 
         // Use the shared coordinator.
@@ -5171,7 +5213,10 @@ impl ProxmoxServer {
                 }
                 // Same authority check `approve_change_set` runs: scope and
                 // protection on the owner guest whose archive this would
-                // read, not just the target vmid above.
+                // read, not just the target vmid above. The waiver check
+                // inside binds to the principal who planned the restore, not
+                // this reader -- see the comment on the `approve_change_set`
+                // call below.
                 if let Err(error) = self
                     .authorize_backup_owner(
                         client,
@@ -5179,7 +5224,7 @@ impl ProxmoxServer {
                         action.owner_vmid,
                         &grant,
                         &action.volid,
-                        caller.as_ref().map(|ctx| ctx.token_name.as_str()),
+                        Some(record.owner.as_str()),
                     )
                     .await
                 {
@@ -5307,6 +5352,11 @@ impl ProxmoxServer {
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("time")
                 .as_secs();
+            // A waiver binds to the principal who planned the change set, not
+            // whoever is approving it -- the two-person rule requires those
+            // to be different callers. Evaluating this against the approver's
+            // own token name meant any waiver naming a `principal` could
+            // never be approved: the approver can never also be the planner.
             let override_ = destructive_allowed(
                 &protection,
                 &self.waivers,
@@ -5316,7 +5366,7 @@ impl ProxmoxServer {
                 self.lab_mode,
                 DestructiveAttempt {
                     op: &action.op,
-                    principal: caller.as_ref().map(|ctx| ctx.token_name.as_str()),
+                    principal: Some(record.owner.as_str()),
                 },
             );
             let override_applies = !matches!(override_, Override::None);
@@ -5401,6 +5451,11 @@ impl ProxmoxServer {
             // all, could approve a copy out of a guest they otherwise could
             // never touch. Mirrors the re-check `apply_restore_new_vmid`
             // runs, so approve and apply hold the same standard.
+            //
+            // The waiver inside binds to the principal who planned the
+            // restore, not the approver: the two-person rule requires those
+            // to differ, so checking against the approver's own token name
+            // would make a principal-bound waiver permanently unapprovable.
             if let Err(error) = self
                 .authorize_backup_owner(
                     client,
@@ -5408,7 +5463,7 @@ impl ProxmoxServer {
                     action.owner_vmid,
                     &grant,
                     &action.volid,
-                    caller.as_ref().map(|ctx| ctx.token_name.as_str()),
+                    Some(record.owner.as_str()),
                 )
                 .await
             {
@@ -7929,6 +7984,7 @@ mod destructive_action_tests {
 mod destructive_scope_tests {
     use super::{build_destroy_action, render_destructive_preview, tool_for_op};
     use crate::server::change_set::PlanDestroyArgs;
+    use rust_proxmoxmcp_core::protect::Override;
     use rust_proxmoxmcp_core::selector::GuestType;
 
     /// Every operation authorises against its own tool name, so a token
@@ -8008,6 +8064,9 @@ mod destructive_scope_tests {
                 &action(op, Some("snap"), Some("local:backup/x")),
                 "g",
                 "pve2",
+                false,
+                "",
+                &Override::None,
             );
             assert!(text.starts_with(expected), "{op}: {text}");
             assert!(
@@ -8022,15 +8081,61 @@ mod destructive_scope_tests {
     /// everything written since the snapshot is lost.
     #[test]
     fn replacing_operations_warn_that_state_is_overwritten() {
-        let rollback =
-            render_destructive_preview(&action("rollback_snapshot", Some("s"), None), "g", "pve2");
+        let rollback = render_destructive_preview(
+            &action("rollback_snapshot", Some("s"), None),
+            "g",
+            "pve2",
+            false,
+            "",
+            &Override::None,
+        );
         assert!(rollback.contains("OVERWRITES"), "{rollback}");
         let restore = render_destructive_preview(
             &action("restore_backup", None, Some("local:backup/x")),
             "g",
             "pve2",
+            false,
+            "",
+            &Override::None,
         );
         assert!(restore.contains("OVERWRITES"), "{restore}");
+    }
+
+    /// Finding C (MEC-1191 re-review): every non-destroy destructive op used
+    /// to carry no protection or waiver line, so the README's claim that
+    /// "the waiver's reason and ticket are printed in the stored preview"
+    /// was false for this renderer. Since a matching waiver no longer
+    /// auto-approves (F4), the human approver reading this text is the only
+    /// gate left, and they must be told the guest is protected.
+    #[test]
+    fn a_protected_guest_shows_protection_and_waiver_in_a_non_destroy_preview() {
+        let text = render_destructive_preview(
+            &action("rollback_snapshot", Some("s"), None),
+            "g",
+            "pve2",
+            true,
+            "tag:protected",
+            &Override::Waiver {
+                reason: "test waiver".to_owned(),
+                ticket: Some("TEST-1".to_owned()),
+                until_unix: 4102444800,
+            },
+        );
+        assert!(text.contains("protected  yes"), "{text}");
+        assert!(text.contains("tag:protected"), "{text}");
+        assert!(text.contains("waiver"), "{text}");
+        assert!(text.contains("TEST-1"), "{text}");
+
+        let unprotected = render_destructive_preview(
+            &action("rollback_snapshot", Some("s"), None),
+            "g",
+            "pve2",
+            false,
+            "",
+            &Override::None,
+        );
+        assert!(unprotected.contains("protected  no"), "{unprotected}");
+        assert!(unprotected.contains("waiver     none"), "{unprotected}");
     }
 
     /// A volume's node is part of its identity, because `local` is node-local.

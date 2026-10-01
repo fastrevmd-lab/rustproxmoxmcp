@@ -28,6 +28,17 @@ Fixes from the MEC-446/MEC-1163 authorization audit (F1-F4, L1-L3):
   change set `Planned`, and the normal approve/apply flow -- including
   the human-approver requirement -- still applies. `--lab-mode` is
   unaffected: it is still a blanket single-operator waiver by design.
+  `approve_proxmox_change_set` and `get_proxmox_change_set` evaluate a
+  `principal`-bound waiver against the change set's recorded planner, not
+  the caller approving or reading it -- checking it against the approver
+  would have made a `principal`-bound waiver permanently unapprovable,
+  since the two-person rule requires the approver to be a distinct
+  principal from the planner. The preview for every non-destroy
+  destructive operation (`delete_snapshot`, `rollback_snapshot`,
+  `delete_backup`, `restore_backup`, `migrate`, `update_vm_config`,
+  `delete_iso`) now shows the same `protected`/`waiver` lines the
+  guest-destroy preview already did, so the human approver can see why
+  protection was lifted for those operations too.
 - **L1:** `delete_iso` now requires the caller's guest scope to be
   unrestricted (`*`), since the ISO it names is not bound to any guest
   the token's scope could be checked against.

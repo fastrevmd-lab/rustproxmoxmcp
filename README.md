@@ -103,7 +103,14 @@ outside the tool call: **there is deliberately no `grant_waiver` tool and no
   no `ops` field at all: re-add every entry with the exact operation(s) it
   should cover before upgrading.
 - **`principal` is optional.** When set, the waiver only matches that one
-  token name; when absent, it matches any caller.
+  token name; when absent, it matches any caller. This names the token that
+  **plans** the operation, not the one that approves or applies it --
+  `approve_proxmox_change_set` and `get_proxmox_change_set` evaluate the
+  waiver against the planner recorded on the change set, because the
+  two-person rule requires the approver to be a distinct principal from the
+  planner. A `principal`-bound waiver therefore refuses an apply run by a
+  caller other than the planner, which is the intended fail-closed outcome,
+  not a bug.
 - **The `op` strings `ops` must name** depend on which path the waiver
   covers:
   - A destructive operation planned through `plan_proxmox_destroy`: the

@@ -308,6 +308,99 @@ async fn a_protected_guest_with_matching_waiver_can_be_applied() {
     );
 }
 
+/// Finding A (MEC-1191 re-review): a waiver that names a `principal` binds to
+/// the token that *planned* the change set. Evaluating it against the
+/// approver's own token name at `approve_proxmox_change_set` would make the
+/// change set permanently unapprovable -- the two-person rule requires the
+/// approver to be a distinct principal from the planner, so a waiver bound to
+/// the planner could never match "whoever approves". This exercises the
+/// README's own example shape (a `principal`-bound waiver) end to end: plan,
+/// approve with a distinct human, apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_principal_bound_waiver_can_still_be_approved_by_a_distinct_principal() {
+    use rust_proxmoxmcp_core::waiver::{WaiverEntry, WaiverFile};
+    use std::sync::Arc;
+
+    // Bound to "test-token", the planner's own token name (see
+    // `common::TestServer`), not the approver's ("test-token-2").
+    let waiver = WaiverEntry::new(
+        "pve3".to_owned(),
+        618,
+        4102444800, // 2100-01-01 in Unix time
+        "test waiver".to_owned(),
+        Some("TEST-125".to_owned()),
+        vec!["destroy_guest".to_owned()],
+        Some("test-token".to_owned()),
+    );
+    let waivers = Arc::new(WaiverFile::with_entries(vec![waiver]));
+
+    let spec = common::TokenSpec {
+        clusters: vec!["pve3".to_owned()],
+        tools: vec![
+            "plan_proxmox_destroy".to_owned(),
+            "delete_vm".to_owned(),
+            "delete_container".to_owned(),
+            "approve_proxmox_change_set".to_owned(),
+            "apply_proxmox_change_set".to_owned(),
+        ],
+        guests: vec!["*".to_owned()],
+    };
+
+    let routes = vec![
+        common::Route {
+            path: "/api2/json/nodes",
+            status: 200,
+            body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+        },
+        common::Route {
+            path: "/api2/json/cluster/resources",
+            status: 200,
+            body: br#"{"data":[{"id":"lxc/618","type":"lxc","vmid":618,"name":"test-protected","node":"pve2","status":"stopped","tags":"protected"}]}"#,
+        },
+        common::Route {
+            path: "/api2/json/nodes/pve2/lxc/618",
+            status: 200,
+            body: br#"{"data":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:618:root@pam:"}"#,
+        },
+        common::Route {
+            path: "/api2/json/nodes/pve2/lxc/618/config",
+            status: 200,
+            body: br#"{"data":{"hostname":"test-protected","digest":"aabbccddeeff00112233445566778899aabbccdd","rootfs":"local-lvm:vm-618-disk-0,size=8G"}}"#,
+        },
+    ];
+
+    let h = common::TestServer::start_with_config(spec, routes, waivers, false).await;
+    h.script_task_completion(
+        "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:618:root@pam:",
+        "OK",
+    );
+
+    let planned = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 618}),
+    )
+    .await
+    .expect("plan should succeed with a matching principal-bound waiver");
+    let id = planned["change_set_id"].as_str().expect("id");
+    assert_eq!(planned["state"].as_str().expect("state"), "Planned");
+
+    // Approval by a distinct human principal must succeed: the waiver binds
+    // to the planner ("test-token"), not the approver ("test-token-2").
+    common::approve_as_second_principal_for(&h, id, "pve3", 618).await;
+
+    let result = common::call(
+        &h,
+        "apply_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 618}),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "apply should succeed once a principal-bound waiver's plan is approved: {result:?}"
+    );
+}
+
 /// F4 regression: a waiver an operator wrote to let `delete_snapshot` through
 /// must not also admit `destroy_guest` on the same protected guest. Before
 /// the `ops` allowlist, `destructive_allowed` matched on `(cluster, vmid)`
