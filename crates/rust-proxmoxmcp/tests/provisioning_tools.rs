@@ -457,3 +457,236 @@ async fn an_old_shaped_create_is_refused_rather_than_half_applied() {
         .count();
     assert_eq!(created, 0, "a half-understood create must not be sent");
 }
+
+/// F3 of the MEC-446/MEC-1163 authorization audit: `import-from` pulls
+/// another guest's disk into a brand-new vmid with no approval step at all --
+/// `create_vm`/`create_container` are 'low' tier and never resolve a source
+/// guest to check scope against, so this bypasses the guest scope entirely,
+/// not merely weakens it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_from_another_guests_volume_is_refused() {
+    let h = common::TestServer::start_with_direct_commit(
+        spec_with(&["create_vm"], &["*"]),
+        provisioning_routes(),
+        true,
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "create_vm",
+        json!({
+            "cluster":"pve3","node":"pve2","vmid":650,
+            "config":{"scsi0":"local-lvm:0,import-from=local-lvm:vm-905-disk-0"}
+        }),
+    )
+    .await
+    .expect_err("import-from must be refused");
+    assert!(err.contains("scsi0"), "{err}");
+
+    let created = h
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST" && r.path.ends_with("/qemu"))
+        .count();
+    assert_eq!(created, 0, "nothing may be created");
+}
+
+/// Same gap, simpler spelling: naming an existing volume directly, with no
+/// `import-from` option at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attaching_an_existing_volume_directly_is_refused() {
+    let h = common::TestServer::start_with_direct_commit(
+        spec_with(&["create_vm"], &["*"]),
+        provisioning_routes(),
+        true,
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "create_vm",
+        json!({
+            "cluster":"pve3","node":"pve2","vmid":650,
+            "config":{"scsi0":"local-lvm:vm-905-disk-0"}
+        }),
+    )
+    .await
+    .expect_err("attaching an existing volume directly must be refused");
+    assert!(err.contains("scsi0"), "{err}");
+
+    let created = h
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST" && r.path.ends_with("/qemu"))
+        .count();
+    assert_eq!(created, 0, "nothing may be created");
+}
+
+/// The LXC twin of the same gap: `rootfs` is the container's primary disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lxc_rootfs_referencing_another_guests_volume_is_refused() {
+    let h = common::TestServer::start_with_direct_commit(
+        spec_with(&["create_container"], &["*"]),
+        provisioning_routes(),
+        true,
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "create_container",
+        json!({
+            "cluster":"pve3","node":"pve2","vmid":651,
+            "config":{"rootfs":"local-lvm:vm-905-disk-0"}
+        }),
+    )
+    .await
+    .expect_err("rootfs naming another guest's volume must be refused");
+    assert!(err.contains("rootfs"), "{err}");
+
+    let created = h
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST" && r.path.ends_with("/lxc"))
+        .count();
+    assert_eq!(created, 0, "nothing may be created");
+}
+
+/// A disk key naming another guest's volume via `unusedN`-style attach (no
+/// size, no `import-from`) must also be refused -- not just the two spellings
+/// above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disk_key_with_no_size_at_all_is_refused() {
+    let h = common::TestServer::start_with_direct_commit(
+        spec_with(&["create_vm"], &["*"]),
+        provisioning_routes(),
+        true,
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "create_vm",
+        json!({"cluster":"pve3","node":"pve2","vmid":650,"config":{"scsi0":"local-lvm:"}}),
+    )
+    .await
+    .expect_err("a disk key with no size must be refused");
+    assert!(err.contains("scsi0"), "{err}");
+}
+
+/// F3 follow-up (finding 2, MEC-1180): real Proxmox's `POST
+/// /nodes/{node}/lxc` requires `ostemplate`, so the F3 allowlist must accept
+/// it -- gated on the value actually being a `vztmpl` volid, not an
+/// arbitrary path or another content kind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_container_accepts_a_vztmpl_ostemplate() {
+    let h = common::TestServer::start_with_direct_commit(
+        spec_with(&["create_container"], &["*"]),
+        provisioning_routes(),
+        true,
+    )
+    .await;
+
+    let created = common::call(
+        &h,
+        "create_container",
+        json!({
+            "cluster":"pve3","node":"pve2","vmid":651,
+            "config":{
+                "hostname":"ct-651",
+                "ostemplate":"local:vztmpl/debian-12-standard_12.2-1_amd64.tar.zst",
+            }
+        }),
+    )
+    .await
+    .expect("create with a vztmpl ostemplate must succeed");
+    assert_eq!(created["kind"], "lxc");
+}
+
+/// An `ostemplate` naming any other content kind is not a template image and
+/// must be refused, the same as any other foreign-volume reference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_container_refuses_an_ostemplate_that_is_not_a_vztmpl() {
+    let h = common::TestServer::start_with_direct_commit(
+        spec_with(&["create_container"], &["*"]),
+        provisioning_routes(),
+        true,
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "create_container",
+        json!({
+            "cluster":"pve3","node":"pve2","vmid":651,
+            "config":{
+                "hostname":"ct-651",
+                "ostemplate":"local:backup/vzdump-qemu-905-2024_01_01-00_00_00.vma.zst",
+            }
+        }),
+    )
+    .await
+    .expect_err("an ostemplate naming a backup, not a vztmpl, must be refused");
+    assert!(err.contains("ostemplate"), "{err}");
+}
+
+/// F3 follow-up (finding 2, MEC-1180): a cloud-init drive, an empty cdrom,
+/// and an ISO attached read-only are the disk-key shapes real Proxmox
+/// `create_vm` sends that are not a size-based new allocation. All three
+/// must be accepted alongside the sizing form.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_vm_accepts_cloud_init_cdrom_and_iso_media() {
+    let h = common::TestServer::start_with_direct_commit(
+        spec_with(&["create_vm"], &["*"]),
+        provisioning_routes(),
+        true,
+    )
+    .await;
+
+    let created = common::call(
+        &h,
+        "create_vm",
+        json!({
+            "cluster":"pve3","node":"pve2","vmid":650,
+            "config":{
+                "name":"test-650",
+                "scsi0":"local-lvm:32",
+                "ide0":"local-lvm:cloudinit",
+                "ide1":"none,media=cdrom",
+                "ide2":"local:iso/debian-12.5.0-amd64-netinst.iso,media=cdrom",
+            }
+        }),
+    )
+    .await
+    .expect("create with cloud-init, empty cdrom, and ISO media must succeed");
+    assert_eq!(created["vmid"], 650);
+}
+
+/// An `ide`-style disk key claiming `media=cdrom` but naming a volid of the
+/// wrong content kind (a backup, not an ISO) must still be refused -- the
+/// media gate does not waive the volume-reference check generally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_vm_refuses_a_cdrom_media_value_that_is_not_an_iso() {
+    let h = common::TestServer::start_with_direct_commit(
+        spec_with(&["create_vm"], &["*"]),
+        provisioning_routes(),
+        true,
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "create_vm",
+        json!({
+            "cluster":"pve3","node":"pve2","vmid":650,
+            "config":{
+                "name":"test-650",
+                "ide2":"local:backup/vzdump-qemu-905-2024_01_01-00_00_00.vma.zst,media=cdrom",
+            }
+        }),
+    )
+    .await
+    .expect_err("a cdrom media value naming a backup, not an ISO, must be refused");
+    assert!(err.contains("ide2"), "{err}");
+}

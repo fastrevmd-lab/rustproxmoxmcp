@@ -132,7 +132,7 @@ pub fn protection_of(
 /// This evaluates the spec §4.2 rule:
 ///
 /// ```text
-/// allowed := ¬protected ∨ waiver_matches(cluster, vmid, now) ∨ lab_mode
+/// allowed := ¬protected ∨ waiver_matches(cluster, vmid, now, op, principal) ∨ lab_mode
 /// ```
 ///
 /// When the guest is unprotected, no override is needed. When the guest is
@@ -140,6 +140,20 @@ pub fn protection_of(
 /// — the record should name the specific, ticketed authority rather than the
 /// blanket flag.
 ///
+/// Identifies the attempted operation and, when known, the calling token —
+/// the two facts a waiver must match beyond guest and window. Grouped into
+/// one type so `destructive_allowed` stays under clippy's argument-count
+/// lint.
+#[derive(Debug, Clone, Copy)]
+pub struct DestructiveAttempt<'a> {
+    /// The operation being attempted (for example `"destroy_guest"`). A
+    /// waiver only overrides protection for an operation it names.
+    pub op: &'a str,
+    /// The calling token's name, if known. A waiver that names a
+    /// `principal` only overrides protection for that caller.
+    pub principal: Option<&'a str>,
+}
+
 /// # Parameters
 /// - `protection`: the protection verdict from [`protection_of`]
 /// - `waivers`: the loaded waiver file
@@ -147,6 +161,7 @@ pub fn protection_of(
 /// - `vmid`: exact VMID
 /// - `now_unix`: current unix timestamp
 /// - `lab_mode`: whether the server is in lab mode
+/// - `attempt`: the operation and, when known, the calling principal
 #[must_use]
 pub fn destructive_allowed(
     protection: &Protection,
@@ -155,6 +170,7 @@ pub fn destructive_allowed(
     vmid: u32,
     now_unix: u64,
     lab_mode: bool,
+    attempt: DestructiveAttempt<'_>,
 ) -> Override {
     // Unprotected guests need no override.
     if !protection.is_protected() {
@@ -162,7 +178,7 @@ pub fn destructive_allowed(
     }
 
     // Check for a matching waiver first (preferred over lab mode for auditability).
-    if let Some(entry) = waivers.matching(cluster, vmid, now_unix) {
+    if let Some(entry) = waivers.matching(cluster, vmid, now_unix, attempt.op, attempt.principal) {
         return Override::Waiver {
             reason: entry.reason().to_owned(),
             ticket: entry.ticket().map(ToOwned::to_owned),

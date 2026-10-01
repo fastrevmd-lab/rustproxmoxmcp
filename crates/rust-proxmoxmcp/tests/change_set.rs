@@ -203,6 +203,8 @@ async fn a_protected_guest_with_matching_waiver_can_be_applied() {
         4102444800, // 2100-01-01 in Unix time
         "test waiver".to_owned(),
         Some("TEST-123".to_owned()),
+        vec!["destroy_guest".to_owned()],
+        None,
     );
     let waivers = Arc::new(WaiverFile::with_entries(vec![waiver]));
 
@@ -262,16 +264,37 @@ async fn a_protected_guest_with_matching_waiver_can_be_applied() {
     .await
     .expect("plan should succeed with matching waiver");
 
-    // The waiver allows planning. Check if approval is still needed.
+    // F4 regression: an operator waiver lifts *protection*, not the
+    // second-principal approval requirement. A matching waiver must leave
+    // the change set `Planned`, not jump it straight to `Approved` -- that
+    // would let any caller holding the destructive tier and a waiver (an
+    // agent token included) skip the human approval two-person control
+    // exists to require.
     let id = planned["change_set_id"].as_str().expect("id");
     let state = planned["state"].as_str().expect("state");
+    assert_eq!(
+        state, "Planned",
+        "a waiver must not move the change set past Planned; approval is a \
+         separate, still-required step"
+    );
 
-    // If not already approved, approve as second principal.
-    if state != "Approved" {
-        common::approve_as_second_principal_for(&h, id, "pve3", 618).await;
-    }
+    // Apply before approval must be refused.
+    let unapproved = common::call(
+        &h,
+        "apply_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 618}),
+    )
+    .await;
+    assert!(
+        unapproved.is_err(),
+        "apply must refuse an unapproved change set even with a matching waiver: \
+         {unapproved:?}"
+    );
 
-    // Apply should succeed.
+    // A distinct human approves as the second principal.
+    common::approve_as_second_principal_for(&h, id, "pve3", 618).await;
+
+    // Apply should succeed once approved.
     let result = common::call(
         &h,
         "apply_proxmox_change_set",
@@ -281,7 +304,162 @@ async fn a_protected_guest_with_matching_waiver_can_be_applied() {
 
     assert!(
         result.is_ok(),
-        "apply should succeed with matching waiver: {result:?}"
+        "apply should succeed once a matching waiver's plan is approved: {result:?}"
+    );
+}
+
+/// Finding A (MEC-1191 re-review): a waiver that names a `principal` binds to
+/// the token that *planned* the change set. Evaluating it against the
+/// approver's own token name at `approve_proxmox_change_set` would make the
+/// change set permanently unapprovable -- the two-person rule requires the
+/// approver to be a distinct principal from the planner, so a waiver bound to
+/// the planner could never match "whoever approves". This exercises the
+/// README's own example shape (a `principal`-bound waiver) end to end: plan,
+/// approve with a distinct human, apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_principal_bound_waiver_can_still_be_approved_by_a_distinct_principal() {
+    use rust_proxmoxmcp_core::waiver::{WaiverEntry, WaiverFile};
+    use std::sync::Arc;
+
+    // Bound to "test-token", the planner's own token name (see
+    // `common::TestServer`), not the approver's ("test-token-2").
+    let waiver = WaiverEntry::new(
+        "pve3".to_owned(),
+        618,
+        4102444800, // 2100-01-01 in Unix time
+        "test waiver".to_owned(),
+        Some("TEST-125".to_owned()),
+        vec!["destroy_guest".to_owned()],
+        Some("test-token".to_owned()),
+    );
+    let waivers = Arc::new(WaiverFile::with_entries(vec![waiver]));
+
+    let spec = common::TokenSpec {
+        clusters: vec!["pve3".to_owned()],
+        tools: vec![
+            "plan_proxmox_destroy".to_owned(),
+            "delete_vm".to_owned(),
+            "delete_container".to_owned(),
+            "approve_proxmox_change_set".to_owned(),
+            "apply_proxmox_change_set".to_owned(),
+        ],
+        guests: vec!["*".to_owned()],
+    };
+
+    let routes = vec![
+        common::Route {
+            path: "/api2/json/nodes",
+            status: 200,
+            body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+        },
+        common::Route {
+            path: "/api2/json/cluster/resources",
+            status: 200,
+            body: br#"{"data":[{"id":"lxc/618","type":"lxc","vmid":618,"name":"test-protected","node":"pve2","status":"stopped","tags":"protected"}]}"#,
+        },
+        common::Route {
+            path: "/api2/json/nodes/pve2/lxc/618",
+            status: 200,
+            body: br#"{"data":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:618:root@pam:"}"#,
+        },
+        common::Route {
+            path: "/api2/json/nodes/pve2/lxc/618/config",
+            status: 200,
+            body: br#"{"data":{"hostname":"test-protected","digest":"aabbccddeeff00112233445566778899aabbccdd","rootfs":"local-lvm:vm-618-disk-0,size=8G"}}"#,
+        },
+    ];
+
+    let h = common::TestServer::start_with_config(spec, routes, waivers, false).await;
+    h.script_task_completion(
+        "UPID:pve2:0000A1B2:00C3D4E5:66BC1234:vzdestroy:618:root@pam:",
+        "OK",
+    );
+
+    let planned = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 618}),
+    )
+    .await
+    .expect("plan should succeed with a matching principal-bound waiver");
+    let id = planned["change_set_id"].as_str().expect("id");
+    assert_eq!(planned["state"].as_str().expect("state"), "Planned");
+
+    // Approval by a distinct human principal must succeed: the waiver binds
+    // to the planner ("test-token"), not the approver ("test-token-2").
+    common::approve_as_second_principal_for(&h, id, "pve3", 618).await;
+
+    let result = common::call(
+        &h,
+        "apply_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 618}),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "apply should succeed once a principal-bound waiver's plan is approved: {result:?}"
+    );
+}
+
+/// F4 regression: a waiver an operator wrote to let `delete_snapshot` through
+/// must not also admit `destroy_guest` on the same protected guest. Before
+/// the `ops` allowlist, `destructive_allowed` matched on `(cluster, vmid)`
+/// alone, so any destructive op against the waived guest sailed through --
+/// a token scoped to this guest could plan and apply a full destroy under a
+/// waiver the operator wrote for a narrower operation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_waiver_for_one_op_does_not_admit_destroy_guest() {
+    use rust_proxmoxmcp_core::waiver::{WaiverEntry, WaiverFile};
+    use std::sync::Arc;
+
+    let waiver = WaiverEntry::new(
+        "pve3".to_owned(),
+        618,
+        4102444800, // 2100-01-01 in Unix time
+        "snapshot cleanup only".to_owned(),
+        Some("TEST-124".to_owned()),
+        vec!["delete_snapshot".to_owned()],
+        None,
+    );
+    let waivers = Arc::new(WaiverFile::with_entries(vec![waiver]));
+
+    let spec = common::TokenSpec {
+        clusters: vec!["pve3".to_owned()],
+        tools: vec![
+            "plan_proxmox_destroy".to_owned(),
+            "delete_vm".to_owned(),
+            "delete_container".to_owned(),
+        ],
+        guests: vec!["*".to_owned()],
+    };
+
+    let routes = vec![
+        common::Route {
+            path: "/api2/json/nodes",
+            status: 200,
+            body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+        },
+        common::Route {
+            path: "/api2/json/cluster/resources",
+            status: 200,
+            body: br#"{"data":[{"id":"lxc/618","type":"lxc","vmid":618,"name":"test-protected","node":"pve2","status":"stopped","tags":"protected"}]}"#,
+        },
+    ];
+
+    let h = common::TestServer::start_with_config(spec, routes, waivers, false).await;
+
+    // A destroy plan -- the default op when none is given -- must be refused:
+    // the waiver on record only names `delete_snapshot`.
+    let err = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 618}),
+    )
+    .await
+    .expect_err("a delete_snapshot-scoped waiver must not admit destroy_guest");
+    assert!(
+        err.to_lowercase().contains("protected"),
+        "expected a protection refusal, got: {err}"
     );
 }
 
@@ -388,6 +566,8 @@ async fn a_protected_guest_with_expired_waiver_is_refused() {
         905,
         946684800, // 2000-01-01 in Unix time
         "expired waiver".to_owned(),
+        None,
+        vec!["destroy_guest".to_owned()],
         None,
     );
     let waivers = Arc::new(WaiverFile::with_entries(vec![waiver]));
@@ -787,6 +967,56 @@ async fn plan_delete_iso_refuses_backup_volid() {
     );
 }
 
+/// L1 regression: `delete_iso` names a vmid only so the usual guest-scope
+/// machinery has something to check, but the ISO itself lives on storage
+/// every guest on the node shares -- it is not actually scoped to that vmid.
+/// A token narrowed to a vmid range must not be able to delete it merely by
+/// naming an in-scope guest, the same way `download_iso` already requires an
+/// unrestricted scope for the identical reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_delete_iso_refuses_a_narrowed_guest_scope() {
+    let h = common::TestServer::start_with_routes(
+        common::TokenSpec {
+            clusters: vec!["pve3".to_owned()],
+            tools: vec!["plan_proxmox_destroy".to_owned(), "delete_iso".to_owned()],
+            guests: vec!["vmid:600-699".to_owned()],
+        },
+        vec![
+            common::Route {
+                path: "/api2/json/nodes",
+                status: 200,
+                body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+            },
+            common::Route {
+                path: "/api2/json/cluster/resources",
+                status: 200,
+                body: br#"{"data":[{"id":"lxc/617","type":"lxc","vmid":617,"name":"test","node":"pve2","status":"stopped"}]}"#,
+            },
+        ],
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({
+            "cluster": "pve3",
+            "vmid": 617,
+            "op": "delete_iso",
+            "storage": "local",
+            "storage_node": "pve2",
+            "volid": "local:iso/debian-12.iso"
+        }),
+    )
+    .await
+    .expect_err("a narrowed guest scope must not admit delete_iso");
+
+    assert!(
+        err.contains("unrestricted") || err.contains('*'),
+        "refusal must name the unrestricted-scope requirement: {err}"
+    );
+}
+
 /// delete_backup must refuse an iso/ volid at plan time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plan_delete_backup_refuses_iso_volid() {
@@ -829,6 +1059,141 @@ async fn plan_delete_backup_refuses_iso_volid() {
     assert!(
         err.contains("iso") && err.contains("backup"),
         "refusal must mention both content kinds: {err}"
+    );
+}
+
+/// MEC-447 / F1 regression: `delete_backup` must refuse a volid that names
+/// its own storage and content kind correctly, but whose archive actually
+/// belongs to a *different* guest than the one the token is planning
+/// against. Before this fix the only checks were storage and content kind --
+/// both of which a caller controls -- so a token scoped to vmid 617 could
+/// delete guest 905's backup by typing its volid, including a protected,
+/// out-of-scope guest's backup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_delete_backup_refuses_a_volid_belonging_to_another_guest() {
+    let h = common::TestServer::start_with_routes(
+        common::TokenSpec {
+            clusters: vec!["pve3".to_owned()],
+            tools: vec!["plan_proxmox_destroy".to_owned(), "delete_backup".to_owned()],
+            guests: vec!["*".to_owned()],
+        },
+        vec![
+            common::Route {
+                path: "/api2/json/nodes",
+                status: 200,
+                body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+            },
+            common::Route {
+                path: "/api2/json/cluster/resources",
+                status: 200,
+                body: br#"{"data":[{"id":"lxc/617","type":"lxc","vmid":617,"name":"test","node":"pve2","status":"stopped"},{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"}]}"#,
+            },
+            common::Route {
+                path: "/api2/json/nodes/pve2/storage/local/content",
+                status: 200,
+                body: br#"{"data":[{"volid":"local:backup/vzdump-qemu-905-2024_01_01-00_00_00.vma.zst","vmid":"905","content":"backup"}]}"#,
+            },
+            // Without the owner check, planning would proceed past this
+            // point and read guest 617's own config to compute the
+            // fingerprint -- present so the old, vulnerable code path
+            // actually reaches (and would have passed) the point this test
+            // guards, rather than failing on an unrelated missing route.
+            common::Route {
+                path: "/api2/json/nodes/pve2/lxc/617/config",
+                status: 200,
+                body: br#"{"data":{"hostname":"test","cores":1,"memory":512,"digest":"aabbccddeeff00112233445566778899aabbccdd","rootfs":"local-lvm:vm-617-disk-0,size=8G"}}"#,
+            },
+        ],
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({
+            "cluster": "pve3",
+            "vmid": 617,
+            "op": "delete_backup",
+            "storage": "local",
+            "storage_node": "pve2",
+            "volid": "local:backup/vzdump-qemu-905-2024_01_01-00_00_00.vma.zst"
+        }),
+    )
+    .await
+    .expect_err(
+        "a volid that Proxmox reports as belonging to guest 905 must be refused when the \
+         plan names vmid 617",
+    );
+
+    assert!(
+        err.contains("905") && err.contains("617"),
+        "refusal must name both the archive's real owner and the vmid the plan named: {err}"
+    );
+
+    let reqs = h.requests();
+    assert!(
+        !reqs.iter().any(|r| r.method == "DELETE"),
+        "nothing may be deleted when the volid does not belong to the named guest: {reqs:?}"
+    );
+}
+
+/// MEC-447 / F1 regression: `restore_backup` must refuse an archive that
+/// belongs to a different guest than the one it would overwrite, even though
+/// the archive's content kind and the vmid's own existence both check out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_restore_backup_refuses_a_volid_belonging_to_another_guest() {
+    let h = common::TestServer::start_with_routes(
+        common::TokenSpec {
+            clusters: vec!["pve3".to_owned()],
+            tools: vec!["plan_proxmox_destroy".to_owned(), "restore_backup".to_owned()],
+            guests: vec!["*".to_owned()],
+        },
+        vec![
+            common::Route {
+                path: "/api2/json/nodes",
+                status: 200,
+                body: br#"{"data":[{"node":"pve2","status":"online"}]}"#,
+            },
+            common::Route {
+                path: "/api2/json/cluster/resources",
+                status: 200,
+                body: br#"{"data":[{"id":"lxc/617","type":"lxc","vmid":617,"name":"test","node":"pve2","status":"stopped"},{"id":"qemu/905","type":"qemu","vmid":905,"name":"vsrx-prod","node":"pve2","status":"running","tags":"protected"}]}"#,
+            },
+            common::Route {
+                path: "/api2/json/nodes/pve2/storage/local/content",
+                status: 200,
+                body: br#"{"data":[{"volid":"local:backup/vzdump-qemu-905-2024_01_01-00_00_00.vma.zst","vmid":"905","content":"backup"}]}"#,
+            },
+            // See the sibling `delete_backup` test above for why this route
+            // is needed to exercise the old code path meaningfully.
+            common::Route {
+                path: "/api2/json/nodes/pve2/lxc/617/config",
+                status: 200,
+                body: br#"{"data":{"hostname":"test","cores":1,"memory":512,"digest":"aabbccddeeff00112233445566778899aabbccdd","rootfs":"local-lvm:vm-617-disk-0,size=8G"}}"#,
+            },
+        ],
+    )
+    .await;
+
+    let err = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({
+            "cluster": "pve3",
+            "vmid": 617,
+            "op": "restore_backup",
+            "volid": "local:backup/vzdump-qemu-905-2024_01_01-00_00_00.vma.zst"
+        }),
+    )
+    .await
+    .expect_err(
+        "restoring guest 617 from an archive Proxmox reports as belonging to guest 905 must \
+         be refused",
+    );
+
+    assert!(
+        err.contains("905") && err.contains("617"),
+        "refusal must name both the archive's real owner and the vmid the plan named: {err}"
     );
 }
 
@@ -1102,5 +1467,109 @@ async fn an_agent_actor_type_approver_is_refused() {
     assert!(
         apply_err.to_string().to_lowercase().contains("approv"),
         "{apply_err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approve_refuses_an_approver_whose_guest_scope_excludes_the_change_set() {
+    // F2: `approve_change_set` used to authorize only the generic
+    // `approve_proxmox_change_set` tool name against the cluster -- never the
+    // approver's own guest scope. A token scoped to vmid 1 only, but holding
+    // every tool and cluster scope `token` does, could approve a destroy of
+    // guest 617. `narrow_token` is exactly that token.
+    let h = common::handler_with_guest(617, false).await;
+    let planned = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect("plan");
+    let id = planned["change_set_id"].as_str().expect("id");
+
+    let err = common::call_with_token(
+        &h,
+        &h.narrow_token,
+        "approve_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect_err("an approver scoped to a different guest must be refused");
+    assert!(
+        err.to_string().to_lowercase().contains("scope"),
+        "the refusal must name the guest-scope mismatch: {err}"
+    );
+
+    // The change set must still be unapproved: apply must refuse it too.
+    let apply_err = common::call(
+        &h,
+        "apply_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect_err("apply must still refuse after a refused approval attempt");
+    assert!(
+        apply_err.to_string().to_lowercase().contains("approv"),
+        "{apply_err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approve_refuses_an_approver_without_the_destructive_tier() {
+    // F2, same gap: a token that carries every guest and tool scope `token`
+    // does, but was minted without the `destructive` action tier, could
+    // still approve a destroy change set -- only the planner's tier had ever
+    // been checked.
+    let h = common::handler_with_guest(617, false).await;
+    let planned = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect("plan");
+    let id = planned["change_set_id"].as_str().expect("id");
+
+    let err = common::call_with_token(
+        &h,
+        &h.low_tier_token,
+        "approve_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect_err("an approver without the destructive tier must be refused");
+    assert!(
+        err.to_string().to_lowercase().contains("destructive"),
+        "the refusal must name the missing destructive tier: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_change_set_refuses_a_caller_whose_guest_scope_excludes_it() {
+    // Sibling gap to F2: `get_proxmox_change_set` authorized only the tool
+    // name and cluster, so a token scoped to a different guest could read
+    // back another guest's change-set preview -- including the guest name,
+    // node, and for `update_vm_config`, cloud-init values like `sshkeys`.
+    let h = common::handler_with_guest(617, false).await;
+    let planned = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect("plan");
+    let id = planned["change_set_id"].as_str().expect("id");
+
+    let err = common::call_with_token(
+        &h,
+        &h.narrow_token,
+        "get_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect_err("a reader scoped to a different guest must be refused");
+    assert!(
+        err.to_string().to_lowercase().contains("scope"),
+        "the refusal must name the guest-scope mismatch: {err}"
     );
 }

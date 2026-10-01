@@ -104,16 +104,30 @@ const fn tool_for_op(op: &str, kind: GuestType) -> Option<&'static str> {
 /// description, so reusing it showed `DESTROY` for a rollback, a restore and a
 /// volume deletion alike — an approver would have been asked to sign off on
 /// something other than what would run.
+///
+/// Carries its own `protected`/`waiver` lines rather than delegating to
+/// `render_preview`'s, because only `destroy_guest`/`destroy` go through
+/// that renderer -- every other operation here (`delete_snapshot`,
+/// `rollback_snapshot`, `delete_backup`, `restore_backup`, `migrate`,
+/// `update_vm_config`, `delete_iso`) used to have no protection or waiver
+/// line at all. Since a matching waiver no longer auto-approves the change
+/// set (see the F4 fix), the human approver is the real gate, and they must
+/// be told when they are signing off on a protected guest.
 fn render_destructive_preview(
     action: &change_set::DestroyAction,
     guest_name: &str,
     node: &str,
+    protected: bool,
+    protection_summary: &str,
+    override_: &rust_proxmoxmcp_core::protect::Override,
 ) -> String {
+    use rust_proxmoxmcp_core::protect::Override;
+
     let target = format!(
         "{} (vmid {}, {}, node {})",
         guest_name, action.vmid, action.cluster, node
     );
-    match action.op.as_str() {
+    let body = match action.op.as_str() {
         "destroy_guest" | "destroy" => {
             format!(
                 "DESTROY {target}\n  The guest and its disks are removed. This cannot be undone."
@@ -190,7 +204,28 @@ fn render_destructive_preview(
             )
         }
         other => format!("UNKNOWN OPERATION '{other}' on {target}"),
-    }
+    };
+
+    // protected/waiver lines, mirroring `render_preview`'s: always present,
+    // so an absent line never has to be read as "not applicable".
+    let protected_line = if protected {
+        format!("  protected  yes — {protection_summary}")
+    } else {
+        "  protected  no".to_owned()
+    };
+    let waiver_line = match override_ {
+        Override::None => "  waiver     none".to_owned(),
+        Override::Waiver { reason, ticket, .. } => {
+            if let Some(ticket) = ticket {
+                format!("  waiver     {ticket} — {reason}")
+            } else {
+                format!("  waiver     {reason}")
+            }
+        }
+        Override::LabMode => "  waiver     lab-mode".to_owned(),
+    };
+
+    format!("{body}\n{protected_line}\n{waiver_line}")
 }
 
 /// Build and validate the action a destructive plan will record.
@@ -395,6 +430,31 @@ fn kind_named_in(path: &str) -> Option<&'static str> {
 /// stops it as part of the operation, so neither is listed.
 fn destroy_requires_a_stopped_guest(op: &str) -> bool {
     matches!(op, "destroy_guest" | "destroy")
+}
+
+/// Refuse `delete_iso` for a token whose guest scope is narrowed.
+///
+/// `delete_iso` names a vmid only so the usual guest-scope and protection
+/// machinery has something to check, but the ISO it deletes lives on
+/// node/cluster storage that every guest shares -- it is not actually scoped
+/// to that vmid. A token narrowed to `vmid:600-699` naming any in-scope guest
+/// could otherwise delete an ISO relied on by guests outside its scope,
+/// including ones it could never touch directly. `download_iso` already
+/// requires an unrestricted scope for the same reason (see its handler); this
+/// closes the equivalent hole on the delete side.
+fn require_unrestricted_scope_for_delete_iso(
+    op: &str,
+    grant: &rust_proxmoxmcp_core::grant::ProxmoxGrant,
+) -> Result<(), String> {
+    if op == "delete_iso" && !grant.is_unrestricted_guest_scope() {
+        return Err(
+            "delete_iso deletes from storage that is not scoped to any guest, so it requires a \
+             caller whose guest scope is '*'. This caller is narrowed to specific guests and \
+             cannot be checked against a storage."
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 /// Refuse a migration plan Proxmox would refuse anyway, before an approval is
@@ -846,41 +906,188 @@ fn redact_download_url(url: &str) -> String {
     }
 }
 
-/// Config keys `create_vm` and `create_container` refuse.
+/// Config key families `create_vm`/`create_container` accept, by exact match
+/// (case-insensitive).
 ///
 /// `create_guest` forwards arbitrary key/value pairs to Proxmox, which is what
 /// lets one function serve both QEMU and LXC without modelling either. That
-/// passthrough is only safe if the keys that leave the guest are refused, and
-/// there are more of them than they first appear:
-///
-/// - `archive`, `restore` and `force` turn a create into a **restore**.
-///   `guests::restore_backup` posts to the *same* endpoint with the same body
-///   shape; the only difference is these three fields. Without this, a token
-///   holding only `create_vm` could overwrite an existing guest, skipping the
-///   destructive tier, the protection check and change-set approval entirely.
-/// - `hookscript` names a script Proxmox runs **on the node**, and `args` is
-///   appended to the `kvm` command line on the node.
-/// - `mpN` mounts a host path into a container. With `unprivileged=0` that is
-///   host root inside a privileged container.
-/// - `hostpciN`, `usbN`, `devN`, `serialN` and `parallelN` pass host devices
-///   through.
-/// - `lxc.*` is raw LXC configuration, which can express all of the above.
-/// - `cicustom` runs cloud-init snippets from storage.
-///
-/// Refused rather than dropped, so a caller is told their config was not
-/// applied as written.
-const REFUSED_CONFIG_KEYS: &[&str] = &[
-    "archive",
-    "restore",
-    "force",
-    "hookscript",
-    "args",
-    "cicustom",
+/// passthrough was previously safe only if every dangerous key was named on a
+/// denylist -- `archive`/`restore`/`force` (turn a create into a *restore*:
+/// `guests::restore_backup` posts to the same endpoint with the same body
+/// shape, so a token holding only `create_vm` could overwrite an existing
+/// guest, skipping the destructive tier, the protection check and change-set
+/// approval entirely), `hookscript`/`args` (run on the node), `mpN`/
+/// `hostpciN`/`usbN`/`devN`/`serialN` (host mounts and device passthrough),
+/// `lxc.*` (raw LXC config expressing all of the above), and `cicustom`
+/// (cloud-init snippets from storage) -- but a denylist only refuses what it
+/// names, and it missed the one that matters most: a disk key
+/// (`scsiN`/`ideN`/`rootfs`/...) can carry `import-from=<volid>` or name an
+/// existing volume directly (`local-lvm:vm-905-disk-0`), attaching another
+/// guest's disk to a brand-new vmid with no approval step at all. An
+/// allowlist of the cloud-init, sizing, metadata and network families this
+/// tool exists for, plus disk keys restricted to a *new* allocation (checked
+/// separately in `reject_unsafe_config`), closes that and every future
+/// denylist gap by construction.
+const ALLOWED_CREATE_CONFIG_KEYS: &[&str] = &[
+    // cloud-init
+    "ciuser",
+    "sshkeys",
+    "nameserver",
+    "searchdomain",
+    "citype",
+    "ciupgrade",
+    // sizing
+    "cores",
+    "sockets",
+    "memory",
+    "balloon",
+    "cpu",
+    "numa",
+    "swap",
+    // metadata
+    "name",
+    "hostname",
+    "description",
+    "tags",
+    "onboot",
+    "startup",
+    "agent",
+    // boot/platform -- no device, host path, or other-guest reach
+    "ostype",
+    "arch",
+    "bios",
+    "scsihw",
+    "boot",
+    "machine",
+    "vga",
+    "features",
+    // container privilege flag; value-checked separately
+    "unprivileged",
+    // container template image; value-checked separately (must be a vztmpl
+    // volid, not an arbitrary path)
+    "ostemplate",
+    // LXC default mountpoint storage, and the plural cloud-init key some
+    // callers send instead of `sshkeys` -- both are plain strings with no
+    // device, host path, or other-guest reach
+    "storage",
+    "ssh-public-keys",
 ];
 
-/// Key prefixes refused for the same reasons, where Proxmox numbers the key.
-const REFUSED_CONFIG_PREFIXES: &[&str] =
-    &["mp", "hostpci", "usb", "dev", "serial", "parallel", "lxc."];
+/// Key prefixes `create_vm`/`create_container` accept unconditionally, where
+/// Proxmox numbers the key.
+const ALLOWED_CREATE_CONFIG_PREFIXES: &[&str] = &["ipconfig", "net"];
+
+/// Disk key prefixes a create may allocate a *new* volume under, where
+/// Proxmox numbers the key.
+const CREATE_DISK_KEY_PREFIXES: &[&str] = &["scsi", "ide", "sata", "virtio"];
+
+/// Disk keys a create may allocate a new volume under by exact match.
+const CREATE_DISK_KEY_EXACT: &[&str] = &["rootfs", "efidisk0", "tpmstate0"];
+
+/// Whether `key` names a disk a create may allocate a new volume under.
+fn is_create_disk_key(lower: &str) -> bool {
+    CREATE_DISK_KEY_EXACT.contains(&lower)
+        || CREATE_DISK_KEY_PREFIXES.iter().any(|prefix| {
+            lower
+                .strip_prefix(prefix)
+                .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+        })
+}
+
+/// Whether `key` is inside `create_vm`/`create_container`'s allowlist.
+fn is_allowed_create_config_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    ALLOWED_CREATE_CONFIG_KEYS.contains(&lower.as_str())
+        || ALLOWED_CREATE_CONFIG_PREFIXES
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+        || is_create_disk_key(&lower)
+}
+
+/// Whether `value` contains a Proxmox volume name (`vm-<n>-...` or
+/// `base-<n>-...`) anywhere in it, not just as the whole field.
+///
+/// `import-from=local-lvm:vm-905-disk-0` is the spelling `disk_value_is_new_allocation`
+/// exists to catch via its option-name check; this is the same fact checked
+/// independent of which option carries it; Proxmox does not require the
+/// volume reference to be the value of a key named `import-from` or `file`.
+fn contains_volume_reference(value: &str) -> bool {
+    for prefix in ["vm-", "base-"] {
+        let mut rest = value;
+        while let Some(idx) = rest.find(prefix) {
+            let after = &rest[idx + prefix.len()..];
+            let digits = after.len() - after.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            if digits > 0 && after[digits..].starts_with('-') {
+                return true;
+            }
+            rest = &rest[idx + prefix.len()..];
+        }
+    }
+    false
+}
+
+/// Whether a disk key's value allocates a *new* volume rather than
+/// referencing an existing one.
+///
+/// Proxmox's grammar is `<storage>:<size-or-volref>[,opt=val,...]`. A fresh
+/// allocation's leading field is a bare size in GB (`32`, `32.5`); an
+/// existing volume's is a Proxmox volume name (`vm-905-disk-0`,
+/// `base-905-disk-0`), and `import-from=<volid>` names a second volume
+/// entirely outside the leading field. Refusing anything but a bare numeric
+/// leading field, with no `import-from`/`file` option and no volume name
+/// anywhere in the value, closes all three spellings by construction: an
+/// unqualified disk key otherwise lets a 'low' create attach, import, or
+/// alias another guest's disk -- going around the guest scope a 'low' tier,
+/// which was never meant to reach any guest but the new one, promises.
+fn disk_value_is_new_allocation(value: &str) -> bool {
+    let Some((_, rest)) = value.split_once(':') else {
+        return false;
+    };
+    let mut fields = rest.split(',');
+    let Some(size) = fields.next() else {
+        return false;
+    };
+    if size.is_empty() || !size.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return false;
+    }
+    for field in fields {
+        let option_key = field
+            .split_once('=')
+            .map_or(field, |(key, _)| key)
+            .trim()
+            .to_ascii_lowercase();
+        if option_key == "import-from" || option_key == "file" {
+            return false;
+        }
+    }
+    !contains_volume_reference(value)
+}
+
+/// Whether a disk value is a cloud-init drive, an empty cdrom, or an ISO
+/// attached read-only -- the three disk-key shapes real Proxmox creates send
+/// that are not a size-based new allocation, and that still carry no path to
+/// another guest's data: a cloud-init drive is server-managed and empty at
+/// create time, an empty cdrom names no volume at all, and an ISO's content
+/// kind is checked the same way `restore_backup`'s volid is, via
+/// `validate_volid_kind`.
+fn disk_value_is_allowed_media(value: &str) -> bool {
+    if value == "none,media=cdrom" {
+        return true;
+    }
+    if let Some((storage, rest)) = value.split_once(':')
+        && !storage.is_empty()
+        && rest == "cloudinit"
+    {
+        return true;
+    }
+    if let Some((volid, rest)) = value.split_once(',')
+        && rest == "media=cdrom"
+        && rust_proxmoxmcp_core::guests::validate_volid_kind(volid, "iso").is_ok()
+    {
+        return true;
+    }
+    false
+}
 
 /// Config key families `update_vm_config` accepts, by exact match
 /// (case-insensitive).
@@ -942,43 +1149,14 @@ fn is_allowed_vm_config_key(key: &str) -> bool {
         })
 }
 
-/// Config keys that exact-match `refused_keys` (case-insensitively) or start
-/// with one of `refused_prefixes` followed by digits (`mp0`, `usb1`, ...) or,
-/// for a prefix ending in `.`, anything at all (`lxc.cgroup...`).
-///
-/// Shared between `reject_unsafe_config` (guest creation) and
-/// `reject_unsafe_vm_config` (QEMU config update), each with its own
-/// denylist for what its tool's mandate excludes. Pure key-name logic, with
-/// no dependency on `Self`, so `build_destroy_action` -- a free function that
-/// builds a change-set action, not a `ProxmoxServer` method -- can call it
-/// too.
-fn offending_config_keys(
-    config: &std::collections::BTreeMap<String, String>,
-    refused_keys: &[&str],
-    refused_prefixes: &[&str],
-) -> Vec<String> {
-    config
-        .keys()
-        .filter(|key| {
-            let lower = key.to_ascii_lowercase();
-            let numbered = refused_prefixes.iter().any(|prefix| {
-                lower.strip_prefix(prefix).is_some_and(|rest| {
-                    prefix.ends_with('.')
-                        || (!rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
-                })
-            });
-            refused_keys.contains(&lower.as_str()) || numbered
-        })
-        .cloned()
-        .collect()
-}
-
 /// Config keys whose value carries an absolute host path in any
 /// comma-separated field, under any key.
 ///
 /// Proxmox storage references are `storage:spec`; an absolute path names the
 /// hypervisor's own filesystem rather than a guest disk or a cloud-init
-/// value. Shared for the same reason as [`offending_config_keys`].
+/// value. Shared between `reject_unsafe_config` (guest creation) and
+/// `reject_unsafe_vm_config` (QEMU config update). Pure key-name logic, with
+/// no dependency on `Self`.
 fn config_host_paths(config: &std::collections::BTreeMap<String, String>) -> Vec<String> {
     config
         .iter()
@@ -1510,7 +1688,7 @@ impl ProxmoxServer {
         existing: Option<&serde_json::Value>,
     ) -> Result<(), Box<CallToolResult>> {
         use rust_proxmoxmcp_core::protect::{
-            Override, creation_allowed, destructive_allowed, protection_of,
+            DestructiveAttempt, Override, creation_allowed, destructive_allowed, protection_of,
         };
 
         require_ha_rule_destructive_tier(caller)?;
@@ -1557,6 +1735,10 @@ impl ProxmoxServer {
                         vmid,
                         now_unix,
                         self.lab_mode,
+                        DestructiveAttempt {
+                            op: &format!("ha_rule_{}", action.op),
+                            principal: caller.map(|ctx| ctx.token_name.as_str()),
+                        },
                     );
                     let override_applies = !matches!(override_, Override::None);
                     self.index
@@ -1991,7 +2173,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("node", args.node.as_str())],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -2402,11 +2584,15 @@ impl ProxmoxServer {
                     .storage_node
                     .as_deref()
                     .ok_or_else(|| missing("storage_node"))?;
+                if action.op == "delete_backup" {
+                    Self::require_backup_owner(client, storage_node, volid, vmid).await?;
+                }
                 let data = guests::delete_volume(client, storage_node, storage, volid).await?;
                 Ok(data.as_str().unwrap_or_default().to_owned())
             }
             "restore_backup" => {
                 let volid = action.volid.as_deref().ok_or_else(|| missing("volid"))?;
+                Self::require_backup_owner(client, node, volid, vmid).await?;
                 guests::restore_backup(client, node, kind, vmid, volid, true).await
             }
             "migrate" => {
@@ -2432,6 +2618,123 @@ impl ProxmoxServer {
             other => Err(rust_proxmoxmcp_core::ProxmoxError::Malformed(format!(
                 "unknown destructive operation '{other}'"
             ))),
+        }
+    }
+
+    /// Refuse `delete_backup` / `restore_backup` on an archive that does not
+    /// belong to `vmid`.
+    ///
+    /// Neither operation's volid is bound to any in-scope guest anywhere else
+    /// in the pipeline: `delete_backup` checks only storage and content kind,
+    /// and `restore_backup` checks only content kind. Without this, a token
+    /// scoped to its own vmid could name an out-of-scope guest's archive and
+    /// delete or restore from it, because the volid's filename convention
+    /// (`vzdump-qemu-<vmid>-...`) is never actually checked against the vmid
+    /// the token is authorized for. This asks Proxmox which guest really owns
+    /// the archive and fails closed if that cannot be established.
+    async fn require_backup_owner(
+        client: &ProxmoxClient,
+        node: &str,
+        volid: &str,
+        vmid: u32,
+    ) -> Result<(), rust_proxmoxmcp_core::ProxmoxError> {
+        let owner = rust_proxmoxmcp_core::guests::resolve_backup_owner(client, node, volid)
+            .await
+            .map_err(|error| {
+                rust_proxmoxmcp_core::ProxmoxError::Denied(format!(
+                    "could not establish which guest owns backup archive '{volid}': {error}. \
+                     Refusing rather than trusting the archive's filename."
+                ))
+            })?;
+        if owner != vmid {
+            return Err(rust_proxmoxmcp_core::ProxmoxError::Denied(format!(
+                "backup archive '{volid}' belongs to guest {owner}, not {vmid}; refusing an \
+                 operation on an archive that does not belong to the named guest"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Authorize a restore-into-new-vmid against the archive's real owner,
+    /// not just the (necessarily free) destination vmid.
+    ///
+    /// `restore_new_vmid` has no source guest to resolve scope from the way
+    /// every other destructive tool does -- the destination is required to be
+    /// free, so the only guest whose scope can matter is whoever the archive
+    /// belongs to. Without this, a token scoped to `vmid:600-699` could name
+    /// any other guest's backup and read its disks into a vmid it controls.
+    ///
+    /// The owner is commonly gone by the time an old backup is restored, which
+    /// is the entire point of restoring one -- so an owner that no longer
+    /// resolves is not itself refused. It falls back to the same bare-number
+    /// scope check [`ProxmoxGrant::allows_new_vmid`] uses for a creation
+    /// destination: only `*` and `vmid:`/`vmid:range` terms can speak for a
+    /// guest with no live tags or pool to match against. An owner that *does*
+    /// still resolve gets the full scope and protection check a live guest
+    /// gets anywhere else in this server.
+    async fn authorize_backup_owner(
+        &self,
+        client: &ProxmoxClient,
+        cluster: &str,
+        owner_vmid: u32,
+        grant: &ProxmoxGrant,
+        volid: &str,
+        principal: Option<&str>,
+    ) -> Result<(), String> {
+        use rust_proxmoxmcp_core::protect::{
+            DestructiveAttempt, Override, destructive_allowed, protection_of,
+        };
+
+        match self.index.resolve(client, cluster, owner_vmid).await {
+            Ok(owner_guest) => {
+                if !grant.allows_guest(owner_guest.facts()) {
+                    return Err(format!(
+                        "backup archive '{volid}' belongs to guest {owner_vmid}, which is \
+                         outside this caller's guest scope; a restore may not read from it"
+                    ));
+                }
+
+                let now_unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("time")
+                    .as_secs();
+                let protection = protection_of(client.cluster(), Some(&owner_guest), false);
+                let override_ = destructive_allowed(
+                    &protection,
+                    &self.waivers,
+                    cluster,
+                    owner_vmid,
+                    now_unix,
+                    self.lab_mode,
+                    DestructiveAttempt {
+                        op: "restore_new_vmid",
+                        principal,
+                    },
+                );
+                if protection.is_protected() && matches!(override_, Override::None) {
+                    return Err(format!(
+                        "backup archive '{volid}' belongs to guest {owner_vmid}, which is \
+                         protected ({}); restoring from it needs a waiver",
+                        protection.summary()
+                    ));
+                }
+                Ok(())
+            }
+            Err(rust_proxmoxmcp_core::ProxmoxError::NotFound { .. }) => {
+                if grant.allows_new_vmid(owner_vmid) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "backup archive '{volid}' belongs to guest {owner_vmid}, which no \
+                         longer exists and is outside this caller's guest scope; a restore may \
+                         not read from it"
+                    ))
+                }
+            }
+            Err(error) => Err(format!(
+                "could not establish whether guest {owner_vmid} (owner of backup archive \
+                 '{volid}') is in scope: {error}"
+            )),
         }
     }
 
@@ -2532,19 +2835,28 @@ impl ProxmoxServer {
 
     /// Refuse config a `low` create must not be able to express.
     ///
-    /// Two checks, because a key list alone is not enough. A key can be
-    /// perfectly ordinary and still carry a host path in its value --
-    /// `scsi0=/dev/sdb` passes a host disk through under a key that must stay
-    /// allowed for `scsi0=local-lvm:32`.
+    /// An allowlist of key families, not a denylist -- see
+    /// `ALLOWED_CREATE_CONFIG_KEYS` for why -- plus three value checks a key
+    /// list alone cannot express: `unprivileged`'s value (not its presence)
+    /// decides privilege; a disk key can be perfectly ordinary and still
+    /// carry a host path (`scsi0=/dev/sdb`) or another guest's volume
+    /// (`scsi0=local-lvm:vm-905-disk-0`) under a key that must stay allowed
+    /// for `scsi0=local-lvm:32`.
     fn reject_unsafe_config(
         config: &std::collections::BTreeMap<String, String>,
     ) -> Option<CallToolResult> {
-        let offending = offending_config_keys(config, REFUSED_CONFIG_KEYS, REFUSED_CONFIG_PREFIXES);
+        let offending: Vec<String> = config
+            .keys()
+            .filter(|key| !is_allowed_create_config_key(key))
+            .cloned()
+            .collect();
         if !offending.is_empty() {
             return Some(tool_error(format!(
-                "config field(s) {} are refused: they express a restore, host code execution, a host \
-                 mount or device passthrough, none of which a 'low' create may do. Create the guest \
-                 without them and set them from the Proxmox UI if you genuinely need them.",
+                "config field(s) {} are refused: a 'low' create accepts only cloud-init, sizing, \
+                 metadata, network and new-volume disk keys. A restore, host code execution, a \
+                 host mount, device passthrough, or an existing-volume reference, none of which \
+                 a 'low' create may do. Create the guest without them and set them from the \
+                 Proxmox UI if you genuinely need them.",
                 offending.join(", ")
             )));
         }
@@ -2563,6 +2875,19 @@ impl ProxmoxServer {
             ));
         }
 
+        // `ostemplate` is the one other key where the *value* decides: the
+        // key names only that a template is being used, not which storage or
+        // content kind it comes from, so an arbitrary path or non-template
+        // volid would otherwise pass the key allowlist unchecked.
+        if let Some(value) = config.get("ostemplate")
+            && rust_proxmoxmcp_core::guests::validate_volid_kind(value, "vztmpl").is_err()
+        {
+            return Some(tool_error(format!(
+                "ostemplate '{value}' is not a usable template volid ('<storage>:vztmpl/<name>'). \
+                 A 'low' create_container may only reference a template image."
+            )));
+        }
+
         let host_pathed = config_host_paths(config);
         if !host_pathed.is_empty() {
             return Some(tool_error(format!(
@@ -2570,6 +2895,32 @@ impl ProxmoxServer {
                  'storage:spec'; a path names the hypervisor's own filesystem, which a 'low' \
                  create must not reach.",
                 host_pathed.join(", ")
+            )));
+        }
+
+        // F3 of the MEC-446/MEC-1163 authorization audit: a disk key's value
+        // is otherwise free-form, so `import-from=<volid>` or an existing
+        // volume named directly (`local-lvm:vm-905-disk-0`) attaches another
+        // guest's disk to this one -- including a protected, out-of-scope
+        // guest -- with no approval step, because `create_vm`/
+        // `create_container` are 'low' tier and never resolve a source guest
+        // to check scope against. See `disk_value_is_new_allocation`.
+        let foreign_volume: Vec<String> = config
+            .iter()
+            .filter(|(key, value)| {
+                is_create_disk_key(&key.to_ascii_lowercase())
+                    && !disk_value_is_new_allocation(value)
+                    && !disk_value_is_allowed_media(value)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        if !foreign_volume.is_empty() {
+            return Some(tool_error(format!(
+                "config field(s) {} must allocate a new volume ('<storage>:<size-in-gb>'), not \
+                 reference an existing one: 'import-from', 'file', and a value naming another \
+                 guest's volume ('vm-<id>-...'/'base-<id>-...') are refused. A 'low' create must \
+                 not be able to attach or import a volume outside the guest it is creating.",
+                foreign_volume.join(", ")
             )));
         }
 
@@ -2592,7 +2943,9 @@ impl ProxmoxServer {
         context: &RequestContext<RoleServer>,
         interrupts_override: Option<bool>,
     ) -> Result<rust_proxmoxmcp_core::AuthorizedGuest, Box<CallToolResult>> {
-        use rust_proxmoxmcp_core::protect::{Override, destructive_allowed, protection_of};
+        use rust_proxmoxmcp_core::protect::{
+            DestructiveAttempt, Override, destructive_allowed, protection_of,
+        };
 
         let caller = Self::caller(context);
         if let Err(error) = authorize_call(caller.as_ref(), tool, Some(&args.cluster), WRITE_TOOLS)
@@ -2602,6 +2955,18 @@ impl ProxmoxServer {
 
         let client = self.client_for(&args.cluster)?;
         let grant = resolve_grant(caller.as_ref())?;
+
+        // A protection tag added inside the resolve cache's TTL must be seen
+        // before an interrupting call acts on it, same as `plan_destroy` and
+        // `authorize_ha_rule_guests` drop the cache ahead of their resolve.
+        // A non-interrupting low call (`create_snapshot`, `clone_vm`, ...)
+        // does not take the guest out of service, so it keeps the cached
+        // answer.
+        let interrupts = interrupts_override
+            .unwrap_or_else(|| rust_proxmoxmcp_core::tier::interrupts_service(tool));
+        if interrupts {
+            self.index.invalidate_cluster(&args.cluster);
+        }
 
         // A resolve failure here is not surfaced directly: doing so would
         // tell an out-of-scope caller "not found" before the scope check
@@ -2627,6 +2992,10 @@ impl ProxmoxServer {
             args.vmid,
             now_unix,
             self.lab_mode,
+            DestructiveAttempt {
+                op: tool,
+                principal: caller.as_ref().map(|ctx| ctx.token_name.as_str()),
+            },
         );
         let override_applies = !matches!(override_, Override::None);
 
@@ -2671,7 +3040,9 @@ impl ProxmoxServer {
         args: &GuestArgs,
         context: &RequestContext<RoleServer>,
     ) -> CallToolResult {
-        use rust_proxmoxmcp_core::protect::{Override, destructive_allowed, protection_of};
+        use rust_proxmoxmcp_core::protect::{
+            DestructiveAttempt, Override, destructive_allowed, protection_of,
+        };
 
         let caller = Self::caller(context);
         if let Err(error) = authorize_call(caller.as_ref(), tool, Some(&args.cluster), WRITE_TOOLS)
@@ -2688,6 +3059,15 @@ impl ProxmoxServer {
             Ok(grant) => grant,
             Err(error) => return *error,
         };
+
+        // A protection tag added inside the resolve cache's TTL must be seen
+        // before an interrupting verb acts on it, same as `plan_destroy` and
+        // `authorize_ha_rule_guests` drop the cache ahead of their resolve.
+        // `start_vm`/`start_container` are additive, not disruptive, and keep
+        // the cached answer.
+        if rust_proxmoxmcp_core::tier::interrupts_service(tool) {
+            self.index.invalidate_cluster(&args.cluster);
+        }
 
         // Resolve first so protection can be computed before authorization,
         // exactly as the destroy path does: a waiver or lab mode has to be
@@ -2718,6 +3098,10 @@ impl ProxmoxServer {
             args.vmid,
             now_unix,
             self.lab_mode,
+            DestructiveAttempt {
+                op: tool,
+                principal: caller.as_ref().map(|ctx| ctx.token_name.as_str()),
+            },
         );
         let override_applies = !matches!(override_, Override::None);
 
@@ -2926,7 +3310,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("node", args.node.as_str())],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -3045,7 +3429,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("node", args.node.as_str()), ("upid", args.upid.as_str())],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -3066,7 +3450,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -3087,7 +3471,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -3108,7 +3492,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -3129,7 +3513,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("group", args.group.as_str())],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -3150,7 +3534,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -3171,7 +3555,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("name", args.name.as_str())],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -3192,7 +3576,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -3213,7 +3597,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("node", args.node.as_str())],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -3234,7 +3618,7 @@ impl ProxmoxServer {
             &args.cluster,
             &[("node", args.node.as_str())],
             None,
-            false,
+            true,
             None,
             &context,
         )
@@ -4327,12 +4711,11 @@ impl ProxmoxServer {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         use change_set::ChangeSetResponse;
-        use mecmcp_changeset::WaiverKind;
         use rust_proxmoxmcp_core::{
             fingerprint::{GuestState, fingerprint},
             guests::fetch_guest_config_state,
             preview::{PreviewInput, render_preview},
-            protect::{Override, destructive_allowed, protection_of},
+            protect::{DestructiveAttempt, Override, destructive_allowed, protection_of},
         };
 
         let caller = Self::caller(&context);
@@ -4389,6 +4772,10 @@ impl ProxmoxServer {
             args.vmid,
             now_unix,
             self.lab_mode,
+            DestructiveAttempt {
+                op: &args.op,
+                principal: caller.as_ref().map(|ctx| ctx.token_name.as_str()),
+            },
         );
 
         let override_applies = !matches!(override_, Override::None);
@@ -4416,6 +4803,31 @@ impl ProxmoxServer {
             Ok(action) => action,
             Err(error) => return tool_error(error),
         };
+
+        // Refuse at plan time rather than relying solely on the apply-time
+        // re-check in `execute_destructive`: a `delete_backup`/`restore_backup`
+        // volid's filename convention names a vmid, but nothing before this
+        // bound it to the vmid the caller is authorized for. Spending a
+        // two-person approval on a plan that was never going to touch the
+        // named guest's own archive is worse than refusing it here.
+        if action.op == "delete_backup" || action.op == "restore_backup" {
+            let owner_node = match action.op.as_str() {
+                "delete_backup" => action
+                    .storage_node
+                    .as_deref()
+                    .expect("delete_backup always carries storage_node"),
+                _ => guest.node.as_str(),
+            };
+            let volid = action
+                .volid
+                .as_deref()
+                .expect("delete_backup/restore_backup always carry volid");
+            if let Err(error) =
+                Self::require_backup_owner(client, owner_node, volid, args.vmid).await
+            {
+                return tool_error(error);
+            }
+        }
 
         // Refuse here rather than at apply. Proxmox will not destroy a running
         // guest -- `destroy_vm`/`destroy_container` send `purge` and never
@@ -4502,6 +4914,10 @@ impl ProxmoxServer {
             return authz_tool_error(error);
         }
 
+        if let Err(error) = require_unrestricted_scope_for_delete_iso(&action.op, &grant) {
+            return tool_error(error);
+        }
+
         // The digest and disk sizes come from the guest's own config, not
         // `/cluster/resources` -- that snapshot is cluster-wide and reports
         // neither. Fetched fresh rather than cached: this is what apply
@@ -4553,7 +4969,14 @@ impl ProxmoxServer {
         let preview_text = if matches!(action.op.as_str(), "destroy_guest" | "destroy") {
             render_preview(&preview_input)
         } else {
-            render_destructive_preview(&action, &guest.name, &guest.node)
+            render_destructive_preview(
+                &action,
+                &guest.name,
+                &guest.node,
+                protection.is_protected(),
+                &protection.summary(),
+                &override_,
+            )
         };
 
         // Use the shared coordinator.
@@ -4649,27 +5072,39 @@ impl ProxmoxServer {
         }
 
         // Apply override.
+        //
+        // A matching operator waiver lifts *protection* -- the same
+        // `Override::Waiver` already let this plan past the per-guest
+        // protection gate in the `authorize` call above -- but it is not a
+        // second principal's decision, so it must not move the change set to
+        // `Approved`. The record stays `Planned`: a distinct human still has
+        // to call `approve_proxmox_change_set`. `authorize_ha_rule_guests`
+        // holds the same line for HA rule changes, and its doc comment says
+        // it plainly: an override there "never waives the change set's
+        // second-principal approval; it only lets the guest check pass".
+        //
+        // Earlier this called `coordinator.waive_approval_operator`, which
+        // sets the record `Approved` outright -- collapsing two-person
+        // control for any caller holding the destructive tier and a waiver,
+        // agent tokens included, contrary to this PR's stated intent.
         let output = match override_ {
             Override::Waiver {
                 reason,
                 ticket,
                 until_unix,
-            } => match coordinator
-                .waive_approval_operator(
-                    output.change_set_id.clone(),
-                    device.clone(),
-                    owner.clone(),
-                    output.digest.clone(),
-                    WaiverKind::OperatorFile,
-                    reason,
-                    Some(until_unix),
-                    ticket,
-                )
-                .await
-            {
-                Ok(waived) => waived,
-                Err(error) => return tool_error(format!("waiver: {error}")),
-            },
+            } => {
+                tracing::warn!(
+                    target: "audit",
+                    event = "protection_waived",
+                    change_set = %output.change_set_id,
+                    %reason,
+                    ticket = ticket.as_deref().unwrap_or(""),
+                    until_unix,
+                    "an operator waiver lifted protection for this plan; a distinct human \
+                     approval is still required before it may be applied"
+                );
+                output
+            }
             Override::LabMode => match coordinator
                 .waive_approval(
                     output.change_set_id.clone(),
@@ -4710,7 +5145,7 @@ impl ProxmoxServer {
         Parameters(args): Parameters<change_set::ChangeSetArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        use change_set::ChangeSetResponse;
+        use change_set::{ChangeSetResponse, DestroyAction};
 
         let caller = Self::caller(&context);
         if let Err(error) = authorize_call(
@@ -4722,6 +5157,16 @@ impl ProxmoxServer {
             return authz_tool_error(error);
         }
 
+        let client = match self.client_for(&args.cluster) {
+            Ok(client) => client,
+            Err(result) => return *result,
+        };
+
+        let grant = match resolve_grant(caller.as_ref()) {
+            Ok(grant) => grant,
+            Err(error) => return *error,
+        };
+
         let coordinator = self.coordinator.clone();
 
         let device = format!("{}/{}", args.cluster, args.vmid);
@@ -4729,6 +5174,64 @@ impl ProxmoxServer {
             Ok(record) => record,
             Err(error) => return tool_error(format!("get: {error}")),
         };
+
+        // This tool name and the cluster scope checked above say nothing
+        // about which guest the caller may read. A token scoped to one guest
+        // could otherwise read any other change set's preview on the same
+        // cluster, which leaks the guest's name, node and (for
+        // `update_vm_config`) cloud-init values like `sshkeys` and
+        // `ipconfigN`. Same two action shapes as `approve_change_set`: an
+        // existing guest to resolve and scope-check, or a not-yet-existing
+        // restore target that only the grant's new-vmid scope can speak to.
+        if let Some(raw_action) = record.actions.first() {
+            if let Ok(_action) = serde_json::from_value::<DestroyAction>(raw_action.clone()) {
+                if let Err(error) = self
+                    .index
+                    .authorize(client, &args.cluster, args.vmid, &grant, Intent::read())
+                    .await
+                {
+                    return tool_error(error);
+                }
+            } else {
+                use restore_change_set::RestoreNewVmidAction;
+
+                let action: RestoreNewVmidAction = match serde_json::from_value(raw_action.clone())
+                {
+                    Ok(action) => action,
+                    Err(error) => {
+                        return tool_error(format!(
+                            "the change set's action could not be read ({error}); it cannot be \
+                             read back"
+                        ));
+                    }
+                };
+                if !grant.allows_new_vmid(action.target_vmid) {
+                    return tool_error(format!(
+                        "vmid {} is outside this caller's guest scope",
+                        action.target_vmid
+                    ));
+                }
+                // Same authority check `approve_change_set` runs: scope and
+                // protection on the owner guest whose archive this would
+                // read, not just the target vmid above. The waiver check
+                // inside binds to the principal who planned the restore, not
+                // this reader -- see the comment on the `approve_change_set`
+                // call below.
+                if let Err(error) = self
+                    .authorize_backup_owner(
+                        client,
+                        &args.cluster,
+                        action.owner_vmid,
+                        &grant,
+                        &action.volid,
+                        Some(record.owner.as_str()),
+                    )
+                    .await
+                {
+                    return tool_error(error);
+                }
+            }
+        }
 
         let preview_text = record
             .preview
@@ -4761,7 +5264,10 @@ impl ProxmoxServer {
         Parameters(args): Parameters<change_set::ChangeSetArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        use change_set::ChangeSetResponse;
+        use change_set::{ChangeSetResponse, DestroyAction};
+        use rust_proxmoxmcp_core::protect::{
+            DestructiveAttempt, Override, destructive_allowed, protection_of,
+        };
 
         let caller = Self::caller(&context);
         if let Err(error) = authorize_call(
@@ -4772,6 +5278,16 @@ impl ProxmoxServer {
         ) {
             return authz_tool_error(error);
         }
+
+        let client = match self.client_for(&args.cluster) {
+            Ok(client) => client,
+            Err(result) => return *result,
+        };
+
+        let grant = match resolve_grant(caller.as_ref()) {
+            Ok(grant) => grant,
+            Err(error) => return *error,
+        };
 
         let approver = caller
             .as_ref()
@@ -4804,6 +5320,156 @@ impl ProxmoxServer {
                  nothing to review. Plan the operation again.",
             );
         };
+
+        // The approver must hold the same authority the executor needs, not
+        // just the generic approve-tool and cluster scope checked above.
+        // Without this, a token scoped to one guest with only `read` could
+        // approve a `destroy_guest` change set against any other guest in the
+        // cluster -- `approve_change_set` never looked at the approver's own
+        // grant, only at whether they held the `approve_proxmox_change_set`
+        // tool name. This mirrors the re-check `apply_change_set` and
+        // `apply_restore_new_vmid` run, so approve and apply hold the
+        // approver and the executor to the same standard.
+        //
+        // Two action shapes share this tool: `DestroyAction` (plan_destroy --
+        // an existing in-scope guest to resolve and protect) and
+        // `RestoreNewVmidAction` (plan_restore_new_vmid -- a target vmid that
+        // does not exist yet, so there is no guest to resolve or protect).
+        // Try the former first; its required `op`/`vmid` fields are absent
+        // from the latter's JSON, so a mismatched shape fails to deserialize
+        // and falls through.
+        let Some(raw_action) = record.actions.first() else {
+            return tool_error("the change set records no action".to_owned());
+        };
+        if let Ok(action) = serde_json::from_value::<DestroyAction>(raw_action.clone()) {
+            let (resolved, resolution_failed) =
+                match self.index.resolve(client, &args.cluster, args.vmid).await {
+                    Ok(guest) => (Some(guest), false),
+                    Err(_) => (None, true),
+                };
+            let protection = protection_of(client.cluster(), resolved.as_ref(), resolution_failed);
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_secs();
+            // A waiver binds to the principal who planned the change set, not
+            // whoever is approving it -- the two-person rule requires those
+            // to be different callers. Evaluating this against the approver's
+            // own token name meant any waiver naming a `principal` could
+            // never be approved: the approver can never also be the planner.
+            let override_ = destructive_allowed(
+                &protection,
+                &self.waivers,
+                &args.cluster,
+                args.vmid,
+                now_unix,
+                self.lab_mode,
+                DestructiveAttempt {
+                    op: &action.op,
+                    principal: Some(record.owner.as_str()),
+                },
+            );
+            let override_applies = !matches!(override_, Override::None);
+
+            let authorized = match self
+                .index
+                .authorize(
+                    client,
+                    &args.cluster,
+                    args.vmid,
+                    &grant,
+                    Intent::destructive(override_applies),
+                )
+                .await
+            {
+                Ok(authorized) => authorized,
+                Err(error) => return tool_error(error),
+            };
+            let guest = authorized.guest();
+
+            let Some(op_tool) = tool_for_op(&action.op, guest.r#type) else {
+                return tool_error(format!(
+                    "the change set names an unknown operation '{}'",
+                    action.op
+                ));
+            };
+            if let Err(error) =
+                authorize_call(caller.as_ref(), op_tool, Some(&args.cluster), WRITE_TOOLS)
+            {
+                return tool_error(error);
+            }
+
+            if let Err(error) = require_unrestricted_scope_for_delete_iso(&action.op, &grant) {
+                return tool_error(error);
+            }
+        } else {
+            use restore_change_set::RestoreNewVmidAction;
+            use rust_proxmoxmcp_core::grant::ProxmoxAction;
+            use rust_proxmoxmcp_core::protect::creation_allowed;
+
+            let action: RestoreNewVmidAction = match serde_json::from_value(raw_action.clone()) {
+                Ok(action) => action,
+                Err(error) => {
+                    return tool_error(format!(
+                        "the change set's action could not be read ({error}); \
+                         it cannot be approved"
+                    ));
+                }
+            };
+
+            if let Err(error) = authorize_call(
+                caller.as_ref(),
+                "restore_backup_new_vmid",
+                Some(&args.cluster),
+                WRITE_TOOLS,
+            ) {
+                return tool_error(error);
+            }
+            if !grant.allows_action(ProxmoxAction::Destructive) {
+                return tool_error(
+                    "restoring into a new vmid requires the 'destructive' action tier, which \
+                     this caller does not carry",
+                );
+            }
+            if !grant.allows_new_vmid(action.target_vmid) {
+                return tool_error(format!(
+                    "vmid {} is outside this caller's guest scope, so a backup may not be \
+                     restored into it",
+                    action.target_vmid
+                ));
+            }
+            if !creation_allowed(client.cluster(), action.target_vmid) {
+                return tool_error(format!(
+                    "vmid {} is a protected pin on cluster {} and must not receive a restore",
+                    action.target_vmid, args.cluster
+                ));
+            }
+            // The approver's authority over *this* vmid -- scope and
+            // protection on the guest whose disks get copied, not just the
+            // target vmid checked above. Without this an approver scoped
+            // only to the target range, with no read into the owner guest at
+            // all, could approve a copy out of a guest they otherwise could
+            // never touch. Mirrors the re-check `apply_restore_new_vmid`
+            // runs, so approve and apply hold the same standard.
+            //
+            // The waiver inside binds to the principal who planned the
+            // restore, not the approver: the two-person rule requires those
+            // to differ, so checking against the approver's own token name
+            // would make a principal-bound waiver permanently unapprovable.
+            if let Err(error) = self
+                .authorize_backup_owner(
+                    client,
+                    &args.cluster,
+                    action.owner_vmid,
+                    &grant,
+                    &action.volid,
+                    Some(record.owner.as_str()),
+                )
+                .await
+            {
+                return tool_error(error);
+            }
+        }
 
         let output = match coordinator
             .approve_change_set(
@@ -4858,7 +5524,7 @@ impl ProxmoxServer {
         use rust_proxmoxmcp_core::{
             fingerprint::{GuestState, fingerprint},
             guests::fetch_guest_config_state,
-            protect::{Override, destructive_allowed, protection_of},
+            protect::{DestructiveAttempt, Override, destructive_allowed, protection_of},
         };
 
         let caller = Self::caller(&context);
@@ -4949,6 +5615,29 @@ impl ProxmoxServer {
             .expect("time")
             .as_secs();
 
+        // Peeked from the raw record rather than the typed `action` deserialized
+        // below: the override check needs the op before dispatch decides whether
+        // the action shape even deserializes, and a waiver must bind to the exact
+        // op the approver signed, not a default. A record with no readable `op`
+        // is refused outright rather than defaulting to any specific operation
+        // string -- defaulting to, say, `"destroy_guest"` would let a waiver
+        // scoped to `destroy_guest` admit an apply whose real operation is
+        // unknown, which is the opposite of what a waiver's `ops` binding is
+        // for. The digest binds the stored actions, so this is not reachable
+        // today; refusing it keeps that true if the record shape ever changes.
+        let Some(op_for_override) = record
+            .actions
+            .first()
+            .and_then(|value| value.get("op"))
+            .and_then(|value| value.as_str())
+        else {
+            return tool_error(
+                "change set refused: its first action has no readable 'op' field, so no \
+                 waiver can be bound to the operation it actually names. Plan the operation \
+                 again.",
+            );
+        };
+
         let override_ = destructive_allowed(
             &protection,
             &self.waivers,
@@ -4956,6 +5645,10 @@ impl ProxmoxServer {
             args.vmid,
             now_unix,
             self.lab_mode,
+            DestructiveAttempt {
+                op: op_for_override,
+                principal: caller.as_ref().map(|ctx| ctx.token_name.as_str()),
+            },
         );
 
         let override_applies = !matches!(override_, Override::None);
@@ -5047,6 +5740,10 @@ impl ProxmoxServer {
             authorize_call(caller.as_ref(), op_tool, Some(&args.cluster), WRITE_TOOLS)
         {
             return authz_tool_error(error);
+        }
+
+        if let Err(error) = require_unrestricted_scope_for_delete_iso(&action.op, &grant) {
+            return tool_error(error);
         }
 
         // Defense-in-depth: validate volid content kind again at apply time,
@@ -6130,7 +6827,56 @@ impl ProxmoxServer {
             );
         }
 
-        let action = match build_restore_new_vmid_action(&args) {
+        // Checked before any network call: an iso or template volid is not a
+        // backup archive and resolving its "owner" against a backup content
+        // listing would produce a confusing not-found rather than this clear
+        // refusal. `build_restore_new_vmid_action` re-validates this, but
+        // that happens after owner resolution below, which needs to know
+        // this is a backup volid first.
+        if let Err(error) = rust_proxmoxmcp_core::guests::validate_volid_kind(&args.volid, "backup")
+        {
+            return tool_error(error.to_string());
+        }
+
+        // Resolve the archive's real owner from Proxmox's own storage content
+        // listing, before this plan's identity even exists. The volid's
+        // filename conventionally names a vmid, but that is a convention a
+        // caller can type, not a binding the server checked -- without this,
+        // a token scoped to its own vmid range could copy another guest's
+        // disks into a vmid it controls merely by naming that guest's
+        // archive.
+        let owner_vmid = match rust_proxmoxmcp_core::guests::resolve_backup_owner(
+            client,
+            &args.node,
+            &args.volid,
+        )
+        .await
+        {
+            Ok(owner_vmid) => owner_vmid,
+            Err(error) => {
+                return tool_error(format!(
+                    "could not establish which guest owns backup archive '{}': {error}. \
+                     Refusing rather than trusting the archive's filename.",
+                    args.volid
+                ));
+            }
+        };
+
+        if let Err(error) = self
+            .authorize_backup_owner(
+                client,
+                &args.cluster,
+                owner_vmid,
+                &grant,
+                &args.volid,
+                caller.as_ref().map(|ctx| ctx.token_name.as_str()),
+            )
+            .await
+        {
+            return tool_error(error);
+        }
+
+        let action = match build_restore_new_vmid_action(&args, owner_vmid) {
             Ok(action) => action,
             Err(error) => return tool_error(error),
         };
@@ -6373,6 +7119,49 @@ impl ProxmoxServer {
                 "vmid {} is a protected pin on cluster {} and must not receive a restore",
                 action.target_vmid, args.cluster
             ));
+        }
+
+        // Re-verify the archive still belongs to the owner this change set
+        // was planned and digested against, then re-run the same scope and
+        // protection check `plan_restore_new_vmid` ran -- a scope can be
+        // narrowed, or a waiver can expire, between plan and apply, and this
+        // is the call that actually copies the owner's disks.
+        match rust_proxmoxmcp_core::guests::resolve_backup_owner(
+            client,
+            &action.node,
+            &action.volid,
+        )
+        .await
+        {
+            Ok(owner_vmid) if owner_vmid == action.owner_vmid => {}
+            Ok(owner_vmid) => {
+                return tool_error(format!(
+                    "backup archive '{}' now belongs to guest {owner_vmid}, not the {} it was \
+                     planned against; the archive's ownership changed since this was planned. \
+                     Plan the operation again.",
+                    action.volid, action.owner_vmid
+                ));
+            }
+            Err(error) => {
+                return tool_error(format!(
+                    "could not re-establish which guest owns backup archive '{}': {error}. \
+                     Refusing rather than trusting the previously recorded owner.",
+                    action.volid
+                ));
+            }
+        }
+        if let Err(error) = self
+            .authorize_backup_owner(
+                client,
+                &args.cluster,
+                action.owner_vmid,
+                &grant,
+                &action.volid,
+                caller.as_ref().map(|ctx| ctx.token_name.as_str()),
+            )
+            .await
+        {
+            return tool_error(error);
         }
 
         let kind = match action.kind.as_str() {
@@ -7195,6 +7984,7 @@ mod destructive_action_tests {
 mod destructive_scope_tests {
     use super::{build_destroy_action, render_destructive_preview, tool_for_op};
     use crate::server::change_set::PlanDestroyArgs;
+    use rust_proxmoxmcp_core::protect::Override;
     use rust_proxmoxmcp_core::selector::GuestType;
 
     /// Every operation authorises against its own tool name, so a token
@@ -7274,6 +8064,9 @@ mod destructive_scope_tests {
                 &action(op, Some("snap"), Some("local:backup/x")),
                 "g",
                 "pve2",
+                false,
+                "",
+                &Override::None,
             );
             assert!(text.starts_with(expected), "{op}: {text}");
             assert!(
@@ -7288,15 +8081,61 @@ mod destructive_scope_tests {
     /// everything written since the snapshot is lost.
     #[test]
     fn replacing_operations_warn_that_state_is_overwritten() {
-        let rollback =
-            render_destructive_preview(&action("rollback_snapshot", Some("s"), None), "g", "pve2");
+        let rollback = render_destructive_preview(
+            &action("rollback_snapshot", Some("s"), None),
+            "g",
+            "pve2",
+            false,
+            "",
+            &Override::None,
+        );
         assert!(rollback.contains("OVERWRITES"), "{rollback}");
         let restore = render_destructive_preview(
             &action("restore_backup", None, Some("local:backup/x")),
             "g",
             "pve2",
+            false,
+            "",
+            &Override::None,
         );
         assert!(restore.contains("OVERWRITES"), "{restore}");
+    }
+
+    /// Finding C (MEC-1191 re-review): every non-destroy destructive op used
+    /// to carry no protection or waiver line, so the README's claim that
+    /// "the waiver's reason and ticket are printed in the stored preview"
+    /// was false for this renderer. Since a matching waiver no longer
+    /// auto-approves (F4), the human approver reading this text is the only
+    /// gate left, and they must be told the guest is protected.
+    #[test]
+    fn a_protected_guest_shows_protection_and_waiver_in_a_non_destroy_preview() {
+        let text = render_destructive_preview(
+            &action("rollback_snapshot", Some("s"), None),
+            "g",
+            "pve2",
+            true,
+            "tag:protected",
+            &Override::Waiver {
+                reason: "test waiver".to_owned(),
+                ticket: Some("TEST-1".to_owned()),
+                until_unix: 4102444800,
+            },
+        );
+        assert!(text.contains("protected  yes"), "{text}");
+        assert!(text.contains("tag:protected"), "{text}");
+        assert!(text.contains("waiver"), "{text}");
+        assert!(text.contains("TEST-1"), "{text}");
+
+        let unprotected = render_destructive_preview(
+            &action("rollback_snapshot", Some("s"), None),
+            "g",
+            "pve2",
+            false,
+            "",
+            &Override::None,
+        );
+        assert!(unprotected.contains("protected  no"), "{unprotected}");
+        assert!(unprotected.contains("waiver     none"), "{unprotected}");
     }
 
     /// A volume's node is part of its identity, because `local` is node-local.

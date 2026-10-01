@@ -15,7 +15,7 @@ fn fixture(body: &str) -> tempfile::NamedTempFile {
 
 const ONE: &str = r#"{"version":1,"waivers":[
   {"cluster":"pve3","vmid":905,"until":"2026-08-13T02:00:00Z",
-   "reason":"decommission","ticket":"CHG-4471"}]}"#;
+   "reason":"decommission","ticket":"CHG-4471","ops":["destroy_guest"]}]}"#;
 
 #[test]
 fn a_waiver_matches_its_exact_target_inside_the_window() {
@@ -23,7 +23,7 @@ fn a_waiver_matches_its_exact_target_inside_the_window() {
     let w = WaiverFile::load(f.path()).expect("load");
     // 2026-08-13T01:00:00Z — inside the window.
     let hit = w
-        .matching("pve3", 905, 1_786_582_800)
+        .matching("pve3", 905, 1_786_582_800, "destroy_guest", None)
         .expect("should match");
     assert_eq!(hit.reason(), "decommission");
     assert_eq!(hit.ticket(), Some("CHG-4471"));
@@ -34,7 +34,10 @@ fn an_expired_waiver_does_not_match() {
     let f = fixture(ONE);
     let w = WaiverFile::load(f.path()).expect("load");
     // 2026-08-13T03:00:00Z — one hour past `until`.
-    assert!(w.matching("pve3", 905, 1_786_590_000).is_none());
+    assert!(
+        w.matching("pve3", 905, 1_786_590_000, "destroy_guest", None)
+            .is_none()
+    );
 }
 
 #[test]
@@ -43,12 +46,50 @@ fn a_waiver_does_not_match_a_different_guest_or_cluster() {
     let w = WaiverFile::load(f.path()).expect("load");
     let inside = 1_786_582_800;
     assert!(
-        w.matching("pve3", 906, inside).is_none(),
+        w.matching("pve3", 906, inside, "destroy_guest", None)
+            .is_none(),
         "vmid must match exactly"
     );
     assert!(
-        w.matching("pve2", 905, inside).is_none(),
+        w.matching("pve2", 905, inside, "destroy_guest", None)
+            .is_none(),
         "cluster must match exactly"
+    );
+}
+
+#[test]
+fn a_waiver_does_not_match_an_op_it_does_not_name() {
+    let f = fixture(ONE);
+    let w = WaiverFile::load(f.path()).expect("load");
+    let inside = 1_786_582_800;
+    assert!(
+        w.matching("pve3", 905, inside, "delete_backup", None)
+            .is_none(),
+        "a destroy_guest-only waiver must not admit delete_backup"
+    );
+}
+
+#[test]
+fn a_principal_scoped_waiver_does_not_match_a_different_caller() {
+    let f = fixture(
+        r#"{"version":1,"waivers":[
+          {"cluster":"pve3","vmid":905,"until":"2026-08-13T02:00:00Z",
+           "reason":"decommission","ticket":"CHG-4471","ops":["destroy_guest"],
+           "principal":"alice"}]}"#,
+    );
+    let w = WaiverFile::load(f.path()).expect("load");
+    let inside = 1_786_582_800;
+    assert!(
+        w.matching("pve3", 905, inside, "destroy_guest", Some("alice"))
+            .is_some()
+    );
+    assert!(
+        w.matching("pve3", 905, inside, "destroy_guest", Some("mallory"))
+            .is_none()
+    );
+    assert!(
+        w.matching("pve3", 905, inside, "destroy_guest", None)
+            .is_none()
     );
 }
 
@@ -75,8 +116,25 @@ fn an_unknown_version_is_refused() {
 }
 
 #[test]
+fn an_empty_ops_list_is_refused() {
+    let f = fixture(
+        r#"{"version":1,"waivers":[
+          {"cluster":"pve3","vmid":905,"until":"2026-08-13T02:00:00Z",
+           "reason":"decommission","ticket":"CHG-4471","ops":[]}]}"#,
+    );
+    let err = WaiverFile::load(f.path()).expect_err("empty ops must be refused");
+    assert!(
+        format!("{err}").contains("empty"),
+        "error should name the problem: {err}"
+    );
+}
+
+#[test]
 fn a_missing_file_loads_as_empty_not_an_error() {
     let w = WaiverFile::load(std::path::Path::new("/nonexistent/waivers.json"))
         .expect("absent waiver file is not an error");
-    assert!(w.matching("pve3", 905, 1_786_582_800).is_none());
+    assert!(
+        w.matching("pve3", 905, 1_786_582_800, "destroy_guest", None)
+            .is_none()
+    );
 }

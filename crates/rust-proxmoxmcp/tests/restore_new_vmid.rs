@@ -33,6 +33,17 @@ async fn restore_harness() -> TestServer {
         status: 200,
         body: br#"{"data":"UPID:pve2:0000A1B2:00C3D4E5:66BC1234:qmrestore:650:root@pam:"}"#,
     });
+    // Owner resolution for the fixture's default volid, `local:backup/vzdump-
+    // qemu-100-...`: Proxmox's content listing says it belongs to vmid 100,
+    // which does not exist in `default_guest_routes`' `/cluster/resources`
+    // fixture (905 and 617 only) -- it stands in for an old backup whose
+    // source guest is gone, the common case this restore operation exists
+    // for. The token's `guests: ["*"]` scope admits it either way.
+    routes.push(rust_proxmoxmcp_core::testing::Route {
+        path: "/api2/json/nodes/pve2/storage/local/content",
+        status: 200,
+        body: br#"{"data":[{"volid":"local:backup/vzdump-qemu-100-2024_01_01-00_00_00.vma.zst","vmid":"100","content":"backup"}]}"#,
+    });
 
     TestServer::start_with_routes(spec, routes).await
 }
@@ -264,6 +275,233 @@ async fn restore_new_vmid_requires_its_own_tool_scope() {
     .expect_err("a token with no restore_backup_new_vmid scope must not plan a restore");
     assert!(
         error.contains("not authorized for tool 'restore_backup_new_vmid'"),
+        "{error}"
+    );
+}
+
+/// F1 regression (finding 4, MEC-1180): a token whose guest scope does not
+/// cover the archive's real owner must not read from it, even when the
+/// restore target vmid is in scope. Without `authorize_backup_owner`'s
+/// guest-scope check, a token scoped to its own vmid range could copy a
+/// live, protected, out-of-scope guest's disks into a vmid it controls
+/// merely by naming that guest's archive.
+///
+/// Finding B (MEC-1191 re-review): the token here must have the *target*
+/// vmid (650) in scope and the *owner* vmid (905) out of scope. A token with
+/// neither in scope (the old `vmid:1-1` fixture) still refuses -- the
+/// target-scope check in `grant.allows_new_vmid` would refuse it on 650
+/// alone, so this test passed even with the owner-scope check removed
+/// entirely. The assertion also pins the error to guest 905 specifically,
+/// not just the generic scope message, so it cannot be satisfied by the
+/// target-scope refusal either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_narrow_scoped_token_may_not_restore_from_an_out_of_scope_owners_archive() {
+    let spec = TokenSpec {
+        clusters: vec!["pve3".to_owned()],
+        tools: vec![
+            "plan_restore_new_vmid".to_owned(),
+            "get_proxmox_change_set".to_owned(),
+            "approve_proxmox_change_set".to_owned(),
+            "apply_restore_new_vmid".to_owned(),
+            "restore_backup_new_vmid".to_owned(),
+        ],
+        guests: vec!["vmid:600-699".to_owned()],
+    };
+    let mut routes = default_guest_routes(617, false);
+    // The archive belongs to 905 -- the fixture's live, protected guest --
+    // not the usual 100 this file's other tests restore from.
+    routes.push(rust_proxmoxmcp_core::testing::Route {
+        path: "/api2/json/nodes/pve2/storage/local/content",
+        status: 200,
+        body: br#"{"data":[{"volid":"local:backup/vzdump-qemu-905-2024_01_01-00_00_00.vma.zst","vmid":"905","content":"backup"}]}"#,
+    });
+    let h = TestServer::start_with_routes(spec, routes).await;
+
+    // `h.token` is scoped to vmid:600-699 -- 650 (the restore target) is in
+    // scope, but 905 (the archive's real owner) is not. Owner is checked
+    // first, so this must refuse on 905, not 650.
+    let error = common::call(
+        &h,
+        "plan_restore_new_vmid",
+        json!({
+            "cluster": "pve3",
+            "node": "pve2",
+            "target_vmid": 650,
+            "kind": "qemu",
+            "volid": "local:backup/vzdump-qemu-905-2024_01_01-00_00_00.vma.zst",
+        }),
+    )
+    .await
+    .expect_err("owner guest 905 is outside this caller's guest scope");
+    assert!(
+        error.contains("belongs to guest 905")
+            && error.contains("outside this caller's guest scope"),
+        "{error}"
+    );
+
+    let reqs = h.requests();
+    assert!(
+        !reqs.iter().any(|r| r.method == "POST"),
+        "no restore request should have been issued: {reqs:?}"
+    );
+}
+
+/// F1 regression (finding 4, MEC-1180): a protected owner with no matching
+/// waiver must refuse the restore, the same as a protected guest refuses a
+/// destroy plan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restoring_from_a_protected_owners_archive_without_a_waiver_is_refused() {
+    let spec = TokenSpec {
+        clusters: vec!["pve3".to_owned()],
+        tools: vec![
+            "plan_restore_new_vmid".to_owned(),
+            "get_proxmox_change_set".to_owned(),
+            "approve_proxmox_change_set".to_owned(),
+            "apply_restore_new_vmid".to_owned(),
+            "restore_backup_new_vmid".to_owned(),
+        ],
+        guests: vec!["*".to_owned()],
+    };
+    let mut routes = default_guest_routes(617, false);
+    routes.push(rust_proxmoxmcp_core::testing::Route {
+        path: "/api2/json/nodes/pve2/storage/local/content",
+        status: 200,
+        body: br#"{"data":[{"volid":"local:backup/vzdump-qemu-905-2024_01_01-00_00_00.vma.zst","vmid":"905","content":"backup"}]}"#,
+    });
+    // A full guest scope admits 905 -- `start_with_routes` mints an empty
+    // waiver file, so protection alone must still refuse this.
+    let h = TestServer::start_with_routes(spec, routes).await;
+
+    let error = call_with_token(
+        &h,
+        &h.token,
+        "plan_restore_new_vmid",
+        json!({
+            "cluster": "pve3",
+            "node": "pve2",
+            "target_vmid": 650,
+            "kind": "qemu",
+            "volid": "local:backup/vzdump-qemu-905-2024_01_01-00_00_00.vma.zst",
+        }),
+    )
+    .await
+    .expect_err("owner guest 905 is protected and no waiver covers this restore");
+    assert!(
+        error.contains("protected") && error.contains("needs a waiver"),
+        "{error}"
+    );
+}
+
+/// F1 regression (finding 4, MEC-1180): the apply-time re-check must catch
+/// an archive whose real owner changed since the plan -- the same way
+/// `apply_proxmox_change_set` refuses a guest whose fingerprint moved.
+/// Proxmox's content listing is live state; nothing stops it answering
+/// differently between plan and apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archive_ownership_changing_between_plan_and_apply_is_refused() {
+    let h = restore_harness().await;
+
+    let planned = call_with_token(
+        &h,
+        &h.token,
+        "plan_restore_new_vmid",
+        json!({
+            "cluster": "pve3",
+            "node": "pve2",
+            "target_vmid": 650,
+            "kind": "qemu",
+            "volid": "local:backup/vzdump-qemu-100-2024_01_01-00_00_00.vma.zst",
+        }),
+    )
+    .await
+    .expect("plan");
+    let id = planned["change_set_id"].as_str().expect("id").to_owned();
+
+    call_with_token(
+        &h,
+        &h.second_token,
+        "approve_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 650}),
+    )
+    .await
+    .expect("second principal approval should succeed");
+
+    // Same volid, different owner: the content listing now attributes it to
+    // 905 instead of the 100 the plan recorded.
+    h.replace_route(rust_proxmoxmcp_core::testing::Route {
+        path: "/api2/json/nodes/pve2/storage/local/content",
+        status: 200,
+        body: br#"{"data":[{"volid":"local:backup/vzdump-qemu-100-2024_01_01-00_00_00.vma.zst","vmid":"905","content":"backup"}]}"#,
+    });
+
+    let error = call_with_token(
+        &h,
+        &h.token,
+        "apply_restore_new_vmid",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 650}),
+    )
+    .await
+    .expect_err("the archive's ownership changed since this was planned");
+    assert!(
+        error.contains("ownership changed since this was planned"),
+        "{error}"
+    );
+
+    let reqs = h.requests();
+    assert!(
+        !reqs
+            .iter()
+            .any(|r| r.method == "POST" && r.path == "/api2/json/nodes/pve2/qemu"),
+        "nothing may be sent to the cluster when the archive's owner changed since plan: \
+         {reqs:?}"
+    );
+}
+
+/// Finding D (MEC-1191 re-review): `approve_proxmox_change_set`'s own
+/// `authorize_backup_owner` call for `RestoreNewVmidAction` -- finding 6 /
+/// F2 from MEC-1180 -- has no regression test. Removing that call (and the
+/// matching one in `get_proxmox_change_set`) left every existing restore
+/// test passing, because they all approve with a token scoped to every
+/// fixture guest.
+///
+/// Plans with the wide `h.token`, then approves with `h.mid_range_token`
+/// (scoped to `vmid:600-699`, which covers the restore target 650 but not
+/// the archive's owner, 100). With the owner check present, approval must
+/// be refused on the owner's scope; removing it would let this approval
+/// through on the target-vmid scope check alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approving_a_restore_requires_authority_over_the_archive_owner_too() {
+    let h = restore_harness().await;
+
+    let planned = call_with_token(
+        &h,
+        &h.token,
+        "plan_restore_new_vmid",
+        json!({
+            "cluster": "pve3",
+            "node": "pve2",
+            "target_vmid": 650,
+            "kind": "qemu",
+            "volid": "local:backup/vzdump-qemu-100-2024_01_01-00_00_00.vma.zst",
+        }),
+    )
+    .await
+    .expect("plan");
+    let id = planned["change_set_id"].as_str().expect("id").to_owned();
+
+    let error = call_with_token(
+        &h,
+        &h.mid_range_token,
+        "approve_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 650}),
+    )
+    .await
+    .expect_err(
+        "an approver scoped only to the restore target, not the archive's owner, must be refused",
+    );
+    assert!(
+        error.contains("belongs to guest 100")
+            && error.contains("outside this caller's guest scope"),
         "{error}"
     );
 }
