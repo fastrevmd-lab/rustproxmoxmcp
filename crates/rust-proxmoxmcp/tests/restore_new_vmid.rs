@@ -166,7 +166,7 @@ async fn a_guest_scope_narrowed_before_apply_is_refused() {
     .await
     .expect_err("a guest scope that no longer covers the target vmid must refuse the apply");
     assert!(
-        error.contains("outside this token's guest scope"),
+        error.contains("outside this caller's guest scope"),
         "{error}"
     );
 

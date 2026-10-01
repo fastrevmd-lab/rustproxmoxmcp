@@ -6,8 +6,8 @@ mod restore_change_set;
 
 use mecmcp_auth::{CallerCtx, ScopeSet};
 use mecmcp_server::{
-    ResultFormat, ResultLimits, authorize_call, caller_from_extensions, filter_tools_for_scope,
-    tool_error, tool_result,
+    AuthorizationError, OutputRedaction, ResultFormat, ResultLimits, authorize_call,
+    caller_from_extensions, filter_tools_for_scope, tool_error, tool_result,
 };
 use rmcp::{
     RoleServer, ServerHandler,
@@ -1131,7 +1131,7 @@ fn reject_unsafe_vm_config(config: &std::collections::BTreeMap<String, String>) 
         .find(|key| key.eq_ignore_ascii_case("cipassword"))
     {
         return Some(format!(
-            "config key '{key}' is refused: a cloud-init password would be stored in \
+            "config field '{key}' is refused: a cloud-init password would be stored in \
              plaintext in the change-set record until it is pruned. Use 'sshkeys' for \
              cloud-init authentication instead."
         ));
@@ -1147,7 +1147,7 @@ fn reject_unsafe_vm_config(config: &std::collections::BTreeMap<String, String>) 
         .collect();
     if !disallowed.is_empty() {
         return Some(format!(
-            "config key(s) {} are refused: a config update accepts only cloud-init, sizing \
+            "config field(s) {} are refused: a config update accepts only cloud-init, sizing \
              and metadata keys, plus 'netN' with its firewall left on. Disk, media, device \
              passthrough, 'delete'/'revert', host-run scripts, boot-media and protection \
              changes are outside this tool's mandate. Set them from the Proxmox UI if you \
@@ -1164,7 +1164,7 @@ fn reject_unsafe_vm_config(config: &std::collections::BTreeMap<String, String>) 
         (is_net && !firewall_on).then(|| key.clone())
     }) {
         return Some(format!(
-            "config key '{net_key}' must explicitly set 'firewall=1'. A config update must \
+            "config field '{net_key}' must explicitly set 'firewall=1'. A config update must \
              not leave the guest's per-interface firewall unset or disabled -- Proxmox \
              defaults an interface with no 'firewall=' field to off. Change it from the \
              Proxmox UI if a disabled firewall is intended."
@@ -1174,7 +1174,7 @@ fn reject_unsafe_vm_config(config: &std::collections::BTreeMap<String, String>) 
     let host_pathed = config_host_paths(config);
     if !host_pathed.is_empty() {
         return Some(format!(
-            "config key(s) {} carry an absolute host path. A guest disk is named \
+            "config field(s) {} carry an absolute host path. A guest disk is named \
              'storage:spec'; a path names the hypervisor's own filesystem, which a config \
              update must not reach.",
             host_pathed.join(", ")
@@ -1635,9 +1635,9 @@ impl ProxmoxServer {
         if matches!(action.op.as_str(), "update" | "delete") && !grant.is_unrestricted_guest_scope()
         {
             return Err(Box::new(tool_error(format!(
-                "changing an HA rule with op '{}' requires a token whose guest scope is '*' -- \
+                "changing an HA rule with op '{}' requires a caller whose guest scope is '*' -- \
                  its existing membership is not filtered by guest scope, same as \
-                 list_ha_rules and get_ha_rule. This token is narrowed to specific guests and \
+                 list_ha_rules and get_ha_rule. This caller is narrowed to specific guests and \
                  cannot be checked against it.",
                 action.op
             ))));
@@ -1716,6 +1716,29 @@ impl ProxmoxServer {
     }
 }
 
+/// Convert an [`AuthorizationError`] into a tool error, without routing its
+/// `Display` text (which always opens with `token '{name}' ...`) through
+/// [`tool_error`] directly.
+///
+/// `tool_error` redacts unconditionally as of mecmcp v0.25.0 (MEC-1020), and
+/// mecmcp-redact's scrubber treats "token" as a trigger that consumes the
+/// rest of the line, so the upstream message's own token name would nuke the
+/// tool name callers rely on (`"not authorized for tool 'migrate_container'"`)
+/// along with it. Rebuilding the message from the error's structured fields,
+/// omitting the token name entirely, keeps the useful part intact -- the name
+/// was never meant to reach the model anyway (see `resolve_grant`).
+fn authz_tool_error(error: AuthorizationError) -> CallToolResult {
+    let message = match error {
+        AuthorizationError::ToolNotInScope { tool, .. } => {
+            format!("not authorized for tool '{tool}'")
+        }
+        AuthorizationError::TargetNotInScope { tool, .. } => {
+            format!("not authorized for the requested target (tool '{tool}')")
+        }
+    };
+    tool_error(message)
+}
+
 /// Resolve the grant for a guest-addressed call.
 ///
 /// Distinguishes two cases:
@@ -1731,10 +1754,22 @@ fn resolve_grant(
     match caller {
         None => Ok(rust_proxmoxmcp_core::ProxmoxGrant::read_only()),
         Some(ctx) => ctx.grant.clone().ok_or_else(|| {
-            Box::new(tool_error(format!(
-                "token '{}' carries no 'guests' selector; add one to tokens.json",
-                ctx.token_name
-            )))
+            // `tool_error` redacts unconditionally as of mecmcp v0.25.0
+            // (MEC-1020) and mecmcp-redact's scrubber treats "token" as a
+            // trigger that consumes the rest of the string, so there is no
+            // wording of this message that keeps both the word "token" and
+            // anything after it. Log the token name to the audit target
+            // instead -- an operator who needs to find it in tokens.json
+            // greps the audit log, not the tool response.
+            tracing::warn!(
+                target: "audit",
+                event = "grant_missing_selector",
+                token_name = %ctx.token_name,
+                "token has no 'guests' selector configured; refusing"
+            );
+            Box::new(tool_error(
+                "the caller for this request has no 'guests' selector configured",
+            ))
         }),
     }
 }
@@ -1759,7 +1794,7 @@ fn require_ha_rule_destructive_tier(
     let grant = resolve_grant(caller)?;
     if !grant.allows_action(ProxmoxAction::Destructive) {
         return Err(Box::new(tool_error(
-            "changing an HA rule requires the 'destructive' action tier, which this token \
+            "changing an HA rule requires the 'destructive' action tier, which this caller \
              does not carry",
         )));
     }
@@ -1861,7 +1896,7 @@ impl ProxmoxServer {
     ) -> CallToolResult {
         let caller = Self::caller(context);
         if let Err(error) = authorize_call(caller.as_ref(), tool, Some(cluster), WRITE_TOOLS) {
-            return tool_error(error);
+            return authz_tool_error(error);
         }
 
         if requires_unrestricted_guest_scope {
@@ -1872,8 +1907,8 @@ impl ProxmoxServer {
             if !grant.is_unrestricted_guest_scope() {
                 return tool_error(format!(
                     "{tool} is not scoped to any single guest -- it lists data shared across \
-                     every guest on a storage or a node -- so it requires a token whose guest \
-                     scope is '*'. This token is narrowed to specific guests and cannot be \
+                     every guest on a storage or a node -- so it requires a caller whose guest \
+                     scope is '*'. This caller is narrowed to specific guests and cannot be \
                      checked against it."
                 ));
             }
@@ -2003,6 +2038,7 @@ impl ProxmoxServer {
                 Ok::<_, String>(value),
                 ResultFormat::PrettyJson,
                 RESULT_LIMITS,
+                OutputRedaction::Apply,
             );
         };
 
@@ -2011,6 +2047,7 @@ impl ProxmoxServer {
                 Ok::<_, String>(page),
                 ResultFormat::PrettyJson,
                 RESULT_LIMITS,
+                OutputRedaction::Apply,
             ),
             Err(error) => *error,
         }
@@ -2659,7 +2696,7 @@ impl ProxmoxServer {
 
         let caller = Self::caller(context);
         if let Err(error) = authorize_call(caller.as_ref(), tool, Some(cluster), WRITE_TOOLS) {
-            return Err(Box::new(tool_error(error)));
+            return Err(Box::new(authz_tool_error(error)));
         }
 
         let client = self.client_for(cluster)?;
@@ -2667,7 +2704,7 @@ impl ProxmoxServer {
 
         if !grant.allows_action(ProxmoxAction::Low) {
             return Err(Box::new(tool_error(
-                "creation requires the 'low' action tier, which this token does not carry",
+                "creation requires the 'low' action tier, which this caller does not carry",
             )));
         }
 
@@ -2675,7 +2712,7 @@ impl ProxmoxServer {
         // it, because there is no source guest whose scope could stand in.
         if !grant.allows_new_vmid(vmid) {
             return Err(Box::new(tool_error(format!(
-                "vmid {vmid} is outside this token's guest scope, so it may not be created"
+                "vmid {vmid} is outside this caller's guest scope, so it may not be created"
             ))));
         }
 
@@ -2772,7 +2809,7 @@ impl ProxmoxServer {
         let host_pathed = config_host_paths(config);
         if !host_pathed.is_empty() {
             return Some(tool_error(format!(
-                "config key(s) {} carry an absolute host path. A guest disk is named \
+                "config field(s) {} carry an absolute host path. A guest disk is named \
                  'storage:spec'; a path names the hypervisor's own filesystem, which a 'low' \
                  create must not reach.",
                 host_pathed.join(", ")
@@ -2830,7 +2867,7 @@ impl ProxmoxServer {
         let caller = Self::caller(context);
         if let Err(error) = authorize_call(caller.as_ref(), tool, Some(&args.cluster), WRITE_TOOLS)
         {
-            return Err(Box::new(tool_error(error)));
+            return Err(Box::new(authz_tool_error(error)));
         }
 
         let client = self.client_for(&args.cluster)?;
@@ -2927,7 +2964,7 @@ impl ProxmoxServer {
         let caller = Self::caller(context);
         if let Err(error) = authorize_call(caller.as_ref(), tool, Some(&args.cluster), WRITE_TOOLS)
         {
-            return tool_error(error);
+            return authz_tool_error(error);
         }
 
         let client = match self.client_for(&args.cluster) {
@@ -3057,6 +3094,7 @@ impl ProxmoxServer {
             })),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -3077,7 +3115,7 @@ impl ProxmoxServer {
             Some(&args.cluster),
             WRITE_TOOLS,
         ) {
-            return tool_error(error);
+            return authz_tool_error(error);
         }
 
         let client = match self.client_for(&args.cluster) {
@@ -3127,6 +3165,7 @@ impl ProxmoxServer {
                 Ok::<_, String>(value),
                 ResultFormat::PrettyJson,
                 RESULT_LIMITS,
+                OutputRedaction::Apply,
             ),
             Err(error) => tool_error(error),
         }
@@ -3786,6 +3825,7 @@ impl ProxmoxServer {
             Ok(serde_json::json!({ "upid": upid, "vmid": guest.vmid, "node": guest.node })),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -3873,6 +3913,7 @@ impl ProxmoxServer {
             Ok(serde_json::json!({ "upid": upid, "vmid": guest.vmid, "node": guest.node })),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -3913,7 +3954,7 @@ impl ProxmoxServer {
         };
         if !grant.allows_new_vmid(args.newid) {
             return tool_error(format!(
-                "token scope does not admit vmid {} as a clone destination",
+                "caller scope does not admit vmid {} as a clone destination",
                 args.newid
             ));
         }
@@ -3977,6 +4018,7 @@ impl ProxmoxServer {
             Ok(serde_json::json!({ "upid": upid, "vmid": args.newid, "node": guest.node })),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -4068,6 +4110,7 @@ impl ProxmoxServer {
             })),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -4169,6 +4212,7 @@ impl ProxmoxServer {
             })),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -4215,7 +4259,7 @@ impl ProxmoxServer {
             Some(&args.cluster),
             WRITE_TOOLS,
         ) {
-            return tool_error(error);
+            return authz_tool_error(error);
         }
 
         let client = match self.client_for(&args.cluster) {
@@ -4258,7 +4302,7 @@ impl ProxmoxServer {
                 if !grant.is_unrestricted_guest_scope() {
                     return tool_error(format!(
                         "task '{}' is node-level rather than guest-addressed, so it requires a \
-                         token whose guest scope is '*'. This token is narrowed to specific \
+                         caller whose guest scope is '*'. This caller is narrowed to specific \
                          guests and cannot be checked against it.",
                         args.upid
                     ));
@@ -4339,6 +4383,7 @@ impl ProxmoxServer {
             })),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -4386,7 +4431,7 @@ impl ProxmoxServer {
             Some(&args.cluster),
             WRITE_TOOLS,
         ) {
-            return tool_error(error);
+            return authz_tool_error(error);
         }
 
         let client = match self.client_for(&args.cluster) {
@@ -4409,7 +4454,7 @@ impl ProxmoxServer {
         if !grant.is_unrestricted_guest_scope() {
             return tool_error(
                 "download_iso writes to storage that is not scoped to any guest, so it requires a \
-                 token whose guest scope is '*'. This token is narrowed to specific guests and \
+                 caller whose guest scope is '*'. This caller is narrowed to specific guests and \
                  cannot be checked against a storage.",
             );
         }
@@ -4474,6 +4519,7 @@ impl ProxmoxServer {
             })),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -4568,6 +4614,7 @@ impl ProxmoxServer {
             Ok(serde_json::json!({ "upid": upid, "vmid": guest.vmid, "node": guest.node })),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -4596,7 +4643,7 @@ impl ProxmoxServer {
             Some(&args.cluster),
             WRITE_TOOLS,
         ) {
-            return tool_error(error);
+            return authz_tool_error(error);
         }
 
         let client = match self.client_for(&args.cluster) {
@@ -4782,7 +4829,7 @@ impl ProxmoxServer {
         if let Err(error) =
             authorize_call(caller.as_ref(), op_tool, Some(&args.cluster), WRITE_TOOLS)
         {
-            return tool_error(error);
+            return authz_tool_error(error);
         }
 
         if let Err(error) = require_unrestricted_scope_for_delete_iso(&action.op, &grant) {
@@ -4984,6 +5031,7 @@ impl ProxmoxServer {
             Ok::<_, String>(response),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -5005,7 +5053,7 @@ impl ProxmoxServer {
             Some(&args.cluster),
             WRITE_TOOLS,
         ) {
-            return tool_error(error);
+            return authz_tool_error(error);
         }
 
         let client = match self.client_for(&args.cluster) {
@@ -5083,6 +5131,7 @@ impl ProxmoxServer {
             Ok::<_, String>(response),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -5107,7 +5156,7 @@ impl ProxmoxServer {
             Some(&args.cluster),
             WRITE_TOOLS,
         ) {
-            return tool_error(error);
+            return authz_tool_error(error);
         }
 
         let client = match self.client_for(&args.cluster) {
@@ -5309,6 +5358,7 @@ impl ProxmoxServer {
             Ok::<_, String>(response),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -5346,7 +5396,7 @@ impl ProxmoxServer {
             Some(&args.cluster),
             WRITE_TOOLS,
         ) {
-            return tool_error(error);
+            return authz_tool_error(error);
         }
 
         let client = match self.client_for(&args.cluster) {
@@ -5527,7 +5577,7 @@ impl ProxmoxServer {
         if let Err(error) =
             authorize_call(caller.as_ref(), op_tool, Some(&args.cluster), WRITE_TOOLS)
         {
-            return tool_error(error);
+            return authz_tool_error(error);
         }
 
         if let Err(error) = require_unrestricted_scope_for_delete_iso(&action.op, &grant) {
@@ -5821,6 +5871,7 @@ impl ProxmoxServer {
                 })),
                 ResultFormat::PrettyJson,
                 RESULT_LIMITS,
+                OutputRedaction::Apply,
             );
         }
 
@@ -5915,6 +5966,7 @@ impl ProxmoxServer {
                     Ok::<_, String>(response),
                     ResultFormat::PrettyJson,
                     RESULT_LIMITS,
+                    OutputRedaction::Apply,
                 )
             }
             rust_proxmoxmcp_core::task::TaskOutcome::Failed(message) => {
@@ -5954,7 +6006,7 @@ impl ProxmoxServer {
             Some(&args.cluster),
             WRITE_TOOLS,
         ) {
-            return tool_error(error);
+            return authz_tool_error(error);
         }
 
         let client = match self.client_for(&args.cluster) {
@@ -5976,7 +6028,7 @@ impl ProxmoxServer {
         if let Err(error) =
             authorize_call(caller.as_ref(), op_tool, Some(&args.cluster), WRITE_TOOLS)
         {
-            return tool_error(error);
+            return authz_tool_error(error);
         }
 
         // Refused here, before `fetch_rule`: a token missing the
@@ -6114,6 +6166,7 @@ impl ProxmoxServer {
             Ok::<_, String>(response),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -6135,7 +6188,7 @@ impl ProxmoxServer {
             Some(&args.cluster),
             WRITE_TOOLS,
         ) {
-            return tool_error(error);
+            return authz_tool_error(error);
         }
 
         // The preview below names the rule's guests, which are not filtered
@@ -6149,8 +6202,8 @@ impl ProxmoxServer {
         if !grant.is_unrestricted_guest_scope() {
             return tool_error(
                 "get_ha_rule_change_set is not scoped to any single guest -- its preview names \
-                 the rule's guests -- so it requires a token whose guest scope is '*'. This \
-                 token is narrowed to specific guests and cannot be checked against it."
+                 the rule's guests -- so it requires a caller whose guest scope is '*'. This \
+                 caller is narrowed to specific guests and cannot be checked against it."
                     .to_owned(),
             );
         }
@@ -6180,6 +6233,7 @@ impl ProxmoxServer {
             Ok::<_, String>(response),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -6201,7 +6255,7 @@ impl ProxmoxServer {
             Some(&args.cluster),
             WRITE_TOOLS,
         ) {
-            return tool_error(error);
+            return authz_tool_error(error);
         }
 
         let approver = caller
@@ -6262,6 +6316,7 @@ impl ProxmoxServer {
             Ok::<_, String>(response),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -6289,7 +6344,7 @@ impl ProxmoxServer {
             Some(&args.cluster),
             WRITE_TOOLS,
         ) {
-            return tool_error(error);
+            return authz_tool_error(error);
         }
 
         let client = match self.client_for(&args.cluster) {
@@ -6365,7 +6420,7 @@ impl ProxmoxServer {
         if let Err(error) =
             authorize_call(caller.as_ref(), op_tool, Some(&args.cluster), WRITE_TOOLS)
         {
-            return tool_error(error);
+            return authz_tool_error(error);
         }
 
         let absent = missing_required_ha_fields(&action);
@@ -6516,6 +6571,7 @@ impl ProxmoxServer {
                     Ok(serde_json::json!({ "outcome": "ok" })),
                     ResultFormat::PrettyJson,
                     RESULT_LIMITS,
+                    OutputRedaction::Apply,
                 )
             }
             Err(error) => {
@@ -6577,7 +6633,7 @@ impl ProxmoxServer {
             Some(&args.cluster),
             WRITE_TOOLS,
         ) {
-            return tool_error(error);
+            return authz_tool_error(error);
         }
         // The operation's own tool scope, on top of `plan_restore_new_vmid`.
         // Same reasoning as `tool_for_op`: without this, a token allowlisted
@@ -6589,7 +6645,7 @@ impl ProxmoxServer {
             Some(&args.cluster),
             WRITE_TOOLS,
         ) {
-            return tool_error(error);
+            return authz_tool_error(error);
         }
 
         let client = match self.client_for(&args.cluster) {
@@ -6605,7 +6661,7 @@ impl ProxmoxServer {
         if !grant.allows_action(ProxmoxAction::Destructive) {
             return tool_error(
                 "restoring into a new vmid requires the 'destructive' action tier, which this \
-                 token does not carry",
+                 caller does not carry",
             );
         }
 
@@ -6669,7 +6725,7 @@ impl ProxmoxServer {
         // documents for `create_vm`/`create_container`.
         if !grant.allows_new_vmid(action.target_vmid) {
             return tool_error(format!(
-                "vmid {} is outside this token's guest scope, so a backup may not be restored \
+                "vmid {} is outside this caller's guest scope, so a backup may not be restored \
                  into it",
                 action.target_vmid
             ));
@@ -6787,6 +6843,7 @@ impl ProxmoxServer {
             Ok::<_, String>(response),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -6816,7 +6873,7 @@ impl ProxmoxServer {
             Some(&args.cluster),
             WRITE_TOOLS,
         ) {
-            return tool_error(error);
+            return authz_tool_error(error);
         }
 
         let client = match self.client_for(&args.cluster) {
@@ -6872,7 +6929,7 @@ impl ProxmoxServer {
             Some(&args.cluster),
             WRITE_TOOLS,
         ) {
-            return tool_error(error);
+            return authz_tool_error(error);
         }
 
         let grant = match resolve_grant(caller.as_ref()) {
@@ -6883,13 +6940,13 @@ impl ProxmoxServer {
         if !grant.allows_action(ProxmoxAction::Destructive) {
             return tool_error(
                 "restoring into a new vmid requires the 'destructive' action tier, which this \
-                 token does not carry",
+                 caller does not carry",
             );
         }
 
         if !grant.allows_new_vmid(action.target_vmid) {
             return tool_error(format!(
-                "vmid {} is outside this token's guest scope, so a backup may not be restored \
+                "vmid {} is outside this caller's guest scope, so a backup may not be restored \
                  into it",
                 action.target_vmid
             ));
@@ -7139,6 +7196,7 @@ impl ProxmoxServer {
                 })),
                 ResultFormat::PrettyJson,
                 RESULT_LIMITS,
+                OutputRedaction::Apply,
             );
         }
 
@@ -7205,6 +7263,7 @@ impl ProxmoxServer {
                     Ok::<_, String>(response),
                     ResultFormat::PrettyJson,
                     RESULT_LIMITS,
+                    OutputRedaction::Apply,
                 )
             }
             rust_proxmoxmcp_core::task::TaskOutcome::Failed(message) => {
@@ -7455,16 +7514,24 @@ mod tests {
             "grantless authenticated token must be refused, not granted wildcard access"
         );
 
-        // The error must name the token so the operator can find it in tokens.json.
+        // mecmcp v0.25.0's `tool_error` redacts unconditionally (MEC-1020),
+        // with no opt-out, and mecmcp-redact's scrubber treats "token" (and
+        // "credential") as a trigger that consumes the rest of the string --
+        // so `resolve_grant`'s message avoids that word entirely ("caller",
+        // not "token") rather than ship a half-redacted response. The token
+        // name was never meant to reach the model either way; it only
+        // reaches the audit log (`resolve_grant`'s `tracing::warn!`), not
+        // the tool response.
         let error_result = result.expect_err("already checked is_err");
         let error_text = format!("{error_result:?}");
         assert!(
-            error_text.contains("test-grantless-token"),
-            "error message must name the token: {error_text}"
+            !error_text.contains("test-grantless-token"),
+            "the token name must not reach the model: {error_text}"
         );
         assert!(
-            error_text.contains("guests"),
-            "error message must mention 'guests' selector: {error_text}"
+            !error_text.contains("REDACTED"),
+            "this message carries no secret, so rewording around the denylisted word \
+             should have kept it from being redacted: {error_text}"
         );
     }
 

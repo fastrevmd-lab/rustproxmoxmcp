@@ -14,7 +14,7 @@ pub use rust_proxmoxmcp_core::testing::Route;
 
 use mecmcp_auth::{KnownNames, ScopeSet, TokenStoreFile};
 use mecmcp_transport::LimitsConfig;
-use mecmcp_transport::test_harness::serve_on_loopback;
+use mecmcp_transport::test_harness::{ServedPlan, serve_on_loopback};
 use rust_proxmoxmcp::http_transport::build_http_router;
 use rust_proxmoxmcp::server::ProxmoxServer;
 use rust_proxmoxmcp_core::testing::TlsMockServer;
@@ -85,6 +85,12 @@ pub struct TestServer {
     /// The server's change-set coordinator, for tests that need to build a
     /// store state the tool surface cannot produce.
     coordinator: Arc<mecmcp_changeset::ChangesetCoordinator>,
+    /// Cancelled by [`Self::shutdown`] to stop the background serve task.
+    shutdown: tokio_util::sync::CancellationToken,
+    /// The background serve task, plus where it's bound. Held so
+    /// [`Self::shutdown`] can await the task exiting before a caller reuses
+    /// the same state path.
+    served: ServedPlan,
 }
 
 impl TestServer {
@@ -508,12 +514,65 @@ impl TestServer {
             index,
             _temp_dir: temp_dir,
             coordinator,
+            shutdown,
+            served,
         }
     }
 
     /// The server's change-set coordinator.
     pub fn coordinator(&self) -> &Arc<mecmcp_changeset::ChangesetCoordinator> {
         &self.coordinator
+    }
+
+    /// Stop the background serve task and wait for the coordinator's
+    /// process-lifetime lock on its state path to release, so a caller can
+    /// start a second server against the same `state_path`.
+    ///
+    /// mecmcp 0.25.0's `ChangesetCoordinator` holds an exclusive lock on the
+    /// state file for as long as it is alive (`_owner_lock` in
+    /// `mecmcp_changeset::coordinator`), which only drops once every
+    /// `Arc` clone of the coordinator does. Cancelling `shutdown` and
+    /// awaiting the serve task drops the router's own clone, but each MCP
+    /// session a test opened (`call`/`call_with_token`) holds a separate
+    /// clone that is *not* dropped by cancellation or by the client
+    /// disconnecting -- mecmcp-transport's streamable-HTTP sessions are
+    /// designed to outlive the connection that created them, and
+    /// `cancellation_token` in `streamable_http_server_config` only cuts the
+    /// SSE stream a session opened, not a session created solely to answer
+    /// one `tools/call` POST. The only thing that drops that clone is
+    /// mecmcp-transport's own idle-timeout reaper, which sweeps on a fixed,
+    /// non-configurable 30-second period and only reaps a session once it
+    /// has been idle past `session_idle_timeout_secs`.
+    ///
+    /// A caller that needs this to converge within the test's lifetime must
+    /// build the server with a short `session_idle_timeout_secs` (see
+    /// [`Self::start_with_limits`]) -- the production default (300s) would
+    /// need the better part of five minutes. Even with a 1-second idle
+    /// timeout, the first reap cannot happen before the reaper's first
+    /// 30-second tick, so this is slow by construction, not by a bug here.
+    ///
+    /// # Panics
+    ///
+    /// Panics if other references to the coordinator remain 40 seconds after
+    /// shutdown (one reaper period plus margin), since that means either the
+    /// idle timeout was left at the production default or something new is
+    /// holding a long-lived clone of the coordinator.
+    pub async fn shutdown(self) {
+        self.shutdown.cancel();
+        let _ = self.served.serving.await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+        while Arc::strong_count(&self.coordinator) > 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "coordinator still has {} references 40s after shutdown; build the server \
+                 with a short session_idle_timeout_secs (see start_with_limits) so \
+                 mecmcp-transport's 30-second session reaper can release its session's \
+                 clone within this deadline",
+                Arc::strong_count(&self.coordinator)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     /// Drop the stored preview from a change set, reproducing the state a
@@ -753,6 +812,46 @@ pub async fn handler_with_guest_on_state(
         Arc::new(rust_proxmoxmcp_core::waiver::WaiverFile::empty()),
         false,
         state_path,
+    )
+    .await
+}
+
+/// As [`handler_with_guest_on_state`], with the request limits also
+/// caller-supplied instead of hardcoded to [`LimitsConfig::default`].
+///
+/// For a test that calls [`TestServer::shutdown`] on the returned server and
+/// needs the session reaper to actually run within the test's lifetime: see
+/// [`TestServer::shutdown`] for why a short `session_idle_timeout_secs` is
+/// required for that to converge at all.
+pub async fn handler_with_guest_on_state_and_limits(
+    _vmid: u32,
+    protected: bool,
+    state_path: Option<std::path::PathBuf>,
+    limits: LimitsConfig,
+) -> TestServer {
+    let spec = TokenSpec {
+        clusters: vec!["pve3".to_owned()],
+        tools: vec![
+            "plan_proxmox_destroy".to_owned(),
+            "get_proxmox_change_set".to_owned(),
+            "approve_proxmox_change_set".to_owned(),
+            "apply_proxmox_change_set".to_owned(),
+            "delete_vm".to_owned(),
+            "delete_container".to_owned(),
+            "migrate_container".to_owned(),
+        ],
+        guests: vec!["*".to_owned()],
+    };
+
+    let routes = default_guest_routes(_vmid, protected);
+
+    TestServer::start_with_config_on_state_and_limits(
+        spec,
+        routes,
+        Arc::new(rust_proxmoxmcp_core::waiver::WaiverFile::empty()),
+        false,
+        state_path,
+        limits,
     )
     .await
 }

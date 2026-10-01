@@ -231,7 +231,7 @@ impl GuestIndex {
 
         if !mecmcp_auth::Grant::allows_action(grant, tier.action()) {
             return Err(ProxmoxError::Denied(format!(
-                "token grant does not carry the {tier:?} action tier"
+                "caller grant does not carry the {tier:?} action tier"
             )));
         }
 

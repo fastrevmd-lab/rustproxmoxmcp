@@ -536,7 +536,23 @@ async fn a_change_set_without_a_stored_preview_cannot_be_applied() {
     let state_path = dir.path().join("changesets.json");
 
     let id = {
-        let h = common::handler_with_guest_on_state(617, false, Some(state_path.clone())).await;
+        // A second server starts on this same `state_path` below, and
+        // mecmcp 0.25.0's coordinator holds an exclusive lock on the state
+        // file for as long as it's alive. A short session_idle_timeout_secs
+        // lets `h.shutdown()` converge within mecmcp-transport's 30-second
+        // session reaper period instead of the production default (300s);
+        // see `TestServer::shutdown` for why the reaper, not cancellation,
+        // is what actually releases the lock.
+        let h = common::handler_with_guest_on_state_and_limits(
+            617,
+            false,
+            Some(state_path.clone()),
+            mecmcp_transport::LimitsConfig {
+                session_idle_timeout_secs: 1,
+                ..mecmcp_transport::LimitsConfig::default()
+            },
+        )
+        .await;
         let planned = common::call(
             &h,
             "plan_proxmox_destroy",
@@ -546,6 +562,11 @@ async fn a_change_set_without_a_stored_preview_cannot_be_applied() {
         .expect("plan");
         let id = planned["change_set_id"].as_str().expect("id").to_owned();
         common::approve_as_second_principal(&h, &id).await;
+        // The coordinator holds an exclusive lock on `state_path` for as
+        // long as it's alive; shut this server down before starting a
+        // second one on the same path below, or that build hangs waiting
+        // for a lock this one never released.
+        h.shutdown().await;
         id
     };
 
