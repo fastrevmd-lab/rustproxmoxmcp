@@ -540,6 +540,9 @@ fn init_audit(args: &mecmcp_runtime::cli::Cli) -> Result<Option<mecmcp_audit::Au
         audit_log_file: args.audit_log_file.clone(),
         redaction,
         journald: args.audit_journald,
+        // This server does not wire up an --otel-endpoint flag; OTel export
+        // stays off until it does.
+        otel: None,
     })
     .context("initializing audit tracing")?;
     mecmcp_audit::install_duration_metric_name("rust_proxmoxmcp_tool_duration_seconds");

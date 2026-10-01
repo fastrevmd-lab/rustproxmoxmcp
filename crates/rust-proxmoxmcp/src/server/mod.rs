@@ -6,8 +6,8 @@ mod restore_change_set;
 
 use mecmcp_auth::{CallerCtx, ScopeSet};
 use mecmcp_server::{
-    ResultFormat, ResultLimits, authorize_call, caller_from_extensions, filter_tools_for_scope,
-    tool_error, tool_result,
+    OutputRedaction, ResultFormat, ResultLimits, authorize_call, caller_from_extensions,
+    filter_tools_for_scope, tool_error, tool_result,
 };
 use rmcp::{
     RoleServer, ServerHandler,
@@ -1618,10 +1618,22 @@ fn resolve_grant(
     match caller {
         None => Ok(rust_proxmoxmcp_core::ProxmoxGrant::read_only()),
         Some(ctx) => ctx.grant.clone().ok_or_else(|| {
-            Box::new(tool_error(format!(
-                "token '{}' carries no 'guests' selector; add one to tokens.json",
-                ctx.token_name
-            )))
+            // `tool_error` redacts unconditionally as of mecmcp v0.25.0
+            // (MEC-1020) and mecmcp-redact's scrubber treats "token" as a
+            // trigger that consumes the rest of the string, so there is no
+            // wording of this message that keeps both the word "token" and
+            // anything after it. Log the token name to the audit target
+            // instead -- an operator who needs to find it in tokens.json
+            // greps the audit log, not the tool response.
+            tracing::warn!(
+                target: "audit",
+                event = "grant_missing_selector",
+                token_name = %ctx.token_name,
+                "token has no 'guests' selector configured; refusing"
+            );
+            Box::new(tool_error(
+                "the token used for this request has no 'guests' selector configured",
+            ))
         }),
     }
 }
@@ -1890,6 +1902,7 @@ impl ProxmoxServer {
                 Ok::<_, String>(value),
                 ResultFormat::PrettyJson,
                 RESULT_LIMITS,
+                OutputRedaction::Apply,
             );
         };
 
@@ -1898,6 +1911,7 @@ impl ProxmoxServer {
                 Ok::<_, String>(page),
                 ResultFormat::PrettyJson,
                 RESULT_LIMITS,
+                OutputRedaction::Apply,
             ),
             Err(error) => *error,
         }
@@ -2756,6 +2770,7 @@ impl ProxmoxServer {
             })),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -2826,6 +2841,7 @@ impl ProxmoxServer {
                 Ok::<_, String>(value),
                 ResultFormat::PrettyJson,
                 RESULT_LIMITS,
+                OutputRedaction::Apply,
             ),
             Err(error) => tool_error(error),
         }
@@ -3485,6 +3501,7 @@ impl ProxmoxServer {
             Ok(serde_json::json!({ "upid": upid, "vmid": guest.vmid, "node": guest.node })),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -3572,6 +3589,7 @@ impl ProxmoxServer {
             Ok(serde_json::json!({ "upid": upid, "vmid": guest.vmid, "node": guest.node })),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -3676,6 +3694,7 @@ impl ProxmoxServer {
             Ok(serde_json::json!({ "upid": upid, "vmid": args.newid, "node": guest.node })),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -3767,6 +3786,7 @@ impl ProxmoxServer {
             })),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -3868,6 +3888,7 @@ impl ProxmoxServer {
             })),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -4038,6 +4059,7 @@ impl ProxmoxServer {
             })),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -4173,6 +4195,7 @@ impl ProxmoxServer {
             })),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -4267,6 +4290,7 @@ impl ProxmoxServer {
             Ok(serde_json::json!({ "upid": upid, "vmid": guest.vmid, "node": guest.node })),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -4650,6 +4674,7 @@ impl ProxmoxServer {
             Ok::<_, String>(response),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -4700,6 +4725,7 @@ impl ProxmoxServer {
             Ok::<_, String>(response),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -4793,6 +4819,7 @@ impl ProxmoxServer {
             Ok::<_, String>(response),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -5286,6 +5313,7 @@ impl ProxmoxServer {
                 })),
                 ResultFormat::PrettyJson,
                 RESULT_LIMITS,
+                OutputRedaction::Apply,
             );
         }
 
@@ -5380,6 +5408,7 @@ impl ProxmoxServer {
                     Ok::<_, String>(response),
                     ResultFormat::PrettyJson,
                     RESULT_LIMITS,
+                    OutputRedaction::Apply,
                 )
             }
             rust_proxmoxmcp_core::task::TaskOutcome::Failed(message) => {
@@ -5579,6 +5608,7 @@ impl ProxmoxServer {
             Ok::<_, String>(response),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -5645,6 +5675,7 @@ impl ProxmoxServer {
             Ok::<_, String>(response),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -5727,6 +5758,7 @@ impl ProxmoxServer {
             Ok::<_, String>(response),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -5981,6 +6013,7 @@ impl ProxmoxServer {
                     Ok(serde_json::json!({ "outcome": "ok" })),
                     ResultFormat::PrettyJson,
                     RESULT_LIMITS,
+                    OutputRedaction::Apply,
                 )
             }
             Err(error) => {
@@ -6203,6 +6236,7 @@ impl ProxmoxServer {
             Ok::<_, String>(response),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -6512,6 +6546,7 @@ impl ProxmoxServer {
                 })),
                 ResultFormat::PrettyJson,
                 RESULT_LIMITS,
+                OutputRedaction::Apply,
             );
         }
 
@@ -6578,6 +6613,7 @@ impl ProxmoxServer {
                     Ok::<_, String>(response),
                     ResultFormat::PrettyJson,
                     RESULT_LIMITS,
+                    OutputRedaction::Apply,
                 )
             }
             rust_proxmoxmcp_core::task::TaskOutcome::Failed(message) => {
@@ -6828,16 +6864,24 @@ mod tests {
             "grantless authenticated token must be refused, not granted wildcard access"
         );
 
-        // The error must name the token so the operator can find it in tokens.json.
+        // mecmcp v0.25.0's `tool_error` redacts unconditionally (MEC-1020),
+        // with no opt-out, and mecmcp-redact's scrubber treats "token" (and
+        // "credential") as a trigger that consumes the rest of the string --
+        // there is no wording of this message that keeps both the word
+        // "token" and anything after it. The token name used to be the one
+        // thing the operator needed from this error; it now only reaches
+        // the audit log (`resolve_grant`'s `tracing::warn!`), not the tool
+        // response, so this test checks redaction happened rather than that
+        // the name survived.
         let error_result = result.expect_err("already checked is_err");
         let error_text = format!("{error_result:?}");
         assert!(
-            error_text.contains("test-grantless-token"),
-            "error message must name the token: {error_text}"
+            !error_text.contains("test-grantless-token"),
+            "the token name must not reach the model: {error_text}"
         );
         assert!(
-            error_text.contains("guests"),
-            "error message must mention 'guests' selector: {error_text}"
+            error_text.contains("REDACTED"),
+            "mecmcp-redact must have redacted the token-adjacent text: {error_text}"
         );
     }
 

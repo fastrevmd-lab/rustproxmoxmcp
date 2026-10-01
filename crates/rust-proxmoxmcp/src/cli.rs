@@ -172,6 +172,10 @@ impl LimitsArgs {
             max_sessions_per_token: self.max_sessions_per_token,
             session_idle_timeout_secs: self.session_idle_timeout_secs,
             session_max_lifetime_secs: self.session_max_lifetime_secs,
+            // No CLI flag wires this up yet, so no proxy is trusted and
+            // per-IP rate limiting keys on the peer address, same as before
+            // this field existed.
+            trusted_proxies: Vec::new(),
         }
     }
 }
