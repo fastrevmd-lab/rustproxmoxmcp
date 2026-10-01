@@ -55,9 +55,23 @@ USER 65532:65532
 # relevant. CMD carries only what an operator is expected to replace: bind
 # address, port, and mode flags. Docker replaces CMD when the caller supplies
 # arguments, so security-relevant defaults must stay in ENTRYPOINT.
+#
+# --audit-hmac-key-file: this image is distroless with no shell, so a
+# shell-script key-generation wrapper (as LXC's install.sh uses) can never
+# run here. Instead the binary itself generates
+# /var/lib/proxmoxmcp/audit-hmac.key on first run if it is absent (see
+# ensure_audit_hmac_key in src/main.rs) -- the container-image equivalent of
+# install.sh's own key-generation step, closing the "5 of 6 server images
+# run unkeyed audit" gap (mecmcp#376 / MEC-978). The path is under the
+# writable /var/lib/proxmoxmcp volume, not /etc/proxmoxmcp, which is mounted
+# read-only in every documented `docker run` example. --audit-redact still
+# defaults to empty (redaction itself stays opt-in), so this alone does not
+# change what is logged -- it only means the key is already there the
+# moment an operator turns redaction on.
 ENTRYPOINT ["/usr/local/bin/rust-proxmoxmcp", \
     "--clusters-file", "/etc/proxmoxmcp/clusters.json", \
-    "--tokens-file", "/var/lib/proxmoxmcp/tokens.json"]
+    "--tokens-file", "/var/lib/proxmoxmcp/tokens.json", \
+    "--audit-hmac-key-file", "/var/lib/proxmoxmcp/audit-hmac.key"]
 CMD ["--transport", "streamable-http", \
     "--host", "127.0.0.1", \
     "--port", "30031"]

@@ -523,7 +523,61 @@ fn init_token_audit() {
         .try_init();
 }
 
+/// Pre-provision the audit HMAC key file at `path` if it is absent or empty,
+/// mirroring `packaging/lxc/install.sh`'s own key-generation step so every
+/// entry point -- LXC install, systemd start, or a container's first run --
+/// converges on the same keyed-audit posture instead of only the LXC path
+/// doing it (mecmcp#376 / MEC-978). `--audit-redact` still defaults to empty
+/// (redaction stays opt-in), so this alone does not turn redaction on; it
+/// just means the key is already there the moment an operator flips
+/// `--audit-redact ...=hmac` on, instead of failing on that first restart.
+///
+/// A zero-byte key file is indistinguishable from "never generated" and
+/// would make every HMAC output constant, so rewriting it here is a repair,
+/// not data loss. A non-empty file is never rotated -- that would silently
+/// break verification of every audit record signed under the old key.
+fn ensure_audit_hmac_key(path: &std::path::Path) -> Result<()> {
+    if std::fs::metadata(path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    let mut key = [0u8; 32];
+    getrandom::fill(&mut key).map_err(|e| {
+        anyhow::anyhow!("generating audit HMAC key: OS entropy source unavailable: {e}")
+    })?;
+    let hex_key: String = key.iter().map(|b| format!("{b:02x}")).collect();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("creating audit HMAC key file {}", path.display()))?;
+        use std::io::Write as _;
+        file.write_all(hex_key.as_bytes())
+            .with_context(|| format!("writing audit HMAC key file {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, &hex_key)
+            .with_context(|| format!("writing audit HMAC key file {}", path.display()))?;
+    }
+
+    Ok(())
+}
+
 fn init_audit(args: &mecmcp_runtime::cli::Cli) -> Result<Option<mecmcp_audit::AuditFileSink>> {
+    if let Some(key_path) = args.audit_hmac_key_file.as_deref() {
+        ensure_audit_hmac_key(key_path).context("pre-provisioning audit HMAC key file")?;
+    }
+
     let redaction = if args.audit_redact.trim().is_empty() {
         None
     } else {

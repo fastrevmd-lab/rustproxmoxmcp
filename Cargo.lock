@@ -2252,6 +2252,7 @@ dependencies = [
  "axum",
  "axum-server",
  "clap",
+ "getrandom 0.4.3",
  "http",
  "mecmcp-audit",
  "mecmcp-auth",
