@@ -410,7 +410,11 @@ impl TestServer {
             None,
             None,
             None,
-            None,
+            // Human, not the default: tests that approve a change set with
+            // this token must be refused for the guest-scope mismatch this
+            // token exists to prove, not for an unrelated non-human actor
+            // type that would mask it.
+            Some(mecmcp_auth::ActorType::Human),
             &known,
         )
         .expect("mint narrow-scoped token");
@@ -431,7 +435,8 @@ impl TestServer {
             None,
             None,
             None,
-            None,
+            // Human, for the same reason as `narrow_token` above.
+            Some(mecmcp_auth::ActorType::Human),
             &known,
         )
         .expect("mint low-tier token");

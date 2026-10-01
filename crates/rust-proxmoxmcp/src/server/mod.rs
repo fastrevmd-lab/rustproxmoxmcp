@@ -4801,7 +4801,7 @@ impl ProxmoxServer {
         Parameters(args): Parameters<change_set::ChangeSetArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        use change_set::ChangeSetResponse;
+        use change_set::{ChangeSetResponse, DestroyAction};
 
         let caller = Self::caller(&context);
         if let Err(error) = authorize_call(
@@ -4813,6 +4813,16 @@ impl ProxmoxServer {
             return tool_error(error);
         }
 
+        let client = match self.client_for(&args.cluster) {
+            Ok(client) => client,
+            Err(result) => return *result,
+        };
+
+        let grant = match resolve_grant(caller.as_ref()) {
+            Ok(grant) => grant,
+            Err(error) => return *error,
+        };
+
         let coordinator = self.coordinator.clone();
 
         let device = format!("{}/{}", args.cluster, args.vmid);
@@ -4820,6 +4830,45 @@ impl ProxmoxServer {
             Ok(record) => record,
             Err(error) => return tool_error(format!("get: {error}")),
         };
+
+        // This tool name and the cluster scope checked above say nothing
+        // about which guest the caller may read. A token scoped to one guest
+        // could otherwise read any other change set's preview on the same
+        // cluster, which leaks the guest's name, node and (for
+        // `update_vm_config`) cloud-init values like `sshkeys` and
+        // `ipconfigN`. Same two action shapes as `approve_change_set`: an
+        // existing guest to resolve and scope-check, or a not-yet-existing
+        // restore target that only the grant's new-vmid scope can speak to.
+        if let Some(raw_action) = record.actions.first() {
+            if let Ok(_action) = serde_json::from_value::<DestroyAction>(raw_action.clone()) {
+                if let Err(error) = self
+                    .index
+                    .authorize(client, &args.cluster, args.vmid, &grant, Intent::read())
+                    .await
+                {
+                    return tool_error(error);
+                }
+            } else {
+                use restore_change_set::RestoreNewVmidAction;
+
+                let action: RestoreNewVmidAction = match serde_json::from_value(raw_action.clone())
+                {
+                    Ok(action) => action,
+                    Err(error) => {
+                        return tool_error(format!(
+                            "the change set's action could not be read ({error}); it cannot be \
+                             read back"
+                        ));
+                    }
+                };
+                if !grant.allows_new_vmid(action.target_vmid) {
+                    return tool_error(format!(
+                        "vmid {} is outside this token's guest scope",
+                        action.target_vmid
+                    ));
+                }
+            }
+        }
 
         let preview_text = record
             .preview
@@ -4851,7 +4900,8 @@ impl ProxmoxServer {
         Parameters(args): Parameters<change_set::ChangeSetArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        use change_set::ChangeSetResponse;
+        use change_set::{ChangeSetResponse, DestroyAction};
+        use rust_proxmoxmcp_core::protect::{Override, destructive_allowed, protection_of};
 
         let caller = Self::caller(&context);
         if let Err(error) = authorize_call(
@@ -4862,6 +4912,16 @@ impl ProxmoxServer {
         ) {
             return tool_error(error);
         }
+
+        let client = match self.client_for(&args.cluster) {
+            Ok(client) => client,
+            Err(result) => return *result,
+        };
+
+        let grant = match resolve_grant(caller.as_ref()) {
+            Ok(grant) => grant,
+            Err(error) => return *error,
+        };
 
         let approver = caller
             .as_ref()
@@ -4894,6 +4954,118 @@ impl ProxmoxServer {
                  nothing to review. Plan the operation again.",
             );
         };
+
+        // The approver must hold the same authority the executor needs, not
+        // just the generic approve-tool and cluster scope checked above.
+        // Without this, a token scoped to one guest with only `read` could
+        // approve a `destroy_guest` change set against any other guest in the
+        // cluster -- `approve_change_set` never looked at the approver's own
+        // grant, only at whether they held the `approve_proxmox_change_set`
+        // tool name. This mirrors the re-check `apply_change_set` and
+        // `apply_restore_new_vmid` run, so approve and apply hold the
+        // approver and the executor to the same standard.
+        //
+        // Two action shapes share this tool: `DestroyAction` (plan_destroy --
+        // an existing in-scope guest to resolve and protect) and
+        // `RestoreNewVmidAction` (plan_restore_new_vmid -- a target vmid that
+        // does not exist yet, so there is no guest to resolve or protect).
+        // Try the former first; its required `op`/`vmid` fields are absent
+        // from the latter's JSON, so a mismatched shape fails to deserialize
+        // and falls through.
+        let Some(raw_action) = record.actions.first() else {
+            return tool_error("the change set records no action".to_owned());
+        };
+        if let Ok(action) = serde_json::from_value::<DestroyAction>(raw_action.clone()) {
+            let (resolved, resolution_failed) =
+                match self.index.resolve(client, &args.cluster, args.vmid).await {
+                    Ok(guest) => (Some(guest), false),
+                    Err(_) => (None, true),
+                };
+            let protection = protection_of(client.cluster(), resolved.as_ref(), resolution_failed);
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_secs();
+            let override_ = destructive_allowed(
+                &protection,
+                &self.waivers,
+                &args.cluster,
+                args.vmid,
+                now_unix,
+                self.lab_mode,
+            );
+            let override_applies = !matches!(override_, Override::None);
+
+            let authorized = match self
+                .index
+                .authorize(
+                    client,
+                    &args.cluster,
+                    args.vmid,
+                    &grant,
+                    Intent::destructive(override_applies),
+                )
+                .await
+            {
+                Ok(authorized) => authorized,
+                Err(error) => return tool_error(error),
+            };
+            let guest = authorized.guest();
+
+            let Some(op_tool) = tool_for_op(&action.op, guest.r#type) else {
+                return tool_error(format!(
+                    "the change set names an unknown operation '{}'",
+                    action.op
+                ));
+            };
+            if let Err(error) =
+                authorize_call(caller.as_ref(), op_tool, Some(&args.cluster), WRITE_TOOLS)
+            {
+                return tool_error(error);
+            }
+        } else {
+            use restore_change_set::RestoreNewVmidAction;
+            use rust_proxmoxmcp_core::grant::ProxmoxAction;
+            use rust_proxmoxmcp_core::protect::creation_allowed;
+
+            let action: RestoreNewVmidAction = match serde_json::from_value(raw_action.clone()) {
+                Ok(action) => action,
+                Err(error) => {
+                    return tool_error(format!(
+                        "the change set's action could not be read ({error}); \
+                         it cannot be approved"
+                    ));
+                }
+            };
+
+            if let Err(error) = authorize_call(
+                caller.as_ref(),
+                "restore_backup_new_vmid",
+                Some(&args.cluster),
+                WRITE_TOOLS,
+            ) {
+                return tool_error(error);
+            }
+            if !grant.allows_action(ProxmoxAction::Destructive) {
+                return tool_error(
+                    "restoring into a new vmid requires the 'destructive' action tier, which \
+                     this token does not carry",
+                );
+            }
+            if !grant.allows_new_vmid(action.target_vmid) {
+                return tool_error(format!(
+                    "vmid {} is outside this token's guest scope, so a backup may not be \
+                     restored into it",
+                    action.target_vmid
+                ));
+            }
+            if !creation_allowed(client.cluster(), action.target_vmid) {
+                return tool_error(format!(
+                    "vmid {} is a protected pin on cluster {} and must not receive a restore",
+                    action.target_vmid, args.cluster
+                ));
+            }
+        }
 
         let output = match coordinator
             .approve_change_set(

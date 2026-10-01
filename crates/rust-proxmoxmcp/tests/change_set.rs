@@ -1218,3 +1218,107 @@ async fn an_agent_actor_type_approver_is_refused() {
         "{apply_err}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approve_refuses_an_approver_whose_guest_scope_excludes_the_change_set() {
+    // F2: `approve_change_set` used to authorize only the generic
+    // `approve_proxmox_change_set` tool name against the cluster -- never the
+    // approver's own guest scope. A token scoped to vmid 1 only, but holding
+    // every tool and cluster scope `token` does, could approve a destroy of
+    // guest 617. `narrow_token` is exactly that token.
+    let h = common::handler_with_guest(617, false).await;
+    let planned = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect("plan");
+    let id = planned["change_set_id"].as_str().expect("id");
+
+    let err = common::call_with_token(
+        &h,
+        &h.narrow_token,
+        "approve_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect_err("an approver scoped to a different guest must be refused");
+    assert!(
+        err.to_string().to_lowercase().contains("scope"),
+        "the refusal must name the guest-scope mismatch: {err}"
+    );
+
+    // The change set must still be unapproved: apply must refuse it too.
+    let apply_err = common::call(
+        &h,
+        "apply_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect_err("apply must still refuse after a refused approval attempt");
+    assert!(
+        apply_err.to_string().to_lowercase().contains("approv"),
+        "{apply_err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approve_refuses_an_approver_without_the_destructive_tier() {
+    // F2, same gap: a token that carries every guest and tool scope `token`
+    // does, but was minted without the `destructive` action tier, could
+    // still approve a destroy change set -- only the planner's tier had ever
+    // been checked.
+    let h = common::handler_with_guest(617, false).await;
+    let planned = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect("plan");
+    let id = planned["change_set_id"].as_str().expect("id");
+
+    let err = common::call_with_token(
+        &h,
+        &h.low_tier_token,
+        "approve_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect_err("an approver without the destructive tier must be refused");
+    assert!(
+        err.to_string().to_lowercase().contains("destructive"),
+        "the refusal must name the missing destructive tier: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_change_set_refuses_a_caller_whose_guest_scope_excludes_it() {
+    // Sibling gap to F2: `get_proxmox_change_set` authorized only the tool
+    // name and cluster, so a token scoped to a different guest could read
+    // back another guest's change-set preview -- including the guest name,
+    // node, and for `update_vm_config`, cloud-init values like `sshkeys`.
+    let h = common::handler_with_guest(617, false).await;
+    let planned = common::call(
+        &h,
+        "plan_proxmox_destroy",
+        json!({"cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect("plan");
+    let id = planned["change_set_id"].as_str().expect("id");
+
+    let err = common::call_with_token(
+        &h,
+        &h.narrow_token,
+        "get_proxmox_change_set",
+        json!({"change_set_id": id, "cluster": "pve3", "vmid": 617}),
+    )
+    .await
+    .expect_err("a reader scoped to a different guest must be refused");
+    assert!(
+        err.to_string().to_lowercase().contains("scope"),
+        "the refusal must name the guest-scope mismatch: {err}"
+    );
+}
