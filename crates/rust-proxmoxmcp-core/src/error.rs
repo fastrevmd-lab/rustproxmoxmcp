@@ -97,12 +97,23 @@ impl ProxmoxError {
 }
 
 /// Render a peer-supplied body into bounded, inert detail.
+///
+/// The `errors` map is run through `mecmcp_redact::redact_json_value` before
+/// formatting, so a secret echoed back under a denylisted field name (for
+/// example a parameter-validation failure on a password-shaped field) comes
+/// out as `[REDACTED]` rather than verbatim. The formatted result is then
+/// run through `redact_text` too, since a secret can be shape-matched (an
+/// API token, a PEM block) rather than sitting under a denylisted key. This
+/// detail is both the text an MCP caller sees and the text logged, so it has
+/// to be safe for both.
 fn extract_detail(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
     let detail = serde_json::from_str::<serde_json::Value>(&text)
         .ok()
-        .and_then(|value| {
-            let errors = value.get("errors")?.as_object()?;
+        .and_then(|mut value| {
+            let errors = value.get_mut("errors")?;
+            mecmcp_redact::redact_json_value(errors);
+            let errors = errors.as_object()?;
             let mut parts: Vec<String> = errors
                 .iter()
                 .map(|(field, reason)| match reason.as_str() {
@@ -115,7 +126,7 @@ fn extract_detail(body: &[u8]) -> String {
         })
         .unwrap_or_else(|| text.into_owned());
 
-    sanitise(&detail)
+    sanitise(&mecmcp_redact::redact_text(&detail))
 }
 
 /// Truncate on a character boundary and drop control characters.
@@ -154,6 +165,25 @@ mod tests {
         let error = ProxmoxError::from_response(401, b"authentication failure: token 'secret'");
         assert!(matches!(error, ProxmoxError::Unauthorized));
         assert!(!error.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn redacts_secrets_in_the_errors_map_before_rendering() {
+        let body = br#"{"data":null,"errors":{
+            "password":"FAKE-cluster-password-7d6c5b4a",
+            "detail":"backup admin password: FAKE-free-text-9f8e7d6c"
+        }}"#;
+        let error = ProxmoxError::from_response(400, body);
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains("FAKE-cluster-password-7d6c5b4a"),
+            "denylisted-key secret survived: {rendered}"
+        );
+        assert!(
+            !rendered.contains("FAKE-free-text-9f8e7d6c"),
+            "shape-matched secret in free text survived: {rendered}"
+        );
+        assert!(rendered.contains("detail"), "field name should survive");
     }
 
     #[test]

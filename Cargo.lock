@@ -2288,6 +2288,7 @@ dependencies = [
  "mecmcp-inventory",
  "mecmcp-job",
  "mecmcp-openapi",
+ "mecmcp-redact",
  "mecmcp-secret",
  "rcgen",
  "rustls",
