@@ -24,6 +24,50 @@ use rust_proxmoxmcp_core::testing::Route;
 /// denylist, the same way an operator's pasted note looks in practice.
 const FAKE_SECRET: &str = "FAKE-api-token-9f8e7d6c5b4a3210";
 
+/// A second secret, opaque (no recognizable shape), placed under a
+/// denylisted key name (`authkey`) that is *not* one of the five curated
+/// free-text keys `redact_free_text_fields` scans. This proves the
+/// mecmcp-redact key-denylist pass -- which runs over the *whole* response
+/// via `mecmcp_server::tool_result`'s `OutputRedaction::Apply`, not just
+/// this server's curated free-text fields -- actually reaches a field this
+/// server never specifically wrote code for.
+const DENYLISTED_KEY_SECRET: &str = "FAKE-authkey-outside-freetext-allowlist";
+
+/// A third secret, shaped as a Juniper/glibc crypt hash (`$<id>$<content>`),
+/// placed under an ordinary key name (`fingerprint`) that is on neither the
+/// free-text allowlist nor mecmcp-redact's key denylist. Proves the
+/// value-shape catch-all catches a secret by its *shape* alone, independent
+/// of what key it happens to be filed under.
+const SHAPE_SECRET: &str = "$9$not-a-real-secret-cryptHash12345";
+
+/// A fourth secret, under Proxmox's own `cipassword` cloud-init key. Proxmox
+/// forbids *writing* this in plaintext (see `update_vm_config.rs`'s
+/// `cipassword_is_refused_at_plan_time`), but a guest config a device
+/// already has on disk can still echo it back on a read, so this proves the
+/// read path redacts it the same as any other denylisted key.
+const CIPASSWORD_SECRET: &str = "FAKE-cipassword-ebe8e0b6c6e44c2f";
+
+/// A fifth secret, under a storage backend's `encryption-key` field (Proxmox
+/// storage-level encryption for backups/snapshots).
+const ENCRYPTION_KEY_SECRET: &str = "FAKE-storage-encryption-key-3f2504e04f89";
+
+/// A sixth secret, under the Proxmox API's own `CSRFPreventionToken` key —
+/// the ticket token `/access/ticket` returns, which this server's handlers
+/// never forward but a hostile or misconfigured backend could echo anyway.
+const CSRF_TOKEN_SECRET: &str = "FAKE-csrf-prevention-token-7c9e6679d1a0";
+
+/// A `PVEAPIToken=<id>=<secret>` line (Proxmox's API-token auth header
+/// format, see `inventory.rs`'s `PVEAPIToken=` formatting) embedded in free
+/// text rather than filed under its own key — the shape this server's own
+/// outbound auth header uses, which an operator could just as easily paste
+/// into a `notes`/`description` field.
+const PVE_API_TOKEN_LINE: &str = "PVEAPIToken=root@pam!mcp=FAKE-pveapitoken-secret-2f3c92a1b6e7"; // gitleaks:allow -- fabricated Proxmox API token, not a real credential
+
+/// A PEM private-key block embedded in free text (a `notes` field), the same
+/// shape `mecmcp-redact`'s line-oriented text scanner already drops the body
+/// of wherever it appears.
+const PEM_PRIVATE_KEY_BLOCK: &str = "-----BEGIN RSA PRIVATE KEY-----\nFAKEbase64PemBodyNotARealKey1234567890abcdef\n-----END RSA PRIVATE KEY-----"; // gitleaks:allow -- fabricated PEM fixture, not a real key
+
 fn secret_bearing_description() -> String {
     format!("re-provisioned 2026-09-27 (ticket OPS-4110); backup admin password: {FAKE_SECRET}")
 }
@@ -89,7 +133,12 @@ fn routes_with_embedded_secret() -> Vec<Route> {
         Route {
             path: "/api2/json/nodes/pve2/status",
             status: 200,
-            body: EMPTY_OBJECT,
+            body: Box::leak(
+                serde_json::json!({"data": {"CSRFPreventionToken": CSRF_TOKEN_SECRET}})
+                    .to_string()
+                    .into_boxed_str(),
+            )
+            .as_bytes(),
         },
         Route {
             path: "/api2/json/cluster/status",
@@ -142,12 +191,24 @@ fn routes_with_embedded_secret() -> Vec<Route> {
         Route {
             path: "/api2/json/nodes/pve2/storage",
             status: 200,
-            body: EMPTY_ARRAY,
+            body: secret_bearing_list(serde_json::json!({
+                "storage": "backup-nfs",
+                "type": "nfs",
+                "content": "backup",
+                "authkey": DENYLISTED_KEY_SECRET,
+                "fingerprint": SHAPE_SECRET,
+                "cipassword": CIPASSWORD_SECRET,
+                "encryption-key": ENCRYPTION_KEY_SECRET,
+            })),
         },
         Route {
             path: "/api2/json/nodes/pve2/storage/local/content",
             status: 200,
-            body: secret_bearing_list(serde_json::json!({"volid": "local:backup/vzdump-qemu-905.vma.zst", "content": "backup", "notes": description.clone()})),
+            body: secret_bearing_list(serde_json::json!({
+                "volid": "local:backup/vzdump-qemu-905.vma.zst",
+                "content": "backup",
+                "notes": format!("{description}\n{PVE_API_TOKEN_LINE}\n{PEM_PRIVATE_KEY_BLOCK}"),
+            })),
         },
         Route {
             path: "/api2/json/nodes/pve2/tasks",
@@ -315,6 +376,109 @@ async fn get_container_config_redacts_description_and_cicustom() {
     );
 }
 
+/// `get_storage`'s fixture carries several secret shapes this server writes
+/// no redaction code for itself: a denylisted key name (`authkey`) outside
+/// the five curated free-text keys, a crypt-hash-shaped value under an
+/// ordinary key (`fingerprint`), and the Proxmox-specific `cipassword` and
+/// `encryption-key` denylisted keys. All must still come back redacted,
+/// proving that `serve_read`'s `tool_result(..., OutputRedaction::Apply)`
+/// call -- which runs `mecmcp_redact::redact_json_value` over the *entire*
+/// response, not just the curated free-text fields -- actually covers the
+/// response body outside what `redact_free_text_fields` targets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_storage_redacts_denylisted_key_and_shape_secrets() {
+    let harness = common::TestServer::start_with_routes(
+        common::TokenSpec::full(),
+        routes_with_embedded_secret(),
+    )
+    .await;
+
+    let storage = common::call(
+        &harness,
+        "get_storage",
+        serde_json::json!({"cluster": "pve3", "node": "pve2"}),
+    )
+    .await
+    .expect("get_storage should succeed against the fixture");
+
+    let rendered = storage.to_string();
+    assert!(
+        !rendered.contains(DENYLISTED_KEY_SECRET),
+        "get_storage leaked a denylisted-key secret outside the free-text allowlist: {rendered}"
+    );
+    assert!(
+        !rendered.contains(SHAPE_SECRET),
+        "get_storage leaked a crypt-hash-shaped secret under a non-denylisted key: {rendered}"
+    );
+    assert!(
+        !rendered.contains(CIPASSWORD_SECRET),
+        "get_storage leaked a cipassword secret: {rendered}"
+    );
+    assert!(
+        !rendered.contains(ENCRYPTION_KEY_SECRET),
+        "get_storage leaked a storage encryption-key secret: {rendered}"
+    );
+}
+
+/// `get_node_status`'s fixture carries a `CSRFPreventionToken` -- the
+/// Proxmox API's own ticket-auth token -- under its own denylisted key. This
+/// server never forwards that field itself, but a backend that echoed it
+/// anyway must still not leak it through this tool's output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_node_status_redacts_csrf_token() {
+    let harness = common::TestServer::start_with_routes(
+        common::TokenSpec::full(),
+        routes_with_embedded_secret(),
+    )
+    .await;
+
+    let status = common::call(
+        &harness,
+        "get_node_status",
+        serde_json::json!({"cluster": "pve3", "node": "pve2"}),
+    )
+    .await
+    .expect("get_node_status should succeed against the fixture");
+
+    let rendered = status.to_string();
+    assert!(
+        !rendered.contains(CSRF_TOKEN_SECRET),
+        "get_node_status leaked a CSRFPreventionToken secret: {rendered}"
+    );
+}
+
+/// `list_backups`'s fixture carries a `notes` field with two secret forms
+/// embedded in free text rather than filed under their own key: a
+/// `PVEAPIToken=<id>=<secret>` line (the same shape this server's own
+/// outbound auth header uses) and a PEM private-key block. Both must still
+/// come back redacted via the free-text scan, not the key denylist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_backups_redacts_free_text_api_token_and_pem_block() {
+    let harness = common::TestServer::start_with_routes(
+        common::TokenSpec::full(),
+        routes_with_embedded_secret(),
+    )
+    .await;
+
+    let backups = common::call(
+        &harness,
+        "list_backups",
+        serde_json::json!({"cluster": "pve3", "node": "pve2", "storage": "local"}),
+    )
+    .await
+    .expect("list_backups should succeed against the fixture");
+
+    let rendered = backups.to_string();
+    assert!(
+        !rendered.contains(PVE_API_TOKEN_LINE),
+        "list_backups leaked a PVEAPIToken= line embedded in free text: {rendered}"
+    );
+    assert!(
+        !rendered.contains("FAKEbase64PemBodyNotARealKey1234567890abcdef"),
+        "list_backups leaked a PEM private-key body embedded in free text: {rendered}"
+    );
+}
+
 /// The full read-tool sweep: every tool in the server's own catalog, called
 /// against both guest fixtures, must never echo the fake secret -- whether
 /// it answers with data or with an error. This is the backstop the two tests
@@ -398,7 +562,12 @@ async fn no_read_tool_leaks_the_fake_secret() {
         "sweep must return one result per planned call"
     );
 
-    for ((vmid, tool), outcome) in plan.into_iter().zip(results) {
+    // Label each (vmid, tool) call distinctly so the shared leak-check
+    // helper below can report exactly which call leaked, the same
+    // granularity the old inline assertion gave per iteration.
+    let mut rendered_by_label: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for ((vmid, tool), outcome) in plan.iter().zip(results) {
         let rendered = match outcome {
             Ok(value) => value.to_string(),
             Err(message) => {
@@ -417,9 +586,37 @@ async fn no_read_tool_leaks_the_fake_secret() {
                 message
             }
         };
-        assert!(
-            !rendered.contains(FAKE_SECRET),
-            "tool '{tool}' (vmid {vmid}) leaked the fake secret: {rendered}"
-        );
+        rendered_by_label.insert(format!("{tool}@{vmid}"), rendered);
     }
+
+    let labels: Vec<&str> = rendered_by_label.keys().map(String::as_str).collect();
+    let leaking = mecmcp_redact::testing::tools_leaking_secrets(
+        &labels,
+        &[
+            FAKE_SECRET,
+            DENYLISTED_KEY_SECRET,
+            SHAPE_SECRET,
+            CIPASSWORD_SECRET,
+            ENCRYPTION_KEY_SECRET,
+            CSRF_TOKEN_SECRET,
+            PVE_API_TOKEN_LINE,
+            "FAKEbase64PemBodyNotARealKey1234567890abcdef",
+        ],
+        |label| {
+            rendered_by_label
+                .get(label)
+                .expect("label came from this same map's keys")
+                .clone()
+        },
+    );
+    // `leaking` is a list of "tool@vmid" labels (from `rendered_by_label`'s
+    // keys), never a secret value, but CodeQL's taint tracking treats it --
+    // and anything derived from it, including its length -- as tainted
+    // because the exercised closure's return flowed from secret-bearing
+    // rendered output upstream. Keep the panic message static; to see which
+    // calls leaked, inspect `leaking` locally under a debugger.
+    assert!(
+        leaking.is_empty(),
+        "at least one tool@vmid call leaked a fake secret"
+    );
 }
