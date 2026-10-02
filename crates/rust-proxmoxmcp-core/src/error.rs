@@ -98,14 +98,10 @@ impl ProxmoxError {
 
 /// Render a peer-supplied body into bounded, inert detail.
 ///
-/// The `errors` map is run through `mecmcp_redact::redact_json_value` before
-/// formatting, so a secret echoed back under a denylisted field name (for
-/// example a parameter-validation failure on a password-shaped field) comes
-/// out as `[REDACTED]` rather than verbatim. The formatted result is then
-/// run through `redact_text` too, since a secret can be shape-matched (an
-/// API token, a PEM block) rather than sitting under a denylisted key. This
-/// detail is both the text an MCP caller sees and the text logged, so it has
-/// to be safe for both.
+/// Runs the parsed error body through `mecmcp_redact::redact_json_value`
+/// before formatting, then runs the formatted result through `redact_text`
+/// as a backstop. This detail is both the text an MCP caller sees and the
+/// text logged, so it has to be safe for both.
 fn extract_detail(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
     let detail = serde_json::from_str::<serde_json::Value>(&text)
