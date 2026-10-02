@@ -2,6 +2,7 @@
 
 mod cli;
 mod http_transport;
+mod readiness;
 mod server;
 
 use anyhow::{Context as _, Result};
@@ -823,6 +824,8 @@ async fn serve_http(
     state_file: Option<PathBuf>,
     approval_digest_key: Option<mecmcp_changeset::ApprovalDigestKey>,
 ) -> Result<()> {
+    let (readiness_checks, _readiness_handles) = readiness::spawn_cluster_readiness(&clients);
+
     let handler = ProxmoxServer::new_with_default_coordinator(
         clusters,
         clients,
@@ -869,6 +872,7 @@ async fn serve_http(
         enable_metrics,
         allow_insecure_bind,
         shutdown,
+        readiness_checks,
     )
     .map_err(|error| anyhow::anyhow!("building HTTP router: {error}"))?;
 

@@ -96,6 +96,10 @@ pub struct TestServer {
     /// [`Self::shutdown`] can await the task exiting before a caller reuses
     /// the same state path.
     served: ServedPlan,
+    /// The `/readyz` cluster-reachability pollers. Held so they keep running
+    /// for the server's lifetime instead of aborting as soon as this
+    /// function returns.
+    _readiness_handles: Vec<tokio_util::task::AbortOnDropHandle<()>>,
 }
 
 impl TestServer {
@@ -500,6 +504,8 @@ impl TestServer {
             );
         }
         let clients = Arc::new(clients);
+        let (readiness_checks, readiness_handles) =
+            rust_proxmoxmcp::readiness::spawn_cluster_readiness(&clients);
 
         let index = Arc::new(GuestIndex::new(Duration::from_secs(
             clusters.policy().resource_cache_ttl_secs,
@@ -532,6 +538,7 @@ impl TestServer {
             false,
             false,
             shutdown.clone(),
+            readiness_checks,
         )
         .expect("build HTTP router");
 
@@ -552,6 +559,7 @@ impl TestServer {
             coordinator,
             shutdown,
             served,
+            _readiness_handles: readiness_handles,
         }
     }
 

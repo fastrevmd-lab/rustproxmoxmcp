@@ -2,16 +2,46 @@
 //! with mecmcp 0.24.1.
 //!
 //! `/healthz` and `/readyz` are mounted unconditionally by
-//! `mecmcp-transport`'s router assembly -- this server wires in no readiness
-//! checks of its own, so `/readyz` degrades to "200 when nothing is
-//! configured to fail." Rate limiting is enforced by the same
-//! `LimitsConfig::default()` this server already passes to
-//! `build_http_router`; as of mecmcp 0.24.1 that default is no longer
-//! unmetered.
+//! `mecmcp-transport`'s router assembly. MEC-983 wires in one named
+//! readiness check per configured Proxmox cluster (`readiness::
+//! spawn_cluster_readiness`), backed by a background poller rather than a
+//! synchronous call from inside the `/readyz` handler itself -- so these
+//! tests poll for the result to converge instead of asserting on the first
+//! response. Rate limiting is enforced by the same `LimitsConfig::default()`
+//! this server already passes to `build_http_router`; as of mecmcp 0.24.1
+//! that default is no longer unmetered.
 
 mod common;
 
 use reqwest::StatusCode;
+use std::time::Duration;
+
+/// Poll `{base_url}/readyz` until it reports `expected`, or give up at the
+/// deadline and return whatever the last response was.
+///
+/// The cluster-reachability poller runs in the background on its own
+/// interval, so a test cannot assume the first `/readyz` response already
+/// reflects a poll that has run.
+async fn wait_for_readyz_status(
+    client: &reqwest::Client,
+    base_url: &str,
+    expected: StatusCode,
+) -> StatusCode {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = client
+            .get(format!("{base_url}/readyz"))
+            .header(reqwest::header::HOST, "localhost")
+            .send()
+            .await
+            .expect("request")
+            .status();
+        if status == expected || tokio::time::Instant::now() >= deadline {
+            return status;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
 
 /// `/healthz` reports the process is up, unauthenticated and with no bearer token.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -27,18 +57,32 @@ async fn healthz_responds_ok_without_auth() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
-/// `/readyz` reports ready, unauthenticated, when no readiness checks are configured.
+/// `/readyz` reports ready, unauthenticated, when every configured cluster
+/// answers its reachability probe -- the default test fixture's mock Proxmox
+/// serves `/api2/json/nodes`, the probe path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn readyz_responds_ok_without_auth() {
     let h = common::TestServer::start(common::TokenSpec::full()).await;
     let client = reqwest::Client::new();
-    let response = client
-        .get(format!("{}/readyz", h.url))
-        .header(reqwest::header::HOST, "localhost")
-        .send()
-        .await
-        .expect("request");
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = wait_for_readyz_status(&client, &h.url, StatusCode::OK).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// MEC-983: a configured cluster whose API does not answer the reachability
+/// probe must flip `/readyz` to 503, naming that cluster, rather than
+/// reporting ready because no check happens to be wired in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readyz_reports_unready_when_a_cluster_is_unreachable() {
+    // No `/api2/json/nodes` route: the mock answers every request 404, so
+    // the cluster-reachability poller's probe call fails.
+    let h = common::TestServer::start_with_routes(common::TokenSpec::full(), vec![]).await;
+    let client = reqwest::Client::new();
+    let status = wait_for_readyz_status(&client, &h.url, StatusCode::SERVICE_UNAVAILABLE).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an unreachable cluster must fail /readyz"
+    );
 }
 
 /// mecmcp 0.24.1 makes `LimitsConfig::default()` rate-limit by default (50
