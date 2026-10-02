@@ -24,6 +24,22 @@ use rust_proxmoxmcp_core::testing::Route;
 /// denylist, the same way an operator's pasted note looks in practice.
 const FAKE_SECRET: &str = "FAKE-api-token-9f8e7d6c5b4a3210";
 
+/// A second secret, opaque (no recognizable shape), placed under a
+/// denylisted key name (`authkey`) that is *not* one of the five curated
+/// free-text keys `redact_free_text_fields` scans. This proves the
+/// mecmcp-redact key-denylist pass -- which runs over the *whole* response
+/// via `mecmcp_server::tool_result`'s `OutputRedaction::Apply`, not just
+/// this server's curated free-text fields -- actually reaches a field this
+/// server never specifically wrote code for.
+const DENYLISTED_KEY_SECRET: &str = "FAKE-authkey-outside-freetext-allowlist";
+
+/// A third secret, shaped as a Juniper/glibc crypt hash (`$<id>$<content>`),
+/// placed under an ordinary key name (`fingerprint`) that is on neither the
+/// free-text allowlist nor mecmcp-redact's key denylist. Proves the
+/// value-shape catch-all catches a secret by its *shape* alone, independent
+/// of what key it happens to be filed under.
+const SHAPE_SECRET: &str = "$9$not-a-real-secret-cryptHash12345";
+
 fn secret_bearing_description() -> String {
     format!("re-provisioned 2026-09-27 (ticket OPS-4110); backup admin password: {FAKE_SECRET}")
 }
@@ -142,7 +158,13 @@ fn routes_with_embedded_secret() -> Vec<Route> {
         Route {
             path: "/api2/json/nodes/pve2/storage",
             status: 200,
-            body: EMPTY_ARRAY,
+            body: secret_bearing_list(serde_json::json!({
+                "storage": "backup-nfs",
+                "type": "nfs",
+                "content": "backup",
+                "authkey": DENYLISTED_KEY_SECRET,
+                "fingerprint": SHAPE_SECRET,
+            })),
         },
         Route {
             path: "/api2/json/nodes/pve2/storage/local/content",
@@ -315,6 +337,41 @@ async fn get_container_config_redacts_description_and_cicustom() {
     );
 }
 
+/// `get_storage`'s fixture carries two secret shapes this server writes no
+/// redaction code for itself: a denylisted key name (`authkey`) outside the
+/// five curated free-text keys, and a crypt-hash-shaped value under an
+/// ordinary key (`fingerprint`). Both must still come back redacted, proving
+/// that `serve_read`'s `tool_result(..., OutputRedaction::Apply)` call --
+/// which runs `mecmcp_redact::redact_json_value` over the *entire* response,
+/// not just the curated free-text fields -- actually covers the response
+/// body outside what `redact_free_text_fields` targets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_storage_redacts_denylisted_key_and_shape_secrets() {
+    let harness = common::TestServer::start_with_routes(
+        common::TokenSpec::full(),
+        routes_with_embedded_secret(),
+    )
+    .await;
+
+    let storage = common::call(
+        &harness,
+        "get_storage",
+        serde_json::json!({"cluster": "pve3", "node": "pve2"}),
+    )
+    .await
+    .expect("get_storage should succeed against the fixture");
+
+    let rendered = storage.to_string();
+    assert!(
+        !rendered.contains(DENYLISTED_KEY_SECRET),
+        "get_storage leaked a denylisted-key secret outside the free-text allowlist: {rendered}"
+    );
+    assert!(
+        !rendered.contains(SHAPE_SECRET),
+        "get_storage leaked a crypt-hash-shaped secret under a non-denylisted key: {rendered}"
+    );
+}
+
 /// The full read-tool sweep: every tool in the server's own catalog, called
 /// against both guest fixtures, must never echo the fake secret -- whether
 /// it answers with data or with an error. This is the backstop the two tests
@@ -426,12 +483,16 @@ async fn no_read_tool_leaks_the_fake_secret() {
     }
 
     let labels: Vec<&str> = rendered_by_label.keys().map(String::as_str).collect();
-    let leaking = mecmcp_redact::testing::tools_leaking_secrets(&labels, &[FAKE_SECRET], |label| {
-        rendered_by_label
-            .get(label)
-            .expect("label came from this same map's keys")
-            .clone()
-    });
+    let leaking = mecmcp_redact::testing::tools_leaking_secrets(
+        &labels,
+        &[FAKE_SECRET, DENYLISTED_KEY_SECRET, SHAPE_SECRET],
+        |label| {
+            rendered_by_label
+                .get(label)
+                .expect("label came from this same map's keys")
+                .clone()
+        },
+    );
     assert!(
         leaking.is_empty(),
         "these tool@vmid calls leaked the fake secret: {leaking:?}"
