@@ -11,8 +11,8 @@ use mecmcp_auth::{BearerSyntax, CallerCtx, TokenStoreFile};
 use mecmcp_transport::{
     BearerAuthenticator, BearerBoundary, BearerResponseProfile, HostOriginPolicy,
     HttpTransportBuildError, HttpTransportConfig, InsecureBindAcknowledgement, LimitsConfig,
-    MalformedArgumentsPolicy, NoAuthAcknowledgement, ServePlan, TargetField, ToolScopePreflight,
-    TransportIdentity, build_streamable_http_router,
+    MalformedArgumentsPolicy, NoAuthAcknowledgement, ReadinessCheck, ServePlan, TargetField,
+    ToolScopePreflight, TransportIdentity, build_streamable_http_router,
 };
 use rust_proxmoxmcp_core::{ProxmoxGrant, tier::WRITE_TOOLS};
 use std::sync::Arc;
@@ -51,6 +51,7 @@ pub fn build_http_router(
     enable_metrics: bool,
     allow_insecure_bind: bool,
     shutdown: CancellationToken,
+    readiness_checks: Vec<ReadinessCheck>,
 ) -> Result<ServePlan, HttpTransportBuildError> {
     let identity =
         TransportIdentity::new("rust-proxmoxmcp", "proxmox", "rust-proxmoxmcp", ["cluster"]);
@@ -90,6 +91,10 @@ pub fn build_http_router(
         }
         config
     };
+
+    let config = readiness_checks
+        .into_iter()
+        .fold(config, HttpTransportConfig::with_readiness_check);
 
     build_streamable_http_router(move || Ok::<_, std::io::Error>(handler.clone()), config)
 }
@@ -303,6 +308,7 @@ mod tests {
             false,
             false,
             shutdown.clone(),
+            vec![],
         )
         .expect("build_http_router with flag off");
 
@@ -343,6 +349,7 @@ mod tests {
             false,
             true,
             shutdown.clone(),
+            vec![],
         )
         .expect("build_http_router with flag on");
 
