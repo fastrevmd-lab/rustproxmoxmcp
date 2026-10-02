@@ -40,8 +40,52 @@ const DENYLISTED_KEY_SECRET: &str = "FAKE-authkey-outside-freetext-allowlist";
 /// of what key it happens to be filed under.
 const SHAPE_SECRET: &str = "$9$not-a-real-secret-cryptHash12345";
 
+/// A Proxmox VM's `cipassword` (cloud-init password) field. mecmcp-redact's
+/// key denylist matches it by substring (`cipassword` normalizes to contain
+/// `password`), a vendor-specific field this server writes no redaction code
+/// for itself.
+const CIPASSWORD_SECRET: &str = "FAKE-cipassword-outside-freetext-allowlist";
+
+/// A Proxmox storage definition's `encryption-key` field. `encryptionkey` is
+/// a literal entry on mecmcp-redact's key denylist, independent of this
+/// server's curated free-text fields.
+const ENCRYPTION_KEY_SECRET: &str = "FAKE-encryptionkey-outside-freetext-allowlist";
+
+/// A `CSRFPreventionToken`-named field. Denylisted because it normalizes to
+/// contain `token`, the same catch-all that covers `PVEAPIToken` below.
+const CSRF_TOKEN_SECRET: &str = "FAKE-csrftoken-outside-freetext-allowlist";
+
+/// The value half of a `PVEAPIToken=user@realm!tokenid=<value>` line, the
+/// form a Proxmox operator pastes into a free-text notes/description field.
+/// Carries the gitleaks allowlist marker because the literal `PVEAPIToken=`
+/// line also matches this repo's `pve-api-token` vendor rule.
+const PVE_API_TOKEN_SECRET: &str = "not-a-real-secret-0123456789abcdef0123456789";
+
+/// A full `PVEAPIToken=...` line as it would appear pasted into a
+/// description/notes field, built from [`PVE_API_TOKEN_SECRET`].
+fn pve_api_token_line() -> String {
+    format!("PVEAPIToken=not-a-real-secret-user@pve!monitoring={PVE_API_TOKEN_SECRET}")
+}
+
+/// The body of a PEM private-key block an operator might paste into a
+/// description field. mecmcp-redact's text scan drops everything between a
+/// `-----BEGIN ... KEY-----` / `-----END ... KEY-----` pair unconditionally.
+const PEM_PRIVATE_KEY_SECRET: &str = "not-a-real-secret-MIIFAKEPEMBODY0123456789";
+
+/// A PEM private-key block, built from [`PEM_PRIVATE_KEY_SECRET`], as it
+/// would appear pasted into a description field.
+fn pem_private_key_block() -> String {
+    format!(
+        "-----BEGIN PRIVATE KEY-----\n{PEM_PRIVATE_KEY_SECRET}\n-----END PRIVATE KEY-----" // gitleaks:allow -- fabricated PEM header/body, not a real key
+    )
+}
+
 fn secret_bearing_description() -> String {
-    format!("re-provisioned 2026-09-27 (ticket OPS-4110); backup admin password: {FAKE_SECRET}")
+    format!(
+        "re-provisioned 2026-09-27 (ticket OPS-4110); backup admin password: {FAKE_SECRET}\n{}\n{}",
+        pve_api_token_line(),
+        pem_private_key_block(),
+    )
 }
 
 const EMPTY_ARRAY: &[u8] = br#"{"data":[]}"#;
@@ -81,6 +125,7 @@ fn routes_with_embedded_secret() -> Vec<Route> {
             "sshkeys": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKEKEYFAKEKEYFAKEKEYFAKEKEYFAKEKEY demo@example.net\n",
             "description": description.clone(),
             "cicustom": "user=local:snippets/postinstall-905.yml",
+            "cipassword": CIPASSWORD_SECRET,
         }
     })
     .to_string();
@@ -164,6 +209,8 @@ fn routes_with_embedded_secret() -> Vec<Route> {
                 "content": "backup",
                 "authkey": DENYLISTED_KEY_SECRET,
                 "fingerprint": SHAPE_SECRET,
+                "encryption-key": ENCRYPTION_KEY_SECRET,
+                "CSRFPreventionToken": CSRF_TOKEN_SECRET,
             })),
         },
         Route {
@@ -303,6 +350,18 @@ async fn get_vm_config_redacts_description_and_cicustom() {
         "get_vm_config leaked the fake secret: {rendered}"
     );
     assert!(
+        !rendered.contains(CIPASSWORD_SECRET),
+        "get_vm_config leaked the cipassword secret: {rendered}"
+    );
+    assert!(
+        !rendered.contains(PVE_API_TOKEN_SECRET),
+        "get_vm_config leaked the PVEAPIToken secret: {rendered}"
+    );
+    assert!(
+        !rendered.contains(PEM_PRIVATE_KEY_SECRET),
+        "get_vm_config leaked the PEM private-key secret: {rendered}"
+    );
+    assert!(
         config["sshkeys"]
             .as_str()
             .expect("sshkeys is a string")
@@ -337,14 +396,16 @@ async fn get_container_config_redacts_description_and_cicustom() {
     );
 }
 
-/// `get_storage`'s fixture carries two secret shapes this server writes no
-/// redaction code for itself: a denylisted key name (`authkey`) outside the
-/// five curated free-text keys, and a crypt-hash-shaped value under an
-/// ordinary key (`fingerprint`). Both must still come back redacted, proving
-/// that `serve_read`'s `tool_result(..., OutputRedaction::Apply)` call --
-/// which runs `mecmcp_redact::redact_json_value` over the *entire* response,
-/// not just the curated free-text fields -- actually covers the response
-/// body outside what `redact_free_text_fields` targets.
+/// `get_storage`'s fixture carries several secret shapes this server writes
+/// no redaction code for itself: a denylisted key name (`authkey`) outside
+/// the five curated free-text keys, a crypt-hash-shaped value under an
+/// ordinary key (`fingerprint`), and two more Proxmox-specific denylisted
+/// keys (`encryption-key`, `CSRFPreventionToken`). All must still come back
+/// redacted, proving that `serve_read`'s `tool_result(...,
+/// OutputRedaction::Apply)` call -- which runs
+/// `mecmcp_redact::redact_json_value` over the *entire* response, not just
+/// the curated free-text fields -- actually covers the response body outside
+/// what `redact_free_text_fields` targets.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_storage_redacts_denylisted_key_and_shape_secrets() {
     let harness = common::TestServer::start_with_routes(
@@ -369,6 +430,14 @@ async fn get_storage_redacts_denylisted_key_and_shape_secrets() {
     assert!(
         !rendered.contains(SHAPE_SECRET),
         "get_storage leaked a crypt-hash-shaped secret under a non-denylisted key: {rendered}"
+    );
+    assert!(
+        !rendered.contains(ENCRYPTION_KEY_SECRET),
+        "get_storage leaked the encryption-key secret: {rendered}"
+    );
+    assert!(
+        !rendered.contains(CSRF_TOKEN_SECRET),
+        "get_storage leaked the CSRFPreventionToken secret: {rendered}"
     );
 }
 
@@ -485,7 +554,16 @@ async fn no_read_tool_leaks_the_fake_secret() {
     let labels: Vec<&str> = rendered_by_label.keys().map(String::as_str).collect();
     let leaking = mecmcp_redact::testing::tools_leaking_secrets(
         &labels,
-        &[FAKE_SECRET, DENYLISTED_KEY_SECRET, SHAPE_SECRET],
+        &[
+            FAKE_SECRET,
+            DENYLISTED_KEY_SECRET,
+            SHAPE_SECRET,
+            CIPASSWORD_SECRET,
+            ENCRYPTION_KEY_SECRET,
+            CSRF_TOKEN_SECRET,
+            PVE_API_TOKEN_SECRET,
+            PEM_PRIVATE_KEY_SECRET,
+        ],
         |label| {
             rendered_by_label
                 .get(label)
