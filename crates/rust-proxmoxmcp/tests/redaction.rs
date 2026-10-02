@@ -493,8 +493,15 @@ async fn no_read_tool_leaks_the_fake_secret() {
                 .clone()
         },
     );
+    // `leaking` is a list of "tool@vmid" labels (from `rendered_by_label`'s
+    // keys), never a secret value, but CodeQL's taint tracking still treats
+    // it as tainted because the exercised closure's return flowed from
+    // secret-bearing rendered output upstream. Assert on a derived count
+    // rather than formatting `leaking` itself (mirrors the same workaround
+    // in rustopnsmcp's `respond_redacts_every_known_opnsense_secret_shape`).
+    let leaking_count = leaking.len();
     assert!(
         leaking.is_empty(),
-        "these tool@vmid calls leaked the fake secret: {leaking:?}"
+        "{leaking_count} tool@vmid call(s) leaked the fake secret"
     );
 }
