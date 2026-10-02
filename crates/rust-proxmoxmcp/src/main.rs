@@ -265,6 +265,9 @@ async fn main() -> Result<()> {
 
     let audit_sink = init_audit(&args.common)?;
 
+    let approval_digest_key =
+        load_approval_digest_key(args.common.approval_digest_key_file.as_deref())?;
+
     if let Some(Command::Token { .. }) = args.common.command.take() {
         // This path fires when a server flag precedes the subcommand
         // (e.g., `--clusters-file X token add ...`). The early dispatch at argv[1]
@@ -370,6 +373,7 @@ async fn main() -> Result<()> {
                 recorder,
                 direct_commit,
                 args.state_file.clone(),
+                approval_digest_key.clone(),
             )
             .await
         }
@@ -461,6 +465,7 @@ async fn main() -> Result<()> {
                 recorder,
                 direct_commit,
                 args.state_file.clone(),
+                approval_digest_key,
             )
             .await
         }
@@ -589,18 +594,40 @@ fn init_audit(args: &mecmcp_runtime::cli::Cli) -> Result<Option<mecmcp_audit::Au
             .map_err(|error| anyhow::anyhow!("invalid --audit-redact: {error}"))?,
         )
     };
+    // This binary does not build mecmcp-audit's `otel` feature, so refuse to
+    // start when telemetry export is requested in a build that can't export
+    // it.
+    if args.otel_endpoint.is_some() {
+        anyhow::bail!(
+            "--otel-endpoint requires a build of rust-proxmoxmcp with mecmcp-audit's `otel` \
+             feature, which this binary does not enable"
+        );
+    }
     let sink = mecmcp_audit::init_tracing(&mecmcp_audit::AuditConfig {
         format: mecmcp_audit::AuditFormat::parse(&args.audit_format),
         audit_log_file: args.audit_log_file.clone(),
         redaction,
         journald: args.audit_journald,
-        // This server does not wire up an --otel-endpoint flag; OTel export
-        // stays off until it does.
         otel: None,
     })
     .context("initializing audit tracing")?;
     mecmcp_audit::install_duration_metric_name("rust_proxmoxmcp_tool_duration_seconds");
     Ok(sink)
+}
+
+/// Load `--approval-digest-key-file`, if set.
+///
+/// `None` keeps the change-set coordinator on today's default digest mode.
+/// A load failure must stop startup rather than continue without the key,
+/// since this flag controls an approval security control.
+fn load_approval_digest_key(
+    path: Option<&std::path::Path>,
+) -> Result<Option<mecmcp_changeset::ApprovalDigestKey>> {
+    path.map(|path| {
+        mecmcp_changeset::ApprovalDigestKey::load_from_file(path)
+            .with_context(|| format!("loading --approval-digest-key-file {}", path.display()))
+    })
+    .transpose()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -613,6 +640,7 @@ async fn serve_stdio(
     evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
     direct_commit: mecmcp_audit::DirectCommitPolicy,
     state_file: Option<PathBuf>,
+    approval_digest_key: Option<mecmcp_changeset::ApprovalDigestKey>,
 ) -> Result<()> {
     let handler = ProxmoxServer::new_with_default_coordinator(
         clusters,
@@ -623,6 +651,7 @@ async fn serve_stdio(
         evidence,
         direct_commit,
         state_file.as_deref(),
+        approval_digest_key,
     )
     .context("build server")?;
 
@@ -792,6 +821,7 @@ async fn serve_http(
     evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
     direct_commit: mecmcp_audit::DirectCommitPolicy,
     state_file: Option<PathBuf>,
+    approval_digest_key: Option<mecmcp_changeset::ApprovalDigestKey>,
 ) -> Result<()> {
     let handler = ProxmoxServer::new_with_default_coordinator(
         clusters,
@@ -802,6 +832,7 @@ async fn serve_http(
         evidence,
         direct_commit,
         state_file.as_deref(),
+        approval_digest_key,
     )
     .context("build server")?;
 
@@ -994,5 +1025,89 @@ mod set_scopes_grant_tests {
                 ProxmoxAction::Destructive
             ]
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod shared_cli_security_option_tests {
+    use super::{init_audit, load_approval_digest_key};
+    use crate::cli::ProxmoxCli;
+    use clap::Parser as _;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// No `--approval-digest-key-file` keeps the coordinator unkeyed, same as
+    /// today.
+    #[test]
+    fn no_approval_digest_key_file_is_fine() {
+        assert!(
+            load_approval_digest_key(None)
+                .expect("no path is not an error")
+                .is_none()
+        );
+    }
+
+    /// A valid key file must be loaded and used.
+    #[test]
+    fn a_valid_approval_digest_key_file_is_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        std::fs::write(&path, b"a-sufficiently-long-test-key-value").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let key = load_approval_digest_key(Some(&path))
+            .expect("a valid key file must load")
+            .expect("Some(path) must produce Some(key)");
+        assert_eq!(&*key, b"a-sufficiently-long-test-key-value");
+    }
+
+    /// A key file that fails `mecmcp-changeset`'s checks (here: too short)
+    /// must fail startup.
+    #[test]
+    fn a_too_short_approval_digest_key_file_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        std::fs::write(&path, b"short").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = load_approval_digest_key(Some(&path))
+            .expect_err("a too-short key file must be refused, not silently skipped");
+        assert!(
+            error.to_string().contains("approval-digest-key-file"),
+            "{error}"
+        );
+    }
+
+    /// A missing key file must fail startup -- the operator asked for a
+    /// keyed digest and typo'd the path.
+    #[test]
+    fn a_missing_approval_digest_key_file_fails_closed() {
+        let error = load_approval_digest_key(Some(std::path::Path::new(
+            "/nonexistent/does-not-exist/key",
+        )))
+        .expect_err("a missing key file must be refused, not silently skipped");
+        assert!(
+            error.to_string().contains("approval-digest-key-file"),
+            "{error}"
+        );
+    }
+
+    /// Requesting telemetry export must refuse startup in a build that
+    /// cannot send it.
+    #[test]
+    fn otel_endpoint_set_refuses_to_start() {
+        let mut cli = ProxmoxCli::parse_from(["rust-proxmoxmcp"]);
+        cli.common.otel_endpoint = Some("http://127.0.0.1:4318".to_owned());
+
+        let error = init_audit(&cli.common).expect_err("--otel-endpoint must be refused");
+        assert!(error.to_string().contains("--otel-endpoint"), "{error}");
+    }
+
+    /// No `--otel-endpoint` keeps today's behaviour: audit initializes with
+    /// `otel: None`.
+    #[test]
+    fn no_otel_endpoint_starts_normally() {
+        let cli = ProxmoxCli::parse_from(["rust-proxmoxmcp"]);
+        init_audit(&cli.common).expect("no --otel-endpoint must not be refused");
     }
 }
