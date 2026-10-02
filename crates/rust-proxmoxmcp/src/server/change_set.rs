@@ -184,6 +184,7 @@ pub(crate) fn build_coordinator(
     state_path: Option<&std::path::Path>,
     lab_mode: bool,
     evidence: Option<Arc<mecmcp_audit::recorder::EvidenceRecorder>>,
+    approval_digest_key: Option<mecmcp_changeset::ApprovalDigestKey>,
 ) -> Result<Arc<ChangesetCoordinator>, CoordinatorError> {
     let limits = OperationLimits {
         max_operations: 100,
@@ -195,7 +196,17 @@ pub(crate) fn build_coordinator(
         max_preview_bytes: 256 * 1024,
     };
     let approval_ttl = Duration::from_secs(3600);
-    let mut coordinator = ChangesetCoordinator::load(state_path, limits, approval_ttl, lab_mode)?;
+    // `load_with_key` verifies any on-disk v6 approval digest against the key
+    // and stores it on the returned coordinator for future signs; it must not
+    // also be passed to `with_approval_digest_key` afterwards, or the two
+    // copies could drift.
+    let mut coordinator = ChangesetCoordinator::load_with_key(
+        state_path,
+        limits,
+        approval_ttl,
+        lab_mode,
+        approval_digest_key,
+    )?;
     if let Some(recorder) = evidence {
         coordinator = coordinator.with_evidence(recorder);
     }
@@ -204,3 +215,72 @@ pub(crate) fn build_coordinator(
 
 // Tool handlers are in mod.rs, integrated with the main proxmox_tool_router.
 // This module provides the types and helper functions.
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::build_coordinator;
+
+    /// A key passed through `build_coordinator` must actually produce the
+    /// keyed v6 approval digest, not the unkeyed v5 one.
+    #[tokio::test]
+    async fn an_approval_digest_key_passed_to_build_coordinator_produces_a_v6_digest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("changeset-state.json");
+        let key = b"a-sufficiently-long-test-key".as_slice();
+
+        let coordinator = build_coordinator(
+            Some(&state_path),
+            false,
+            None,
+            Some(mecmcp_changeset::ApprovalDigestKey::new(key)),
+        )
+        .expect("coordinator with a configured key");
+
+        let created = coordinator
+            .create_change_set(
+                "cluster-a/vm-100".to_string(),
+                vec![serde_json::json!({"action": "set", "target": "/test"})],
+                "alice".to_string(),
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+                "policy-sig".to_string(),
+            )
+            .await
+            .expect("create");
+        coordinator
+            .approve_change_set(
+                created.change_set_id.clone(),
+                "cluster-a/vm-100".to_string(),
+                "bob".to_string(),
+                created.digest.clone(),
+                mecmcp_audit::ActorType::Human,
+            )
+            .await
+            .expect("approve");
+
+        let state = mecmcp_changeset::persistence::read_state_with_key(
+            &state_path,
+            10 * 1024 * 1024,
+            Some(key),
+        )
+        .expect("read back with the same key");
+        let approval = state.change_sets[&created.change_set_id]
+            .approval
+            .as_ref()
+            .expect("approval");
+        assert_eq!(
+            approval.digest_version, 6,
+            "a key passed through build_coordinator must produce a v6 (keyed) digest, \
+             not the unkeyed v5 one"
+        );
+
+        drop(coordinator);
+        let unkeyed_read =
+            mecmcp_changeset::persistence::read_state_with_key(&state_path, 10 * 1024 * 1024, None);
+        assert!(
+            unkeyed_read.is_err(),
+            "a v6 digest produced through build_coordinator must not verify without the key"
+        );
+    }
+}

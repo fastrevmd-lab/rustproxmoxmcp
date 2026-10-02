@@ -287,6 +287,7 @@ mod tests {
             None,
             mecmcp_audit::DirectCommitPolicy::new(false),
             None,
+            None,
         )
         .expect("build server");
 
