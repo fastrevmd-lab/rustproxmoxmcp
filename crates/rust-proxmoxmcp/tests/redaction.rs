@@ -398,7 +398,12 @@ async fn no_read_tool_leaks_the_fake_secret() {
         "sweep must return one result per planned call"
     );
 
-    for ((vmid, tool), outcome) in plan.into_iter().zip(results) {
+    // Label each (vmid, tool) call distinctly so the shared leak-check
+    // helper below can report exactly which call leaked, the same
+    // granularity the old inline assertion gave per iteration.
+    let mut rendered_by_label: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for ((vmid, tool), outcome) in plan.iter().zip(results) {
         let rendered = match outcome {
             Ok(value) => value.to_string(),
             Err(message) => {
@@ -417,9 +422,18 @@ async fn no_read_tool_leaks_the_fake_secret() {
                 message
             }
         };
-        assert!(
-            !rendered.contains(FAKE_SECRET),
-            "tool '{tool}' (vmid {vmid}) leaked the fake secret: {rendered}"
-        );
+        rendered_by_label.insert(format!("{tool}@{vmid}"), rendered);
     }
+
+    let labels: Vec<&str> = rendered_by_label.keys().map(String::as_str).collect();
+    let leaking = mecmcp_redact::testing::tools_leaking_secrets(&labels, &[FAKE_SECRET], |label| {
+        rendered_by_label
+            .get(label)
+            .expect("label came from this same map's keys")
+            .clone()
+    });
+    assert!(
+        leaking.is_empty(),
+        "these tool@vmid calls leaked the fake secret: {leaking:?}"
+    );
 }
