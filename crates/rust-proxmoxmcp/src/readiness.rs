@@ -7,9 +7,12 @@
 //! interval and records the outcome in an [`AtomicBool`], which the probe
 //! closure only reads.
 //!
-//! One [`ReadinessCheck`] is registered per cluster, named after it, so a
-//! `/readyz` failure identifies which cluster is unreachable rather than
-//! reporting a single fleet-wide flag.
+//! `/readyz` is unauthenticated, so exactly one fixed-name
+//! [`ReadinessCheck`] is registered for the whole fleet: it fails if any
+//! configured cluster is currently unreachable. Which cluster is down is
+//! never put in the probe's name or its `/readyz` body -- operator
+//! inventory names are not data an unauthenticated caller should get -- it
+//! only goes to the server log at the poll call site.
 
 use mecmcp_transport::ReadinessCheck;
 use rust_proxmoxmcp_core::client::ProxmoxClient;
@@ -28,21 +31,28 @@ const POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// already grants its service token.
 const PROBE_PATH: &str = "/api2/json/nodes";
 
-/// Fixed reason reported on `/readyz` for an unreachable cluster.
+/// Fixed name for the single fleet-wide `/readyz` check.
+///
+/// One name for all clusters, not one check per cluster: a per-cluster name
+/// would put operator inventory names on an unauthenticated endpoint.
+const CHECK_NAME: &str = "proxmox_cluster_reachability";
+
+/// Fixed reason reported on `/readyz` when any cluster is unreachable.
 ///
 /// `/readyz` is unauthenticated, so [`ReadinessCheck::new`] requires a
-/// `&'static str` reason that cannot carry a runtime detail (the underlying
-/// HTTP error, a timeout, a TLS failure). The failing [`ReadinessCheck`]'s
-/// name already identifies which cluster; operators get the detail from the
-/// server log at the poll call site instead.
-const UNREACHABLE_REASON: &str = "cluster is unreachable";
+/// `&'static str` reason that cannot carry a runtime detail (which cluster,
+/// the underlying HTTP error, a timeout, a TLS failure). Operators get that
+/// detail from the server log at the poll call site instead.
+const UNREACHABLE_REASON: &str = "one or more configured clusters are unreachable";
 
 /// Tracks whether one cluster answered its last reachability poll.
 ///
-/// Cheap to clone -- clones share the same flag. Starts reachable: a cluster
-/// with no completed poll yet is not known to be down, and treating
-/// "unknown" as "down" would fail `/readyz` for every cluster on a fresh
-/// start until the first poll (up to [`POLL_INTERVAL`] later) completes.
+/// Cheap to clone -- clones share the same flag. Starts unreachable: a
+/// cluster with no completed poll yet has not been verified, and `/readyz`
+/// meaning "verified ready" is worth a few seconds of 503 at startup rather
+/// than a false "ready" for a blackholed cluster. `tokio::time::interval`'s
+/// first tick fires immediately, so the first poll starts at t=0 and this
+/// window is normally far shorter than [`POLL_INTERVAL`].
 #[derive(Clone)]
 struct ClusterReachability {
     reachable: Arc<AtomicBool>,
@@ -51,7 +61,7 @@ struct ClusterReachability {
 impl ClusterReachability {
     fn new() -> Self {
         Self {
-            reachable: Arc::new(AtomicBool::new(true)),
+            reachable: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -59,21 +69,27 @@ impl ClusterReachability {
         self.reachable.store(reachable, Ordering::Relaxed);
     }
 
-    /// Build a `/readyz` probe closure reading this tracker's live state.
-    fn probe(&self) -> impl Fn() -> Result<(), &'static str> + Send + Sync + Clone + use<> {
-        let state = self.clone();
-        move || {
-            if state.reachable.load(Ordering::Relaxed) {
-                Ok(())
-            } else {
-                Err(UNREACHABLE_REASON)
-            }
+    fn is_reachable(&self) -> bool {
+        self.reachable.load(Ordering::Relaxed)
+    }
+}
+
+/// Build the single fleet-wide `/readyz` probe: ready only if every tracked
+/// cluster's last poll succeeded.
+fn fleet_probe(
+    trackers: Arc<[ClusterReachability]>,
+) -> impl Fn() -> Result<(), &'static str> + Send + Sync + Clone + use<> {
+    move || {
+        if trackers.iter().all(ClusterReachability::is_reachable) {
+            Ok(())
+        } else {
+            Err(UNREACHABLE_REASON)
         }
     }
 }
 
-/// Register a `/readyz` [`ReadinessCheck`] per configured cluster and spawn
-/// the background pollers that keep them current.
+/// Register the single `/readyz` [`ReadinessCheck`] for the fleet and spawn
+/// the background pollers that keep it current.
 ///
 /// The returned handles abort their polling tasks when dropped
 /// ([`AbortOnDropHandle`]); the caller must keep them alive for as long as
@@ -82,20 +98,19 @@ impl ClusterReachability {
 pub fn spawn_cluster_readiness(
     clients: &Arc<BTreeMap<String, ProxmoxClient>>,
 ) -> (Vec<ReadinessCheck>, Vec<AbortOnDropHandle<()>>) {
-    let mut checks = Vec::with_capacity(clients.len());
+    let trackers: Vec<ClusterReachability> =
+        clients.keys().map(|_| ClusterReachability::new()).collect();
+    let trackers: Arc<[ClusterReachability]> = trackers.into();
     let mut handles = Vec::with_capacity(clients.len());
 
-    for name in clients.keys() {
-        let tracker = ClusterReachability::new();
-        let check_name: &'static str =
-            Box::leak(format!("proxmox_cluster_{name}").into_boxed_str());
-        checks.push(ReadinessCheck::new(check_name, tracker.probe()));
-
+    for (name, tracker) in clients.keys().zip(trackers.iter()) {
         let clients = Arc::clone(clients);
         let name = name.clone();
         let tracker = tracker.clone();
         handles.push(AbortOnDropHandle::new(tokio::spawn(async move {
             let mut tick = tokio::time::interval(POLL_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut was_reachable = None;
             loop {
                 tick.tick().await;
                 let Some(client) = clients.get(&name) else {
@@ -103,19 +118,28 @@ pub fn spawn_cluster_readiness(
                     // names this cluster. Nothing left to poll.
                     break;
                 };
-                let reachable = client.get_json(PROBE_PATH, &[], &[]).await.is_ok();
-                if !reachable {
-                    tracing::warn!(
-                        target: "audit",
-                        cluster = %name,
-                        "readiness poll: cluster did not answer {PROBE_PATH}"
-                    );
+                let result = client.get_json(PROBE_PATH, &[], &[]).await;
+                let reachable = result.is_ok();
+                // Log only on a state transition, so a cluster that stays
+                // down doesn't write a line every POLL_INTERVAL.
+                if was_reachable != Some(reachable) {
+                    if let Err(error) = &result {
+                        tracing::warn!(
+                            cluster = %name,
+                            error = %error,
+                            "readiness poll: cluster did not answer {PROBE_PATH}"
+                        );
+                    } else {
+                        tracing::info!(cluster = %name, "readiness poll: cluster is reachable again");
+                    }
                 }
+                was_reachable = Some(reachable);
                 tracker.record(reachable);
             }
         })));
     }
 
+    let checks = vec![ReadinessCheck::new(CHECK_NAME, fleet_probe(trackers))];
     (checks, handles)
 }
 
@@ -124,24 +148,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_fresh_tracker_probes_ready() {
+    fn a_fresh_tracker_is_not_yet_reachable() {
         let tracker = ClusterReachability::new();
-        assert_eq!(tracker.probe()(), Ok(()));
+        assert!(!tracker.is_reachable());
     }
 
     #[test]
-    fn recording_unreachable_flips_the_probe_to_failing() {
+    fn recording_reachable_flips_the_tracker() {
         let tracker = ClusterReachability::new();
-        tracker.record(false);
-        assert_eq!(tracker.probe()(), Err(UNREACHABLE_REASON));
-    }
-
-    #[test]
-    fn recording_reachable_again_clears_a_prior_failure() {
-        let tracker = ClusterReachability::new();
-        tracker.record(false);
         tracker.record(true);
-        assert_eq!(tracker.probe()(), Ok(()));
+        assert!(tracker.is_reachable());
+    }
+
+    #[test]
+    fn recording_unreachable_again_clears_a_prior_success() {
+        let tracker = ClusterReachability::new();
+        tracker.record(true);
+        tracker.record(false);
+        assert!(!tracker.is_reachable());
     }
 
     #[test]
@@ -149,24 +173,31 @@ mod tests {
         let tracker = ClusterReachability::new();
         let clone = tracker.clone();
 
-        clone.record(false);
-        assert_eq!(tracker.probe()(), Err(UNREACHABLE_REASON));
+        clone.record(true);
+        assert!(tracker.is_reachable());
     }
 
     #[test]
-    fn probe_reflects_state_recorded_after_it_was_built() {
-        let tracker = ClusterReachability::new();
-        let probe = tracker.probe();
+    fn fleet_probe_is_ready_only_when_every_tracker_is_reachable() {
+        let a = ClusterReachability::new();
+        let b = ClusterReachability::new();
+        let trackers: Arc<[ClusterReachability]> = vec![a.clone(), b.clone()].into();
+        let probe = fleet_probe(trackers);
 
-        tracker.record(false);
         assert_eq!(probe(), Err(UNREACHABLE_REASON));
 
-        tracker.record(true);
+        a.record(true);
+        assert_eq!(probe(), Err(UNREACHABLE_REASON), "b is still unreachable");
+
+        b.record(true);
         assert_eq!(probe(), Ok(()));
+
+        a.record(false);
+        assert_eq!(probe(), Err(UNREACHABLE_REASON), "a went back down");
     }
 
     #[tokio::test]
-    async fn one_readiness_check_is_registered_per_cluster() {
+    async fn one_fleet_wide_readiness_check_is_registered_regardless_of_cluster_count() {
         use rust_proxmoxmcp_core::inventory::Cluster;
         use std::io::Write as _;
 
@@ -207,8 +238,8 @@ mod tests {
         let clients = Arc::new(clients);
 
         let (checks, handles) = spawn_cluster_readiness(&clients);
-        assert_eq!(checks.len(), 2);
-        assert_eq!(handles.len(), 2);
+        assert_eq!(checks.len(), 1, "one fixed-name check for the whole fleet");
+        assert_eq!(handles.len(), 2, "one poller per configured cluster");
         drop(handles);
     }
 }
