@@ -115,10 +115,11 @@ optional field that narrows a waiver to one token name.
 
 - **`/readyz` now reports real Proxmox cluster reachability** (MEC-983,
   closes #115). Each configured cluster gets a background poller that calls
-  its API on a 30-second interval and a named `ReadinessCheck`; an
-  unreachable cluster flips `/readyz` to 503 and names which cluster failed,
-  instead of the endpoint reporting ready unconditionally because no check
-  was ever wired in.
+  its API on a 30-second interval; a single fixed-name `ReadinessCheck`
+  flips `/readyz` to 503 if any configured cluster is unreachable, instead
+  of the endpoint reporting ready unconditionally because no check was ever
+  wired in. `/readyz` is unauthenticated, so the response never identifies
+  which cluster failed — that detail goes to the server log only.
 
 ## [0.10.0] - 2026-09-16
 
